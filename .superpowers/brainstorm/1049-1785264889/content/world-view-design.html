@@ -1,0 +1,235 @@
+<style>
+  .app-concept {
+    margin-top: 22px;
+    overflow: hidden;
+    border: 1px solid #303842;
+    border-radius: 17px;
+    background: #0d1014;
+    box-shadow: 0 24px 70px rgba(0,0,0,.35);
+  }
+  .concept-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 42px;
+    padding: 0 15px;
+    border-bottom: 1px solid #2d333a;
+    color: #7f8a95;
+    background: #171b20;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+  }
+  .concept-tabs {
+    display: flex;
+    padding: 3px;
+    border: 1px solid #39434d;
+    border-radius: 8px;
+    background: #101419;
+    letter-spacing: 0;
+  }
+  .concept-tabs span { padding: 5px 13px; border-radius: 5px; }
+  .concept-tabs .active { color: #1e252c; background: #edf0f2; }
+  .scene-wrap { position: relative; aspect-ratio: 2.05; overflow: hidden; background:#d7dadc; }
+  .scene-wrap svg { display:block; width:100%; height:100%; }
+  .hud-card {
+    position: absolute;
+    top: 16px;
+    min-width: 122px;
+    padding: 11px 13px;
+    border: 1px solid rgba(255,255,255,.78);
+    border-radius: 11px;
+    background: rgba(247,248,249,.84);
+    color: #25282b;
+    box-shadow: 0 6px 20px rgba(58,64,70,.13);
+    backdrop-filter: blur(10px);
+  }
+  .hud-card.left { left: 16px; }
+  .hud-card.right { right: 16px; text-align:right; }
+  .hud-card .small { color:#747b81; font-size:9px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+  .hud-card .big { margin-top:2px; font-size:22px; font-weight:650; }
+  .hud-card .state { margin-top:2px; color:#3e80ca; font-size:10px; font-weight:700; }
+  .scene-note {
+    position:absolute;
+    display:flex;
+    align-items:center;
+    gap:7px;
+    color:#33383d;
+    font-size:10px;
+    font-weight:700;
+  }
+  .scene-note i {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    width:19px;
+    height:19px;
+    border-radius:50%;
+    color:#fff;
+    background:#2f79ca;
+    font-style:normal;
+    box-shadow:0 3px 9px rgba(32,85,143,.28);
+  }
+  .note-path { left:52%; top:40%; }
+  .note-actor { right:18%; top:52%; }
+  .note-uncertain { left:18%; top:45%; }
+  .camera-grid {
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:11px;
+    margin-top:15px;
+  }
+  .camera-state {
+    min-height:98px;
+    padding:13px 14px;
+    border:1px solid #273749;
+    border-radius:11px;
+    background:#111923;
+  }
+  .camera-state .index { color:#68aaf2; font-size:10px; font-weight:750; letter-spacing:.1em; }
+  .camera-state h3 { margin:7px 0 5px; color:#e2e9f0; font-size:13px; }
+  .camera-state p { margin:0; color:#8293a5; font-size:11px; line-height:1.45; }
+  .rules {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+    margin-top:15px;
+  }
+  .rule {
+    padding:13px 14px;
+    border-radius:10px;
+    background:rgba(24,35,48,.75);
+    color:#8fa0b4;
+    font-size:12px;
+    line-height:1.5;
+  }
+  .rule b { color:#d9e4ee; }
+  @media (max-width:900px) {
+    .scene-wrap { aspect-ratio:1.25; }
+    .camera-grid,.rules { grid-template-columns:1fr 1fr; }
+    .scene-note { display:none; }
+  }
+</style>
+
+<h2>Design section 2 · Visual hierarchy and camera</h2>
+<p class="subtitle">The default WORLD view is a calm reconstructed scene. Raw points, candidate fans and performance counters move to RAW BEV instead of competing with the driving story.</p>
+
+<div class="app-concept">
+  <div class="concept-bar">
+    <span>BEAMNG / AUTONOMY VISUALIZER</span>
+    <div class="concept-tabs"><span class="active">WORLD</span><span>RAW BEV</span></div>
+    <span>STREAMING · 29.8 HZ</span>
+  </div>
+  <div class="scene-wrap">
+    <svg viewBox="0 0 1100 535" aria-label="Tesla-style reconstructed world view">
+      <defs>
+        <linearGradient id="vSky" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#eef0f1"/><stop offset="1" stop-color="#cdd0d1"/>
+        </linearGradient>
+        <linearGradient id="vRoad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#b9bcbe"/><stop offset="1" stop-color="#989d9f"/>
+        </linearGradient>
+        <linearGradient id="vPath" x1="0" y1="1" x2=".18" y2="0">
+          <stop offset="0" stop-color="#2f7fd8" stop-opacity=".9"/><stop offset="1" stop-color="#76abe6" stop-opacity=".34"/>
+        </linearGradient>
+        <filter id="vShadow"><feDropShadow dx="0" dy="7" stdDeviation="8" flood-color="#555a5e" flood-opacity=".25"/></filter>
+      </defs>
+      <rect width="1100" height="535" fill="url(#vSky)"/>
+      <path d="M0 250 L315 224 L785 224 L1100 250 L1100 535 L0 535 Z" fill="#c7cacc"/>
+      <path d="M178 535 L407 223 L695 223 L925 535 Z" fill="url(#vRoad)"/>
+      <path d="M0 260 L330 230 L407 223 L178 535 L0 535 Z" fill="#d9dbdc"/>
+      <path d="M1100 260 L770 230 L695 223 L925 535 L1100 535 Z" fill="#d9dbdc"/>
+      <path d="M162 535 L397 222" stroke="#f2f3f3" stroke-width="8"/>
+      <path d="M941 535 L705 222" stroke="#f2f3f3" stroke-width="8"/>
+      <path d="M550 535 L550 227" stroke="#eceeef" stroke-width="4" stroke-dasharray="32 25" opacity=".9"/>
+      <path d="M504 535 C503 456 512 387 529 333 C537 303 548 267 563 224 L603 224 C598 263 598 294 603 328 C613 392 638 460 671 535 Z" fill="url(#vPath)"/>
+      <path d="M506 534 C505 455 514 387 531 331 C540 299 551 263 565 224" fill="none" stroke="#2c71bd" stroke-width="3" opacity=".75"/>
+      <path d="M32 244 L291 224" stroke="#cb5752" stroke-width="3" opacity=".78"/>
+      <path d="M809 224 L1068 244" stroke="#cb5752" stroke-width="3" opacity=".78"/>
+
+      <g fill="#a3a7aa">
+        <path d="M37 225 L55 187 L73 225 Z"/><path d="M112 229 L132 181 L152 229 Z"/>
+        <path d="M218 228 L235 194 L252 228 Z"/><path d="M850 228 L870 180 L890 228 Z"/>
+        <path d="M965 230 L984 190 L1003 230 Z"/><path d="M1030 232 L1048 196 L1066 232 Z"/>
+      </g>
+
+      <g transform="translate(629 266) scale(.62)" filter="url(#vShadow)">
+        <ellipse cx="0" cy="23" rx="31" ry="7" fill="#666" opacity=".22"/>
+        <path d="M-27 18 L-22 -9 L-11 -25 L11 -25 L24 -8 L28 18 Z" fill="#858a8d"/>
+        <path d="M-15 -8 L-8 -20 L8 -20 L17 -8 Z" fill="#565e63"/>
+        <rect x="-20" y="12" width="8" height="5" rx="2" fill="#c64b46"/><rect x="13" y="12" width="8" height="5" rx="2" fill="#c64b46"/>
+      </g>
+      <g transform="translate(455 311) scale(.84)" filter="url(#vShadow)">
+        <ellipse cx="0" cy="23" rx="31" ry="7" fill="#666" opacity=".22"/>
+        <path d="M-27 18 L-22 -9 L-11 -25 L11 -25 L24 -8 L28 18 Z" fill="#aeb2b4"/>
+        <path d="M-15 -8 L-8 -20 L8 -20 L17 -8 Z" fill="#62696e"/>
+      </g>
+      <g transform="translate(751 359) scale(1.05)" filter="url(#vShadow)">
+        <ellipse cx="0" cy="23" rx="31" ry="7" fill="#666" opacity=".22"/>
+        <path d="M-27 18 L-22 -9 L-11 -25 L11 -25 L24 -8 L28 18 Z" fill="#919598"/>
+        <path d="M-15 -8 L-8 -20 L8 -20 L17 -8 Z" fill="#575f64"/>
+      </g>
+      <g transform="translate(352 271)" opacity=".36">
+        <path d="M-20 -15 L18 -15 L26 15 L-27 15 Z" fill="#9ca2a6"/>
+        <circle cx="-15" cy="-7" r="3" fill="#747c81"/><circle cx="9" cy="1" r="2.5" fill="#747c81"/>
+      </g>
+
+      <g transform="translate(510 438)" filter="url(#vShadow)">
+        <ellipse cx="0" cy="39" rx="66" ry="16" fill="#555" opacity=".23"/>
+        <path d="M-60 30 L-51 -25 L-25 -58 L26 -58 L52 -22 L61 30 L39 50 L-39 50 Z" fill="#f4f5f6" stroke="#aeb2b5" stroke-width="2"/>
+        <path d="M-36 -20 L-20 -48 L20 -48 L38 -18 Z" fill="#566169"/>
+        <path d="M-48 10 L-31 18 L-32 28 L-51 22 Z M48 10 L31 18 L32 28 L51 22 Z" fill="#d84f49"/>
+      </g>
+
+      <g transform="translate(321 238)">
+        <circle r="5" fill="#e8e9e9" stroke="#909598"/>
+        <path d="M0 6 L0 28 M-11 13 L11 13 M0 28 L-9 42 M0 28 L9 42" stroke="#747a7e" stroke-width="4" stroke-linecap="round"/>
+      </g>
+      <g transform="translate(808 246)">
+        <circle r="5" fill="#e8e9e9" stroke="#909598"/>
+        <path d="M0 6 L0 28 M-11 13 L11 13 M0 28 L-9 42 M0 28 L9 42" stroke="#747a7e" stroke-width="4" stroke-linecap="round"/>
+      </g>
+    </svg>
+    <div class="hud-card left">
+      <div class="small">Ego speed</div>
+      <div class="big">38 <span style="font-size:10px;color:#777">km/h</span></div>
+      <div class="state">SELF-DRIVING</div>
+    </div>
+    <div class="hud-card right">
+      <div class="small">Planned speed</div>
+      <div class="big">34 <span style="font-size:10px;color:#777">km/h</span></div>
+      <div class="state">RIGHT TURN · 56 m</div>
+    </div>
+    <div class="scene-note note-path"><i>1</i> planned path</div>
+    <div class="scene-note note-actor"><i>2</i> corroborated actor</div>
+    <div class="scene-note note-uncertain"><i>3</i> uncertain geometry</div>
+  </div>
+</div>
+
+<div class="camera-grid">
+  <div class="camera-state">
+    <div class="index">01 · CRUISE</div>
+    <h3>Low trailing camera</h3>
+    <p>Ego sits in the lower third; look-ahead grows smoothly with speed.</p>
+  </div>
+  <div class="camera-state">
+    <div class="index">02 · JUNCTION</div>
+    <h3>Pull up and widen</h3>
+    <p>More cross-traffic context appears as path curvature or branching rises.</p>
+  </div>
+  <div class="camera-state">
+    <div class="index">03 · REVERSE</div>
+    <h3>Rotate behind travel</h3>
+    <p>Camera eases 180°; rear path and nearby boundaries become the focus.</p>
+  </div>
+  <div class="camera-state">
+    <div class="index">04 · AEB</div>
+    <h3>No camera drama</h3>
+    <p>Keep orientation stable; threat, corridor and stop line change to red.</p>
+  </div>
+</div>
+
+<div class="rules">
+  <div class="rule"><b>Always visible:</b> ego, road/free space, chosen path, confirmed actors, speed and autonomy state.</div>
+  <div class="rule"><b>Diagnostic only:</b> raw points, candidate fan, sensor mounts, range rings, acquisition/poll counters and planner internals.</div>
+</div>

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamng-lidar-bev"
+version = "1.2.0"
+description = "Four-LiDAR EGO bird's-eye view for BeamNG.tech"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beamngpy==1.34.1",
+    "numpy>=1.26,<2.0",
+    "PyQt6>=6.6,<7.0",
+]
+
+[project.scripts]
+beamng-lidar-bev = "beamng_lidar_bev.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+beamng_lidar_bev = ["qml/*.qml", "qml/qmldir"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# no:pytest-qt: the suite is offline and never makes a QApplication, but the
+# globally installed pytest-qt plugin probes for a Qt binding at startup. On a
+# machine with PyQt5/PyQt6/PySide6 side by side that loads a SECOND Qt runtime
+# into the process, and the later `import PyQt6.QtCore` in worker.py dies with
+# DLL error 0xc0000139 during collection.
+addopts = "-q -p no:pytest-qt"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

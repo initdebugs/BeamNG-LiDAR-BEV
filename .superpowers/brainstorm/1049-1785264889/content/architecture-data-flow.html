@@ -1,0 +1,173 @@
+<style>
+  .flow-shell {
+    margin-top: 22px;
+    padding: 24px;
+    border: 1px solid rgba(132, 155, 182, .22);
+    border-radius: 18px;
+    background:
+      radial-gradient(circle at 24% 10%, rgba(59,130,246,.1), transparent 32%),
+      linear-gradient(150deg, #0d131c, #090d13);
+  }
+  .flow-grid {
+    display: grid;
+    grid-template-columns: 1fr 58px 1.2fr 58px 1.05fr;
+    gap: 10px;
+    align-items: stretch;
+  }
+  .flow-col { display: flex; flex-direction: column; gap: 12px; }
+  .flow-label {
+    margin: 0 0 2px 2px;
+    color: #677a91;
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  .node {
+    position: relative;
+    flex: 1;
+    min-height: 84px;
+    padding: 15px 16px;
+    border: 1px solid #26384c;
+    border-radius: 12px;
+    background: rgba(19,29,41,.9);
+  }
+  .node.sensor { border-color: #23545f; background: rgba(10,42,49,.58); }
+  .node.truth { border-color: #50452b; background: rgba(52,41,15,.5); }
+  .node.core { border-color: #285184; background: rgba(14,39,70,.67); }
+  .node.output { border-color: #315977; background: rgba(18,39,55,.75); }
+  .node.legacy { border-color: #414c59; background: rgba(28,34,41,.76); }
+  .node h3 { margin: 0 0 6px; color: #e7edf4; font-size: 14px; }
+  .node p { margin: 0; color: #8fa0b4; font-size: 11px; line-height: 1.45; }
+  .node .rate {
+    position: absolute;
+    top: 11px;
+    right: 12px;
+    color: #5e7996;
+    font-size: 9px;
+    font-weight: 700;
+  }
+  .sensor h3 { color: #75e7de; }
+  .truth h3 { color: #f0c86b; }
+  .core h3 { color: #80b8ff; }
+  .output h3 { color: #83c9ff; }
+  .arrows {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .arrow {
+    position: relative;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(90deg, #37516c, #6a9fd2);
+  }
+  .arrow:after {
+    content: "";
+    position: absolute;
+    right: -1px;
+    top: -5px;
+    border-left: 9px solid #6a9fd2;
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+  }
+  .merge-note {
+    margin-top: 11px;
+    padding: 10px 12px;
+    border: 1px solid rgba(116,191,255,.16);
+    border-radius: 9px;
+    color: #8297ae;
+    background: rgba(15,28,42,.55);
+    font-size: 11px;
+    line-height: 1.45;
+  }
+  .contract-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .contract {
+    padding: 11px 12px;
+    border-radius: 9px;
+    background: #111a25;
+    color: #91a2b6;
+    font-size: 11px;
+  }
+  .contract b { display:block; margin-bottom:3px; color:#dbe7f3; font-size:11px; }
+  @media (max-width: 960px) {
+    .flow-grid { grid-template-columns: 1fr; }
+    .arrows { min-height: 30px; transform: rotate(90deg); }
+    .contract-grid { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+
+<h2>Design section 1 · Architecture and data flow</h2>
+<p class="subtitle">One perception pipeline feeds two views. Switching views never restarts sensors, changes planning, or alters the driving loop.</p>
+
+<div class="flow-shell">
+  <div class="flow-grid">
+    <div class="flow-col">
+      <div class="flow-label">Live inputs</div>
+      <div class="node sensor">
+        <span class="rate">30 Hz</span>
+        <h3>Semantic LiDAR array</h3>
+        <p>3D returns, height, annotation class and sensor provenance remain intact instead of becoming two flat point buckets.</p>
+      </div>
+      <div class="node truth">
+        <span class="rate">10–15 Hz</span>
+        <h3>BeamNG actor states</h3>
+        <p>Batched position, orientation, velocity and vehicle type. Registry refreshes slowly; poses update together in one request.</p>
+      </div>
+      <div class="node">
+        <span class="rate">25 Hz</span>
+        <h3>Planner + vehicle state</h3>
+        <p>Chosen composite path, alternatives, AEB corridor, speed, controls and navigation intent.</p>
+      </div>
+    </div>
+
+    <div class="arrows"><div class="arrow"></div></div>
+
+    <div class="flow-col">
+      <div class="flow-label">Worker-thread scene assembly</div>
+      <div class="node core">
+        <h3>Temporal surface builder</h3>
+        <p>Short world-space history becomes a stable ego-relative road mesh, curb/boundary lines and sparse uncertain geometry. Old cells fade rather than jump.</p>
+      </div>
+      <div class="node core">
+        <h3>Corroborated actor tracker</h3>
+        <p>Ground-truth pose chooses the model, but LiDAR evidence controls visibility. A temporarily missed actor coasts briefly, then fades—never silently persists.</p>
+      </div>
+      <div class="node core">
+        <h3>Scene-frame builder</h3>
+        <p>Produces immutable NumPy/primitive data only. No QML or OpenGL object crosses the worker boundary.</p>
+      </div>
+    </div>
+
+    <div class="arrows"><div class="arrow"></div></div>
+
+    <div class="flow-col">
+      <div class="flow-label">GUI-thread views</div>
+      <div class="node output">
+        <span class="rate">60 fps</span>
+        <h3>WORLD · Qt Quick 3D</h3>
+        <p>Interpolated camera and actors, road mesh, generic low-poly models, blue path ribbon and minimal Tesla-style status overlay.</p>
+      </div>
+      <div class="node legacy">
+        <span class="rate">25 fps</span>
+        <h3>RAW BEV · Existing widget</h3>
+        <p>The current honest top-down cloud and planner/AEB overlays stay intact for debugging and comparison.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="merge-note">
+    <b>Hybrid contract:</b> LiDAR decides what environmental structure is visible. BeamNG enriches recognized dynamic actors with stable identity and pose; it does not paint an unseen perfect world.
+  </div>
+  <div class="contract-grid">
+    <div class="contract"><b>Road</b>LiDAR semantic surface + temporal smoothing</div>
+    <div class="contract"><b>Curbs / boundaries</b>LiDAR height and non-road edges</div>
+    <div class="contract"><b>Vehicles</b>BeamNG model + pose, gated by LiDAR evidence</div>
+    <div class="contract"><b>Intent</b>Planner path and AEB geometry directly</div>
+  </div>
+</div>

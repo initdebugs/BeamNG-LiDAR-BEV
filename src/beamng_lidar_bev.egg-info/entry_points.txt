@@ -1,0 +1,2 @@
+[console_scripts]
+beamng-lidar-bev = beamng_lidar_bev.__main__:main

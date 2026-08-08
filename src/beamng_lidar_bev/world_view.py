@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from PyQt6.QtCore import (
+    QAbstractListModel,
+    QByteArray,
+    QModelIndex,
+    QObject,
+    Qt,
+    QUrl,
+    pyqtProperty,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import QCloseEvent, QColor, QVector3D
+from PyQt6.QtQml import QQmlEngine
+from PyQt6.QtQuick3D import QQuick3DGeometry
+from PyQt6.QtQuickWidgets import QQuickWidget
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
+
+from .models import WorldActor, WorldFrame
+
+_POSITION_BYTES = 12
+_COLOUR_BYTES = 16
+_VERTEX_STRIDE = _POSITION_BYTES + _COLOUR_BYTES
+
+
+def interleave(vertices: np.ndarray, colors: np.ndarray) -> np.ndarray:
+    """
+    Pack positions and linear RGBA colours into one contiguous float32 buffer.
+
+    The layout is what `SceneGeometry` declares to Qt: xyz then rgba, 28 bytes a
+    vertex. Kept a free function so the packing can be pinned offline without a
+    QApplication or a graphics device.
+    """
+    positions = np.asarray(vertices, dtype=np.float32)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(f"Expected an Nx3 vertex array, got {positions.shape}")
+    rgba = np.asarray(colors, dtype=np.float32)
+    if rgba.ndim != 2 or rgba.shape[1] != 4:
+        raise ValueError(f"Expected an Nx4 colour array, got {rgba.shape}")
+    if len(rgba) != len(positions):
+        raise ValueError(
+            f"{len(positions)} vertices against {len(rgba)} colours"
+        )
+    return np.ascontiguousarray(
+        np.concatenate((positions, rgba), axis=1), dtype=np.float32
+    )
+
+
+class SceneGeometry(QQuick3DGeometry):
+    """
+    A mesh handed to Qt Quick 3D as raw bytes rather than as a QML value list.
+
+    This replaces `ProceduralMesh`, and it is what lets the scene be detailed at
+    all. `ProceduralMesh` takes `list<vector3d>`, so feeding it meant building
+    one QVector3D per vertex in a Python loop on the GUI thread every frame --
+    the cost of the view scaled with its detail, and WORLD_CELL_SIZE_M was set
+    by what that loop could carry rather than by what the sensors resolve.
+    `setVertexData` takes the numpy buffer verbatim, so the Python cost is O(1)
+    in vertex count and the grid is free to follow the data.
+
+    Attributes are declared ONCE, in the constructor: `addAttribute` appends,
+    so re-declaring them per frame would grow the attribute list without bound.
+    """
+
+    def __init__(self, primitive: QQuick3DGeometry.PrimitiveType) -> None:
+        # No Qt parent: QQuick3DGeometry only accepts a QQuick3DObject as one,
+        # and the bridge is a plain QObject. The bridge holds a Python
+        # reference instead, and ownership is pinned to C++ so the QML engine
+        # cannot decide to collect a geometry that is still bound to a Model.
+        super().__init__()
+        QQmlEngine.setObjectOwnership(self, QQmlEngine.ObjectOwnership.CppOwnership)
+        attribute = QQuick3DGeometry.Attribute
+        self.setStride(_VERTEX_STRIDE)
+        self.setPrimitiveType(primitive)
+        self.addAttribute(
+            attribute.Semantic.PositionSemantic,
+            0,
+            attribute.ComponentType.F32Type,
+        )
+        self.addAttribute(
+            attribute.Semantic.ColorSemantic,
+            _POSITION_BYTES,
+            attribute.ComponentType.F32Type,
+        )
+        if primitive != QQuick3DGeometry.PrimitiveType.Points:
+            self.addAttribute(
+                attribute.Semantic.IndexSemantic,
+                0,
+                attribute.ComponentType.U32Type,
+            )
+        self.clear_mesh()
+
+    def set_mesh(
+        self,
+        vertices: np.ndarray,
+        colors: np.ndarray,
+        indices: np.ndarray | None = None,
+    ) -> None:
+        buffer = interleave(vertices, colors)
+        if not len(buffer):
+            self.clear_mesh()
+            return
+        self.setVertexData(buffer.tobytes())
+        if indices is not None:
+            self.setIndexData(
+                np.ascontiguousarray(indices, dtype=np.uint32).tobytes()
+            )
+        low = buffer[:, :3].min(axis=0)
+        high = buffer[:, :3].max(axis=0)
+        self.setBounds(
+            QVector3D(float(low[0]), float(low[1]), float(low[2])),
+            QVector3D(float(high[0]), float(high[1]), float(high[2])),
+        )
+        self.update()
+
+    def clear_mesh(self) -> None:
+        self.setVertexData(b"")
+        self.setIndexData(b"")
+        self.setBounds(QVector3D(), QVector3D())
+        self.update()
+
+
+class ActorListModel(QAbstractListModel):
+    ActorIdRole = int(Qt.ItemDataRole.UserRole) + 1
+    KindRole = ActorIdRole + 1
+    XRole = KindRole + 1
+    YRole = XRole + 1
+    ZRole = YRole + 1
+    YawRole = ZRole + 1
+    WidthRole = YawRole + 1
+    HeightRole = WidthRole + 1
+    LengthRole = HeightRole + 1
+    ConfidenceRole = LengthRole + 1
+
+    _ROLE_NAMES = {
+        ActorIdRole: QByteArray(b"actorId"),
+        KindRole: QByteArray(b"kind"),
+        XRole: QByteArray(b"x"),
+        YRole: QByteArray(b"y"),
+        ZRole: QByteArray(b"z"),
+        YawRole: QByteArray(b"yaw"),
+        WidthRole: QByteArray(b"actorWidth"),
+        HeightRole: QByteArray(b"actorHeight"),
+        LengthRole: QByteArray(b"actorLength"),
+        ConfidenceRole: QByteArray(b"confidence"),
+    }
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._actors: tuple[WorldActor, ...] = ()
+
+    def roleNames(self) -> dict[int, QByteArray]:
+        return self._ROLE_NAMES
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._actors)
+
+    def data(self, index: QModelIndex, role: int = 0) -> Any:
+        if not index.isValid() or not (0 <= index.row() < len(self._actors)):
+            return None
+        actor = self._actors[index.row()]
+        width, height, length = actor.scale
+        values = {
+            self.ActorIdRole: actor.actor_id,
+            self.KindRole: actor.kind,
+            self.XRole: actor.position[0],
+            self.YRole: actor.position[1],
+            self.ZRole: actor.position[2],
+            self.YawRole: actor.yaw_deg,
+            self.WidthRole: width,
+            self.HeightRole: height,
+            self.LengthRole: length,
+            self.ConfidenceRole: actor.confidence,
+        }
+        return values.get(role)
+
+    def set_actors(self, actors: tuple[WorldActor, ...]) -> None:
+        updated = tuple(actors)
+        current_ids = tuple(actor.actor_id for actor in self._actors)
+        updated_ids = tuple(actor.actor_id for actor in updated)
+        if updated_ids == current_ids:
+            self._actors = updated
+            if updated:
+                self.dataChanged.emit(
+                    self.index(0, 0),
+                    self.index(len(updated) - 1, 0),
+                    list(self._ROLE_NAMES),
+                )
+            return
+        self.beginResetModel()
+        self._actors = updated
+        self.endResetModel()
+
+
+class SceneBridge(QObject):
+    state_changed = pyqtSignal()
+    geometry_changed = pyqtSignal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        triangles = QQuick3DGeometry.PrimitiveType.Triangles
+        self._road_geometry = SceneGeometry(triangles)
+        self._boundary_geometry = SceneGeometry(triangles)
+        self._vehicle_geometry = SceneGeometry(triangles)
+        self._aeb_geometry = SceneGeometry(triangles)
+        self._aeb_marker_geometry = SceneGeometry(triangles)
+        self._path_geometry = SceneGeometry(triangles)
+        self._uncertain_geometry = SceneGeometry(
+            QQuick3DGeometry.PrimitiveType.Points
+        )
+        self._actor_model = ActorListModel(self)
+        self._ego_scale = (2.0, 1.5, 4.4)
+        self._speed_text = "0"
+        self._target_speed_text = "—"
+        self._autonomy_mode = "OFF"
+        self._alert_text = ""
+        self._perception_available = False
+        self._camera_position = (0.0, 12.0, 20.0)
+        self._camera_euler = (-21.0, 0.0, 0.0)
+
+    @pyqtProperty(QObject, constant=True)
+    def actorModel(self) -> QObject:
+        return self._actor_model
+
+    # Constant, and deliberately so: the geometry OBJECTS never change, only
+    # the buffers inside them. Qt is told about new data by
+    # QQuick3DGeometry.update(), so nothing here has to be re-bound per frame.
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def roadGeometry(self) -> QQuick3DGeometry:
+        return self._road_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def boundaryGeometry(self) -> QQuick3DGeometry:
+        return self._boundary_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def vehicleGeometry(self) -> QQuick3DGeometry:
+        return self._vehicle_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def aebGeometry(self) -> QQuick3DGeometry:
+        return self._aeb_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def aebMarkerGeometry(self) -> QQuick3DGeometry:
+        return self._aeb_marker_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def pathGeometry(self) -> QQuick3DGeometry:
+        return self._path_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def uncertainGeometry(self) -> QQuick3DGeometry:
+        return self._uncertain_geometry
+
+    @pyqtProperty(float, notify=state_changed)
+    def egoWidth(self) -> float:
+        return self._ego_scale[0]
+
+    @pyqtProperty(float, notify=state_changed)
+    def egoHeight(self) -> float:
+        return self._ego_scale[1]
+
+    @pyqtProperty(float, notify=state_changed)
+    def egoLength(self) -> float:
+        return self._ego_scale[2]
+
+    @pyqtProperty(str, notify=state_changed)
+    def speedText(self) -> str:
+        return self._speed_text
+
+    @pyqtProperty(str, notify=state_changed)
+    def targetSpeedText(self) -> str:
+        return self._target_speed_text
+
+    @pyqtProperty(str, notify=state_changed)
+    def autonomyMode(self) -> str:
+        return self._autonomy_mode
+
+    @pyqtProperty(str, notify=state_changed)
+    def alertText(self) -> str:
+        return self._alert_text
+
+    @pyqtProperty(bool, notify=state_changed)
+    def perceptionAvailable(self) -> bool:
+        return self._perception_available
+
+    @pyqtProperty(float, notify=state_changed)
+    def cameraX(self) -> float:
+        return self._camera_position[0]
+
+    @pyqtProperty(float, notify=state_changed)
+    def cameraY(self) -> float:
+        return self._camera_position[1]
+
+    @pyqtProperty(float, notify=state_changed)
+    def cameraZ(self) -> float:
+        return self._camera_position[2]
+
+    @pyqtProperty(float, notify=state_changed)
+    def cameraPitch(self) -> float:
+        return self._camera_euler[0]
+
+    @pyqtProperty(float, notify=state_changed)
+    def cameraYaw(self) -> float:
+        return self._camera_euler[1]
+
+    @pyqtSlot(object)
+    def set_frame(self, frame: WorldFrame) -> None:
+        self._road_geometry.set_mesh(
+            frame.road_vertices, frame.road_colors, frame.road_indices
+        )
+        self._boundary_geometry.set_mesh(
+            frame.boundary_vertices, frame.boundary_colors, frame.boundary_indices
+        )
+        self._vehicle_geometry.set_mesh(
+            frame.vehicle_vertices, frame.vehicle_colors, frame.vehicle_indices
+        )
+        self._aeb_geometry.set_mesh(
+            frame.aeb_vertices, frame.aeb_colors, frame.aeb_indices
+        )
+        self._aeb_marker_geometry.set_mesh(
+            frame.aeb_marker_vertices,
+            frame.aeb_marker_colors,
+            frame.aeb_marker_indices,
+        )
+        self._path_geometry.set_mesh(
+            frame.path_vertices, frame.path_colors, frame.path_indices
+        )
+        self._uncertain_geometry.set_mesh(
+            frame.uncertain_points, frame.uncertain_colors
+        )
+        self._actor_model.set_actors(frame.actors)
+        self._ego_scale = frame.ego_scale
+        self._speed_text = f"{frame.speed_kph:.0f}"
+        self._target_speed_text = (
+            f"{frame.target_speed_kph:.0f}"
+            if frame.autonomy_mode != "OFF"
+            else "—"
+        )
+        self._autonomy_mode = frame.autonomy_mode
+        self._alert_text = frame.alert
+        self._perception_available = frame.perception_available
+        self._camera_position = frame.camera_position
+        self._camera_euler = frame.camera_euler
+        self.geometry_changed.emit()
+        self.state_changed.emit()
+
+    @pyqtSlot()
+    def clear(self) -> None:
+        for geometry in (
+            self._road_geometry,
+            self._boundary_geometry,
+            self._vehicle_geometry,
+            self._aeb_geometry,
+            self._aeb_marker_geometry,
+            self._path_geometry,
+            self._uncertain_geometry,
+        ):
+            geometry.clear_mesh()
+        self._actor_model.set_actors(())
+        self._speed_text = "0"
+        self._target_speed_text = "—"
+        self._autonomy_mode = "OFF"
+        self._alert_text = ""
+        self._perception_available = False
+        self.geometry_changed.emit()
+        self.state_changed.emit()
+
+
+class WorldView(QWidget):
+    rendering_failed = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("worldView")
+        self.setMinimumSize(320, 320)
+        self.bridge = SceneBridge(self)
+        self._ready = False
+        self._failure_emitted = False
+        self._failure_message = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._quick = QQuickWidget(self)
+        self._quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+        self._quick.setClearColor(QColor("#d5d8da"))
+        self._quick.rootContext().setContextProperty("sceneBridge", self.bridge)
+        self._quick.statusChanged.connect(self._on_status_changed)
+        qml_path = Path(__file__).with_name("qml") / "WorldScene.qml"
+        self._quick.setSource(QUrl.fromLocalFile(str(qml_path)))
+        layout.addWidget(self._quick)
+        self._on_status_changed(self._quick.status())
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    @property
+    def failure_message(self) -> str:
+        return self._failure_message
+
+    @pyqtSlot(object)
+    def set_frame(self, frame: WorldFrame) -> None:
+        if self._ready:
+            self.bridge.set_frame(frame)
+
+    @pyqtSlot()
+    def clear(self) -> None:
+        self.bridge.clear()
+
+    @pyqtSlot()
+    def shutdown(self) -> None:
+        """Unload QML before its context object is destroyed."""
+        self._ready = False
+        self._quick.setSource(QUrl())
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        self.shutdown()
+        super().closeEvent(event)
+
+    @pyqtSlot(QQuickWidget.Status)
+    def _on_status_changed(self, status: QQuickWidget.Status) -> None:
+        self._ready = status == QQuickWidget.Status.Ready
+        if status != QQuickWidget.Status.Error or self._failure_emitted:
+            return
+        errors = "; ".join(error.toString() for error in self._quick.errors())
+        self._emit_failure(errors or "Qt Quick 3D failed to load")
+
+    def _emit_failure(self, message: str) -> None:
+        if self._failure_emitted:
+            return
+        self._failure_emitted = True
+        self._failure_message = message
+        self.rendering_failed.emit(message)
