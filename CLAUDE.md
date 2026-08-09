@@ -966,8 +966,18 @@ controller:
   a stop the ratio recovers *even though the car is closer than when it fired* — traced at
   50 km/h, the brake let go at 11.6 m and again at 6.4 m, delivering an emergency stop as three
   pulses. It releases when the threat has been gone for `AEB_CONFIRM_S`, when `available` exceeds
-  both `AEB_RELEASE_MARGIN · needed` and the fire-time gap, or after `AEB_STOPPED_HOLD_S` at rest
-  (holding a stopped car indefinitely because the wall is still a wall is a trapped car).
+  both `AEB_RELEASE_MARGIN · needed` and the fire-time gap, or **the moment the car reaches rest**.
+- **There is no post-stop hold.** Reaching a standstill *is* the objective, so once the car is
+  stopped the event is over and the pedal goes straight back to the driver — the same rule every
+  teardown path in `worker` follows, which hands back a coasting car rather than a braked one. A
+  timed `AEB_STOPPED_HOLD_S` existed and was removed. Note what this means and does not: the car is
+  **not** held against a gradient afterwards, and it never was — the hold expired regardless.
+  `AEB_STOPPED_SPEED_MPS` (0.05) is what "at rest" means and is deliberately far tighter than
+  `STALL_SPEED_MPS` (0.3, "is this car moving", for the stall and hold checks): releasing at 0.3
+  hands back a car still rolling at over 1 km/h toward the thing it just braked for, and under a
+  full pedal that is one tick before it is genuinely stopped, so the looser figure buys nothing.
+  `AEB_MIN_ENGAGED_S` is a separate rule and still applies — it bars a single-tick blip, and is not
+  a hold.
 - **The scan horizon is latched the same way, for the same reason.** It scales with `needed`, so
   braking pulls it in behind the very obstacle being braked for: at 50 km/h the wall sat at
   10.2 m while the horizon had come down to 9.2 m, the threat read as *gone*, and the brake

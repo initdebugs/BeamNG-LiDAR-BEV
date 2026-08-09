@@ -1119,10 +1119,21 @@ AEB_TRIGGER_MARGIN = 1.10
 # pulses. The release is therefore latched against the gap the event STARTED
 # with, which slowing down cannot manufacture.
 AEB_RELEASE_MARGIN = 2.0
-# Once stopped, hold this long and then hand the car back. Without it an AEB
-# that stopped you a metre from a wall would keep the brake on for as long as
-# the wall was still there, which is a trapped car rather than a safe one.
-AEB_STOPPED_HOLD_S = 2.0
+# There is no post-stop hold, and the absence is deliberate. Reaching a
+# standstill IS the objective, so once the car is stopped the event is over and
+# the pedal goes straight back to the driver -- the same rule every teardown
+# path in `worker` follows, which hands back a coasting car rather than a braked
+# one. A timed hold was tried and removed: it left a window in which neither the
+# system nor the driver was clearly in charge of the pedal, and the car is not
+# held against a gradient either way. AEB_MIN_ENGAGED_S is what stops a
+# single-tick blip; it is not a hold.
+# What "stopped" means for handing the pedal back. Deliberately far tighter
+# than STALL_SPEED_MPS (0.3), which answers a different question -- "is this car
+# moving" for the stall and hold checks. Releasing at 0.3 would hand back a car
+# still rolling at over 1 km/h toward the obstacle it just braked for, and under
+# a full pedal that is a single tick before it is genuinely at rest, so the
+# looser threshold buys nothing and costs the last metre.
+AEB_STOPPED_SPEED_MPS = 0.05
 # No single-tick blips: once fired, the brake stays on at least this long.
 AEB_MIN_ENGAGED_S = 0.3
 # Pedal: FULL, with no slew limits -- an emergency outranks smoothness, the

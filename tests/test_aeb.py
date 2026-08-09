@@ -21,11 +21,12 @@ from beamng_lidar_bev.config import (
     AEB_CONFIRM_S,
     AEB_HOLD_BRAKE,
     AEB_LATENCY_S,
+    AEB_MIN_ENGAGED_S,
     AEB_MIN_HITS,
     AEB_MIN_SPEED_MPS,
     AEB_REVERSE_STANDOFF_M,
     AEB_STANDOFF_M,
-    AEB_STOPPED_HOLD_S,
+    AEB_STOPPED_SPEED_MPS,
     AEB_TRIGGER_MARGIN,
 )
 from beamng_lidar_bev.models import ARMED, BRAKING, STANDBY, VehicleGeometry
@@ -294,28 +295,61 @@ def test_stopped_against_the_obstacle_it_holds_rather_than_stands_on_the_pedal(
     assert state.brake == pytest.approx(AEB_HOLD_BRAKE)
 
 
-def test_it_holds_the_stopped_car_and_then_hands_it_back() -> None:
+def test_the_brake_is_handed_back_the_moment_the_car_stops() -> None:
     """
-    Nose-to-nose with the wall it has to keep the car there -- the required
-    deceleration is 0 at a standstill, so a ratio test alone would let go --
-    but only for AEB_STOPPED_HOLD_S. Holding indefinitely because the wall is
-    still a wall is a trapped car rather than a safe one.
+    Reaching a standstill IS the objective, so the event ends when the car
+    stops. There is no timed hold: it would leave a window in which neither the
+    system nor the driver is clearly in charge of the pedal, and it never held
+    the car against a gradient anyway.
+
+    The wall is still a wall throughout, which is the point -- the release is
+    the car having stopped, not the threat having gone.
     """
     brake = EmergencyBraking()
     hold(brake, wall(10.0), 11.0)
 
-    held = brake.step(wall(3.5), GEOMETRY, 0.0, 0.1, heading_rad=0.0)
-    assert held.status == BRAKING
-    assert held.brake == pytest.approx(AEB_HOLD_BRAKE)
+    # Still rolling, nose-to-nose, and for longer than AEB_MIN_ENGAGED_S so the
+    # release below is the standstill rule rather than the blip guard expiring.
+    # 0.2 m/s is inside STALL_SPEED_MPS, which is exactly the threshold it would
+    # have been wrong to release on: 0.7 km/h is still moving.
+    for _ in range(4):
+        moving = brake.step(wall(3.5), GEOMETRY, 0.2, 0.1, heading_rad=0.0)
+    assert moving.status == BRAKING
+    assert moving.brake == pytest.approx(AEB_HOLD_BRAKE)
 
-    for _ in range(int(AEB_STOPPED_HOLD_S / 0.1) + 1):
-        state = brake.step(wall(3.5), GEOMETRY, 0.0, 0.1, heading_rad=0.0)
+    stopped = brake.step(wall(3.5), GEOMETRY, 0.0, 0.1, heading_rad=0.0)
 
-    # STANDBY rather than ARMED because the car is stationary, which is below
-    # the arming speed -- the point is that the brake is off and the driver has
-    # the car back.
-    assert state.status == STANDBY
-    assert state.brake == 0.0
+    # The pedal is up on the very tick the car reached rest -- no hold, and no
+    # part of a second of one.
+    assert stopped.status != BRAKING
+    assert stopped.brake == 0.0
+
+    # ...and it stays up with the wall still there. STANDBY rather than ARMED
+    # because a stationary car is below the arming speed; the brake does not
+    # come back until the car is moving at something again.
+    settled = brake.step(wall(3.5), GEOMETRY, 0.0, 0.1, heading_rad=0.0)
+    assert settled.status == STANDBY
+    assert settled.brake == 0.0
+
+
+def test_a_single_tick_blip_is_still_barred() -> None:
+    """
+    Releasing at rest must not become "release immediately". AEB_MIN_ENGAGED_S
+    is a separate rule from the hold that was removed, and it is what stops a
+    one-tick pulse: a car that is already stationary when the brake fires still
+    holds it for the minimum rather than flickering.
+    """
+    brake = EmergencyBraking()
+    state = hold(brake, wall(_fires_at(5.0)), 5.0)
+    assert state.status == BRAKING
+
+    elapsed = 0.0
+    while elapsed < AEB_MIN_ENGAGED_S - 0.05:
+        state = brake.step(
+            wall(_fires_at(5.0)), GEOMETRY, 0.0, 0.05, heading_rad=0.0
+        )
+        elapsed += 0.05
+        assert state.status == BRAKING, "a stop released inside the blip guard"
 
 
 def test_an_emergency_stop_is_one_continuous_brake_application() -> None:
@@ -362,7 +396,11 @@ def _close_on_a_wall(
         peak = max(peak, state.brake)
         speed = max(0.0, speed - AEB_BRAKING_DECEL_MPS2 * state.brake * DT)
         travelled += speed * DT
-        if speed <= 0.01:
+        # Stopped by the same definition AEB releases on. The plant models no
+        # drag at all, so once the pedal comes up the car coasts forever at
+        # whatever residual it had; asking for a tighter zero than the system
+        # itself uses would be measuring the plant's missing friction.
+        if speed <= AEB_STOPPED_SPEED_MPS:
             return releases, wall_at - travelled, peak
     return releases, None, peak
 

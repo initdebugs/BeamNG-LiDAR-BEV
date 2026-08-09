@@ -45,7 +45,7 @@ from .config import (
     AEB_REVERSE_MIN_SPEED_MPS,
     AEB_REVERSE_STANDOFF_M,
     AEB_STANDOFF_M,
-    AEB_STOPPED_HOLD_S,
+    AEB_STOPPED_SPEED_MPS,
     AEB_TRIGGER_MARGIN,
     AEB_YAW_FILTER_ALPHA,
     MIN_TURN_RADIUS_M,
@@ -362,7 +362,6 @@ class EmergencyBraking:
         # How long the car has been at rest under an AEB stop, and the room
         # there was when the event fired -- the release is latched against the
         # latter so that slowing down cannot satisfy it.
-        self._stopped_for = 0.0
         self._fired_available = 0.0
         self._fired_horizon = 0.0
         # Same wrap-aware yaw pipeline as DrivingController._observe_yaw, and
@@ -523,9 +522,6 @@ class EmergencyBraking:
 
         if self._engaged:
             self._engaged_for += dt
-            self._stopped_for = (
-                self._stopped_for + dt if abs(speed) < STALL_SPEED_MPS else 0.0
-            )
             if self._engaged_for < AEB_MIN_ENGAGED_S:
                 cleared = False
             else:
@@ -538,9 +534,20 @@ class EmergencyBraking:
                     # release the brake. See AEB_RELEASE_MARGIN.
                     or available
                     > max(AEB_RELEASE_MARGIN * needed, self._fired_available)
-                    # ...or the car is stopped and has been for a moment, at
-                    # which point holding it is trapping it.
-                    or self._stopped_for >= AEB_STOPPED_HOLD_S
+                    # ...or the car has come to REST, at which point the event
+                    # is over and the pedal goes straight back to the driver.
+                    # The stop is the whole objective, so there is nothing left
+                    # for the brake to achieve. Note the car is not held against
+                    # a gradient afterwards: releasing means releasing, exactly
+                    # as every teardown path in `worker` hands back a coasting
+                    # car rather than a braked one.
+                    #
+                    # AEB_STOPPED_SPEED_MPS, not STALL_SPEED_MPS. "Counts as
+                    # stationary" is 0.3 m/s, and letting go there hands back a
+                    # car still rolling at 1 km/h toward the thing it just
+                    # braked for -- which under a full pedal is one tick before
+                    # it is actually stopped, so it buys nothing either.
+                    or abs(speed) <= AEB_STOPPED_SPEED_MPS
                 )
             if cleared:
                 self._engaged = False
@@ -550,7 +557,6 @@ class EmergencyBraking:
         elif triggered and self._seen_for >= AEB_CONFIRM_S:
             self._engaged = True
             self._engaged_for = 0.0
-            self._stopped_for = 0.0
             self._fired_available = available
             self._fired_horizon = horizon
             self._brake = self._brake_for(speed)
