@@ -371,6 +371,52 @@ WORLD_COLUMN_VERTICAL_BRIDGE_BINS = 2
 # Below this a slab is not worth a box -- it is road noise, not structure.
 WORLD_MIN_SLAB_HEIGHT_M = 0.10
 
+# --- Which way a slab faces ---------------------------------------------------
+#
+# The voxel lattice is world-aligned, so every slab used to be a world-aligned
+# box: a wall running diagonally came out as a staircase of cubes and a car
+# parked at an angle as a heap of them. The orientation is now MEASURED from the
+# footprint and the box is rotated to match.
+#
+# It cannot be measured inside one column. A 0.25 m cell holds at most 0.25 m of
+# evidence, which is smaller than the azimuth stripe spacing the returns arrive
+# with (1.24 m at 20 m), so the direction has to come from a NEIGHBOURHOOD. Two
+# metre tile, summed over a sliding 3x3 of them, gives a 3 m window: long
+# enough to hold a clear line through a wall and short enough that a curved one
+# is still followed rather than averaged into a chord. The window SLIDES because
+# a fixed tile is a world-aligned box whose corner a surface can clip, leaving
+# too few cells to fit a direction to -- which showed up as stray untilted cubes
+# along an otherwise clean wall.
+WORLD_ORIENT_CELL_M = 1.0
+# Quantised, because merging only ever happens between cells that agree on a
+# frame -- the angle is a key field exactly like the altitude and height buckets
+# beside it. Over [0, 90) rather than [0, 180): the grid is square, so rotating
+# a rectangle by 90 degrees just swaps its sides.
+#
+# Twelve is 7.5 degrees, so the worst case is a surface 3.75 degrees off the
+# frame it is drawn in. Measured on a 20 m wall at the worst angle for each:
+#
+#     6 buckets   drawn up to 7.50 deg out, 0.12-0.17 m of wander off the line
+#    12 buckets   drawn up to 3.75 deg out, 0.02-0.04 m -- flat, to the eye
+#
+# It is also CHEAPER, which is not the obvious direction: a frame that fits
+# merges into fewer, longer boxes, and on a street scene that was 22 slabs
+# against 33 and 31.3 ms against 33.2. Quality and cost agree here, so the
+# reason not to go further is the fixed cost of a group that holds almost
+# nothing, not the geometry.
+WORLD_ORIENT_BUCKETS = 12
+# ...and it is only believed when the footprint actually supports it. Below
+# these it falls back to bucket 0, which IS the world-aligned frame, so the
+# fallback needs no separate code path.
+#
+# Anisotropy is (l1 - l2) / (l1 + l2) over the footprint covariance: 1.0 is a
+# perfect line, 0.0 a shapeless blob. A bush is a blob and has no direction to
+# find; so is the inside corner of an L-shaped building, where the two walls
+# average to a 45-degree answer that fits neither -- both fall back, which is
+# the honest result rather than an invented rotation.
+WORLD_ORIENT_MIN_CELLS = 6
+WORLD_ORIENT_MIN_ANISOTROPY = 0.6
+
 # --- What counts as something you could hit -----------------------------------
 #
 # A run of occupied height whose underside clears this is drawn through, not

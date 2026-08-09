@@ -1391,3 +1391,153 @@ def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
     assert len(points) > 40_000, "the timing scene stopped being a worst case"
     assert len(frame.road_vertices) > 10_000, "the ground stopped being covered"
     assert elapsed_ms < 40.0, f"scene build took {elapsed_ms:.1f} ms"
+
+
+# --- Which way a slab faces ---------------------------------------------------
+#
+# The voxel lattice is world-aligned, so every slab used to be a world-aligned
+# box: a wall running diagonally came out as a staircase of cubes and an angled
+# car as a heap of them. The frame is now measured from the footprint and the
+# box rotated to match -- but only where the footprint actually supports it.
+
+
+def _diagonal_wall(
+    angle_deg: float, length_m: float = 20.0, at_m: float = 14.0
+) -> tuple[tuple[float, float, float], ...]:
+    """A thin vertical wall at `angle_deg` to world Y."""
+    angle = np.radians(angle_deg)
+    return tuple(
+        (float(t * np.sin(angle)), float(at_m + t * np.cos(angle)), float(z))
+        for t in np.arange(-length_m / 2, length_m / 2, 0.15)
+        for z in np.arange(0.0, 3.0, 0.1)
+    )
+
+
+def _slab_tilts(frame: object) -> np.ndarray:
+    """Each slab's longest horizontal edge, as an angle in [0, 90)."""
+    boxes = _boxes(frame)
+    bottom = boxes[:, 4:8, :]
+    edges = bottom[:, [1, 2], :] - bottom[:, [0, 1], :]
+    lengths = np.hypot(edges[:, :, 0], edges[:, :, 2])
+    longest = edges[np.arange(len(edges)), np.argmax(lengths, axis=1)]
+    return np.degrees(np.arctan2(longest[:, 0], -longest[:, 2])) % 90.0
+
+
+def _dominant_tilt(frame: object) -> float:
+    """
+    The tilt of the box carrying most of the wall.
+
+    Not the median over boxes: a 20 m wall meshes as one long tilted slab plus a
+    single-voxel cap at each tip, where the 3x3 window has wall on one side only
+    and the guards correctly refuse to fit a direction. Those caps are 0.25 m of
+    honest world-aligned geometry and they must not outvote the wall itself.
+    """
+    boxes = _boxes(frame)
+    bottom = boxes[:, 4:8, :]
+    edges = bottom[:, [1, 2], :] - bottom[:, [0, 1], :]
+    lengths = np.hypot(edges[:, :, 0], edges[:, :, 2])
+    return float(_slab_tilts(frame)[int(np.argmax(lengths.max(axis=1)))])
+
+
+def _off_the_line(frame: object, angle_deg: float, at_m: float = 14.0) -> float:
+    """How far the slabs wander off the wall's true line, in metres."""
+    boxes = _boxes(frame)
+    centre_x = boxes[:, :, 0].mean(axis=1)
+    centre_y = -boxes[:, :, 2].mean(axis=1)
+    angle = np.radians(angle_deg)
+    return float(
+        np.ptp(centre_x * np.cos(angle) - (centre_y - at_m) * np.sin(angle))
+    )
+
+
+@pytest.mark.parametrize("angle", (15.0, 30.0, 45.0, 60.0, 75.0))
+def test_a_diagonal_wall_is_a_tilted_slab_not_a_staircase(angle: float) -> None:
+    """
+    The headline. Merged in the world frame a 20 m diagonal wall is dozens of
+    world-aligned cubes stepping across the line; merged in its own frame it is
+    a handful of boxes lying along it.
+    """
+    points = _diagonal_wall(angle)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, (SCENE_BOUNDARY,) * len(points))
+    )
+
+    assert len(_boxes(frame)) <= 6, "the wall is still being drawn as steps"
+    assert abs(_dominant_tilt(frame) - angle) <= 4.0
+    assert _off_the_line(frame, angle) < 0.1
+
+
+def test_a_wall_between_two_buckets_still_lies_in_one_plane() -> None:
+    """
+    The worst case, and the reason the merge KEY and the drawn POSITION are
+    deliberately different numbers. A surface half a bucket off its frame drifts
+    across the rotated rows and fragments however fine the buckets are; what
+    must not happen is that the fragments step apart. Each is drawn at its own
+    measured perpendicular, so they stay coplanar and the seams are invisible.
+    """
+    angle = 90.0 / config.WORLD_ORIENT_BUCKETS / 2.0 + 30.0
+    points = _diagonal_wall(angle)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, (SCENE_BOUNDARY,) * len(points))
+    )
+
+    assert _off_the_line(frame, angle) < 0.1, "the fragments stepped apart"
+    assert abs(_dominant_tilt(frame) - angle) <= 90.0 / (
+        config.WORLD_ORIENT_BUCKETS
+    )
+
+
+def test_a_shapeless_clump_is_never_given_a_direction() -> None:
+    """
+    A bush has no direction to find, and inventing one would be exactly the kind
+    of claim this view must not make. Its returns are a blob, the anisotropy
+    guard rejects it, and it stays in the world-aligned frame -- which is the
+    same code path as before any of this existed.
+    """
+    rng = np.random.default_rng(7)
+    points = tuple(
+        (float(x), 12.0 + float(y), float(rng.uniform(0.0, 1.4)))
+        for x, y in rng.uniform(-1.2, 1.2, size=(1500, 2))
+        if x * x + y * y <= 1.44
+    )
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, (SCENE_BOUNDARY,) * len(points))
+    )
+
+    np.testing.assert_allclose(_slab_tilts(frame), 0.0, atol=1e-6)
+
+
+def test_orientation_frames_reads_a_line_and_refuses_a_blob() -> None:
+    """The estimator on its own, away from the meshing."""
+    line = np.column_stack(
+        (np.arange(40), np.round(np.arange(40) * np.tan(np.radians(30.0))))
+    ).astype(np.int32)
+    blob = np.argwhere(np.ones((9, 9))).astype(np.int32)
+
+    on_line = world_scene.orientation_frames(line, config.WORLD_COLUMN_SIZE_M)
+    on_blob = world_scene.orientation_frames(blob, config.WORLD_COLUMN_SIZE_M)
+
+    step = 90.0 / config.WORLD_ORIENT_BUCKETS
+    assert on_line.oriented.all()
+    assert abs(float(np.median(on_line.bucket)) * step - 30.0) <= step
+    assert not on_blob.oriented.any(), "a square block has no direction"
+    assert not on_blob.bucket.any()
+
+
+def test_an_unoriented_footprint_is_meshed_exactly_as_before() -> None:
+    """
+    Bucket 0 IS the world-aligned frame, so the fallback and the old behaviour
+    have to be the same code path rather than merely similar. A world-aligned
+    wall is the case where the two must agree exactly.
+    """
+    points = _diagonal_wall(0.0)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, (SCENE_BOUNDARY,) * len(points))
+    )
+
+    assert len(_boxes(frame)) == 1
+    np.testing.assert_allclose(_slab_tilts(frame), 0.0, atol=1e-6)

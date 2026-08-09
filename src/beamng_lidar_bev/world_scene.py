@@ -67,6 +67,10 @@ from .config import (
     WORLD_MAX_ROAD_CELLS,
     WORLD_MAX_UNCERTAIN_POINTS,
     WORLD_MIN_SLAB_HEIGHT_M,
+    WORLD_ORIENT_BUCKETS,
+    WORLD_ORIENT_CELL_M,
+    WORLD_ORIENT_MIN_ANISOTROPY,
+    WORLD_ORIENT_MIN_CELLS,
     WORLD_PATH_ALERT_RGB,
     WORLD_PATH_RGB,
     WORLD_POSE_JUMP_RESET_M,
@@ -289,6 +293,151 @@ def _fade_to_air(
     faded = colours.astype(np.float64)
     faded[:, :3] += edge * (_AIR_LINEAR - faded[:, :3])
     return np.ascontiguousarray(faded, dtype=np.float32)
+
+
+def orientation_step() -> float:
+    """Radians between adjacent orientation buckets. Bucket 0 is world-aligned."""
+    return 0.5 * np.pi / WORLD_ORIENT_BUCKETS
+
+
+def rotate_xy(points: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate the XY of an (N, 2) or (N, 3) array about the world Z axis."""
+    array = np.asarray(points, dtype=np.float64)
+    cos, sin = np.cos(angle_rad), np.sin(angle_rad)
+    rotated = array.copy()
+    rotated[..., 0] = array[..., 0] * cos - array[..., 1] * sin
+    rotated[..., 1] = array[..., 0] * sin + array[..., 1] * cos
+    return rotated
+
+
+@dataclass(frozen=True)
+class ColumnFrames:
+    """Per footprint cell, the frame the surface through it actually runs in."""
+
+    bucket: np.ndarray
+    """Quantised angle, and the key runs must agree on before they may merge."""
+    angle_rad: np.ndarray
+    """The unquantised major-axis angle, kept because the bucket is folded into
+    [0, 90) and so cannot say which of the rotated axes the surface lies along."""
+    centre_xy: np.ndarray
+    """The neighbourhood's mean position -- where the returns say the surface
+    IS, as opposed to which lattice cell they happened to land in."""
+    oriented: np.ndarray
+    """Whether the estimate cleared the guards at all. False keeps the cell in
+    the world-aligned frame and untouched, which is the old behaviour."""
+
+
+def orientation_frames(cells_xy: np.ndarray, cell_size_m: float) -> ColumnFrames:
+    """
+    Which way the surface through each footprint cell runs, as a bucket index.
+
+    The whole reason slabs used to be world-aligned boxes: the voxel lattice is
+    world-aligned, so a wall at 30 degrees was a staircase of cubes and an
+    angled car a heap of them. The direction is measured here, from the shape of
+    the FOOTPRINT itself rather than from a fresh frame of returns -- the store
+    is what has been accumulated and expired correctly, so it is the honest
+    evidence, and it improves with every look.
+
+    Measured over a WORLD_ORIENT_CELL_M neighbourhood, because one 0.25 m column
+    holds less evidence than the azimuth spacing the returns arrive with. The
+    principal axis of the neighbourhood's covariance is the answer; its
+    anisotropy is how much that answer is worth.
+
+    Returns one bucket per input row, so duplicate columns (a trunk and the
+    canopy above it are two runs in one column) all get the same frame.
+    Everything that fails the guards gets bucket 0, which IS the world-aligned
+    frame -- the fallback and the old behaviour are the same code path.
+    """
+    cells = np.asarray(cells_xy, dtype=np.int64).reshape(-1, 2)
+    if not len(cells):
+        empty = np.zeros(0)
+        return ColumnFrames(
+            bucket=np.zeros(0, dtype=np.int32),
+            angle_rad=empty,
+            centre_xy=np.zeros((0, 2)),
+            oriented=np.zeros(0, dtype=bool),
+        )
+
+    # Deduplicated first: a column holding three runs must not weigh three times
+    # as much in its neighbourhood's covariance as its neighbours do.
+    packed = pack_cell_keys(cells)
+    unique, inverse = np.unique(packed, return_inverse=True)
+    first = np.zeros(len(unique), dtype=np.intp)
+    first[inverse] = np.arange(len(inverse))
+    centres = (cells[first] + 0.5) * cell_size_m
+
+    tile = np.floor(centres / WORLD_ORIENT_CELL_M).astype(np.int64)
+    coarse = pack_cell_keys(tile)
+    order = np.argsort(coarse, kind="stable")
+    starts = _group_starts(coarse[order])
+
+    ordered = centres[order]
+    tile_sums = np.add.reduceat(
+        np.column_stack(
+            (
+                np.ones(len(ordered)),
+                ordered[:, 0],
+                ordered[:, 1],
+                ordered[:, 0] ** 2,
+                ordered[:, 1] ** 2,
+                ordered[:, 0] * ordered[:, 1],
+            )
+        ),
+        starts,
+        axis=0,
+    )
+
+    # Summed over a SLIDING 3x3 of tiles rather than read from one. A tile is a
+    # world-aligned box and a surface can clip its corner, leaving three or four
+    # cells in it -- too few to fit a direction to, so it fell back to
+    # world-aligned and left stray untilted cubes along an otherwise clean wall.
+    # Measured on a 30-degree wall that was most of a 0.279 m spread about the
+    # true line. Every statistic here is a plain SUM, so widening the window is
+    # just adding the neighbours' sums: nine `searchsorted` lookups over the
+    # tile keys, which are far fewer than the cells.
+    tiles = tile[order][starts]
+    keys = pack_cell_keys(tiles)
+    window = np.zeros_like(tile_sums)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            wanted = pack_cell_keys(tiles + (dx, dy))
+            slot = np.clip(np.searchsorted(keys, wanted), 0, len(keys) - 1)
+            window += np.where(
+                (keys[slot] == wanted)[:, None], tile_sums[slot], 0.0
+            )
+
+    counts = window[:, 0]
+    safe = np.maximum(counts, 1.0)
+    mean_x, mean_y = window[:, 1] / safe, window[:, 2] / safe
+    cxx = window[:, 3] / safe - mean_x**2
+    cyy = window[:, 4] / safe - mean_y**2
+    cxy = window[:, 5] / safe - mean_x * mean_y
+
+    # Closed-form eigenvalues of a symmetric 2x2, and the major axis angle.
+    # `0.5 * arctan2(2c, a - b)` lands in [-pi/2, pi/2] and is only defined
+    # modulo pi, which is exactly right: a line has no head or tail.
+    trace, gap = cxx + cyy, np.hypot(cxx - cyy, 2.0 * cxy)
+    anisotropy = np.where(trace > 1e-12, gap / np.maximum(trace, 1e-12), 0.0)
+    angle = 0.5 * np.arctan2(2.0 * cxy, cxx - cyy)
+
+    step = orientation_step()
+    bucket = np.rint(np.mod(angle, 0.5 * np.pi) / step).astype(np.int32)
+    bucket = np.mod(bucket, WORLD_ORIENT_BUCKETS)
+    oriented = (counts >= WORLD_ORIENT_MIN_CELLS) & (
+        anisotropy >= WORLD_ORIENT_MIN_ANISOTROPY
+    )
+    bucket[~oriented] = 0
+
+    tile_counts = np.diff(np.append(starts, len(order))).astype(np.intp)
+    scatter = np.empty(len(unique), dtype=np.intp)
+    scatter[order] = np.repeat(np.arange(len(starts)), tile_counts)
+    group = scatter[inverse]
+    return ColumnFrames(
+        bucket=bucket[group],
+        angle_rad=angle[group],
+        centre_xy=np.column_stack((mean_x, mean_y))[group],
+        oriented=oriented[group],
+    )
 
 
 def face_shades(right: np.ndarray, forward: np.ndarray) -> np.ndarray:
@@ -1808,7 +1957,17 @@ class WorldSceneAssembler:
         shadow_linear: np.ndarray,
         lit_linear: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Extrude one class of voxel runs into merged, face-shaded slabs."""
+        """
+        Extrude one class of voxel runs into merged, face-shaded slabs.
+
+        Merged and extruded ONCE PER ORIENTATION BUCKET, each in its own rotated
+        frame, which is what lets a diagonal wall be one long tilted box instead
+        of a staircase of world-aligned cubes. Runs only ever merge with runs
+        that agree on a frame, so the bucket is a key field exactly like the
+        altitude and height buckets -- but unlike those it cannot simply be
+        folded into `layers`, because the cells have to be re-gridded in the
+        bucket's own frame before `merge_cell_runs` can find runs along it.
+        """
         if not len(keys_2d):
             return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
 
@@ -1821,31 +1980,134 @@ class WorldSceneAssembler:
         layers = (
             (altitude - altitude.min()) * 4096 + np.clip(span, 0, 4095)
         ).astype(np.int32)
+        frames = orientation_frames(keys_2d, WORLD_COLUMN_SIZE_M)
 
-        keys = np.column_stack((keys_2d, layers))
-        for axis in (0, 1):
-            keys, base, top = self._bridge_column_gaps(keys, base, top, axis)
-
-        # No height cull here: `_column_runs` already dropped everything under
-        # WORLD_MIN_SLAB_HEIGHT_M, and doing it there rather than here is what
-        # keeps bridging off the flat ground -- see its docstring for the
-        # measurement.
-        rectangles, extents = merge_cell_runs(
-            keys, np.column_stack((base, top)), WORLD_COLUMN_SIZE_M
+        # Which rotated axis the surface lies along cannot come from the bucket:
+        # it is folded into [0, 90), so a surface at 100 degrees sits in the
+        # 15-degree bucket lying along rotated Y rather than rotated X. Adding a
+        # quarter turn for those normalises every group to "along rotated X",
+        # which the grid does not care about -- it is square -- and which lets
+        # the perpendicular below always be Y.
+        offset = frames.angle_rad - frames.bucket * orientation_step()
+        along_x = np.abs(np.cos(offset)) >= np.abs(np.sin(offset))
+        angles = frames.bucket * orientation_step() + np.where(
+            along_x, 0.0, 0.5 * np.pi
         )
-        if not len(rectangles):
+        groups = frames.bucket * 2 + (~along_x)
+
+        right, forward = _basis(snapshot)
+        boxes: list[np.ndarray] = []
+        shades: list[np.ndarray] = []
+        for group in np.unique(groups):
+            selected = groups == group
+            angle = float(angles[selected][0])
+            centres = rotate_xy(
+                (keys_2d[selected] + 0.5) * WORLD_COLUMN_SIZE_M, -angle
+            )
+
+            # ACROSS the surface, take the position from the RETURNS rather than
+            # from the lattice. Rotating world cell centres scatters them about
+            # the true line by up to half a cell diagonal (0.18 m), and a 0.25 m
+            # bin cannot hold that without straddling: measured, a wall at 15 or
+            # 60 degrees split across two rotated rows and came back as a 0.50 m
+            # step down its whole length in 9-23 fragments. The neighbourhood's
+            # own mean is where the returns say the surface is.
+            #
+            # The KEY and the drawn POSITION are then deliberately different
+            # numbers. Binning the snapped value still has boundaries, and a
+            # wall whose line lands on one still fragments -- but each fragment
+            # is now DRAWN at its own measured perpendicular, so what was a
+            # visible 0.5 m step becomes an invisible seam between two boxes
+            # lying in the same plane. Thickness comes from the key, centre from
+            # the mean.
+            #
+            # For an unoriented cell the mean is its own centre, so the two
+            # collapse and the old behaviour falls straight out: the mean of the
+            # cell centres across a full rectangle IS that rectangle's centre.
+            perpendicular = np.where(
+                frames.oriented[selected],
+                rotate_xy(frames.centre_xy[selected], -angle)[:, 1],
+                centres[:, 1],
+            )
+
+            # Two world cells can now land in one rotated cell; the reduction
+            # below takes the min base and max top, so nothing is lost.
+            cells = np.column_stack(
+                (
+                    np.floor(centres[:, 0] / WORLD_COLUMN_SIZE_M),
+                    np.floor(perpendicular / WORLD_COLUMN_SIZE_M),
+                )
+            ).astype(np.int32)
+            keys = np.column_stack((cells, layers[selected]))
+            values = np.column_stack(
+                (base[selected], top[selected], perpendicular)
+            )
+
+            packed = pack_cell_keys(keys)
+            order = np.argsort(packed, kind="stable")
+            starts = _group_starts(packed[order])
+            keys = keys[order][starts]
+            counts = np.diff(np.append(starts, len(order)))
+            ordered = values[order]
+            values = np.column_stack(
+                (
+                    np.minimum.reduceat(ordered[:, 0], starts),
+                    np.maximum.reduceat(ordered[:, 1], starts),
+                    np.add.reduceat(ordered[:, 2], starts) / counts,
+                )
+            )
+
+            for axis in (0, 1):
+                keys, values = bridge_gaps(
+                    keys, values, axis, WORLD_COLUMN_BRIDGE_CELLS
+                )
+
+            # No height cull here: `_column_runs` already dropped everything
+            # under WORLD_MIN_SLAB_HEIGHT_M, and doing it there rather than here
+            # is what keeps bridging off the flat ground -- see its docstring.
+            rectangles, extents = merge_cell_runs(
+                keys, values, WORLD_COLUMN_SIZE_M
+            )
+            if not len(rectangles):
+                continue
+
+            x_min, x_max, y_min, y_max = rectangles.T
+            floor_z, roof_z, centre_y = extents.T
+            # Thickness from the key, centre from the measurement.
+            half = 0.5 * (y_max - y_min)
+            y_min, y_max = centre_y - half, centre_y + half
+            corners_x = np.stack(
+                (x_min, x_max, x_max, x_min, x_min, x_max, x_max, x_min), axis=1
+            )
+            corners_y = np.stack(
+                (y_min, y_min, y_max, y_max, y_min, y_min, y_max, y_max), axis=1
+            )
+            corners_z = np.stack(
+                (floor_z, floor_z, floor_z, floor_z, roof_z, roof_z, roof_z, roof_z),
+                axis=1,
+            )
+            boxes.append(
+                rotate_xy(
+                    np.stack((corners_x, corners_y, corners_z), axis=2), angle
+                )
+            )
+            # Rotating a box by `angle` turns its face normals the same way, and
+            # `n . right` for the turned normal is the untouched normal against
+            # a basis turned the other way -- so the existing world-normal
+            # shading is reused by handing it a counter-rotated basis. Per
+            # BUCKET rather than per box, because every box here shares a frame.
+            shades.append(
+                np.tile(
+                    face_shades(
+                        rotate_xy(right, -angle), rotate_xy(forward, -angle)
+                    ),
+                    (len(rectangles), 1),
+                )
+            )
+
+        if not boxes:
             return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
-
-        x_min, x_max, y_min, y_max = rectangles.T
-        low, high = extents.T
-        corners_x = np.stack(
-            (x_min, x_max, x_max, x_min, x_min, x_max, x_max, x_min), axis=1
-        )
-        corners_y = np.stack(
-            (y_min, y_min, y_max, y_max, y_min, y_min, y_max, y_max), axis=1
-        )
-        corners_z = np.stack((low, low, low, low, high, high, high, high), axis=1)
-        corners = np.stack((corners_x, corners_y, corners_z), axis=2)
+        corners = np.concatenate(boxes)
 
         # Explode each box into six independent quads so every face can hold its
         # own shade; a shared corner belongs to three faces and can only carry
@@ -1854,13 +2116,11 @@ class WorldSceneAssembler:
         world = faces.reshape(-1, 3)
         vertices = world_to_render(world, snapshot)
 
-        right, forward = _basis(snapshot)
-        shade = np.repeat(face_shades(right, forward), 4)
-        shade = np.tile(shade, len(rectangles))[:, None]
+        shade = np.repeat(np.concatenate(shades).reshape(-1), 4)[:, None]
         colour = shadow_linear + shade * (lit_linear - shadow_linear)
         colours = depth_tint(colour, vertices)
 
-        quad = np.arange(len(rectangles) * 6, dtype=np.uint32) * 4
+        quad = np.arange(len(corners) * 6, dtype=np.uint32) * 4
         indices = (quad[:, None] + _FACE_TRIANGLES[None, :]).reshape(-1)
         return vertices, colours, np.ascontiguousarray(indices)
 

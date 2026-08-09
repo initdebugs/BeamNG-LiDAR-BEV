@@ -700,6 +700,52 @@ flattens the top into them. Expect ratios of only 1.1–1.3:1 between faces; a d
 under a light air has almost no luminance room, so face shading is a *crease* cue and depth is
 the contrast cue.
 
+**Slabs are ORIENTED to the surface they describe, not to the world lattice.** The voxel grid is
+world-aligned, so every box used to be world-aligned too: a wall at 30° came out as a staircase of
+cubes and a car parked at an angle as a heap of them. `orientation_frames` measures the direction
+from the FOOTPRINT — the accumulated store, which is the evidence that has already been expired and
+bounded correctly — and `_slab_mesh` then merges and extrudes once per orientation bucket, each in
+its own rotated frame. Measured on a 20 m wall: **one to three boxes instead of dozens, drawn within
+3.75° of the truth and within 0.04 m of the true line.** Six things carry it:
+
+- **The direction cannot be measured inside one column.** A 0.25 m cell holds less evidence than the
+  azimuth stripe spacing the returns arrive with (1.24 m at 20 m), so it comes from a
+  `WORLD_ORIENT_CELL_M` neighbourhood — and from a **sliding 3×3** of those, because a fixed tile is
+  a world-aligned box whose corner a surface can clip, leaving too few cells to fit anything to.
+  That showed up as stray untilted cubes along an otherwise clean wall. Every statistic is a plain
+  sum, so widening the window is just adding neighbours' sums: nine `searchsorted` lookups over the
+  tile keys, which are far fewer than the cells.
+- **The angle is a key field**, exactly like the altitude and height buckets — runs only merge with
+  runs that agree on a frame. Unlike those it cannot simply be folded into `layers`, because the
+  cells have to be *re-gridded* in the bucket's frame before `merge_cell_runs` can find runs along
+  it. Buckets fold into [0, 90) because the grid is square.
+- **The merge KEY and the drawn POSITION are deliberately different numbers**, and this is what
+  removes the visible defect. Rotating world cell centres scatters them up to half a cell diagonal
+  (0.18 m) about the true line, which a 0.25 m bin cannot hold without straddling: a wall at 15° or
+  60° split across two rotated rows and came back as a **0.50 m step down its whole length in 9–23
+  fragments**. Thickness now comes from the key and the centre from the neighbourhood's measured
+  mean, so a surface half a bucket off its frame still fragments — that is unavoidable — but the
+  fragments stay coplanar and the seams are invisible.
+- **Bucket 0 IS the world-aligned frame**, so the fallback and the old behaviour are one code path
+  rather than two that have to be kept in step. For an unoriented cell the "measured mean" is its
+  own centre, and the mean of cell centres across a full rectangle is that rectangle's centre, so
+  the position rule collapses to the old one exactly.
+- **Nothing is oriented unless the footprint supports it** (`WORLD_ORIENT_MIN_CELLS`,
+  `WORLD_ORIENT_MIN_ANISOTROPY`). A bush is a blob with no direction to find, and so is the inside
+  corner of an L-shaped building, where two walls average to a 45° answer fitting neither. Both fall
+  back. Inventing an orientation would be the same class of error as rendering every simulator actor
+  unconditionally — a claim the perception did not make.
+- **Face shading is per bucket, and it reuses the world-normal path rather than replacing it.**
+  Rotating a box turns its face normals the same way, and `n · right` for a turned normal equals the
+  untouched normal against a basis turned the other way — so `face_shades` is handed a
+  counter-rotated basis. Every box in a bucket shares a frame, so this is one call per bucket, not
+  per box.
+
+Finer buckets are **cheaper as well as better**, which is not the obvious direction: a frame that
+fits merges into fewer, longer boxes. Measured on a street scene, 12 buckets gave 22 slabs and
+31.3 ms against 33 slabs and 33.2 ms at 6. The reason not to keep going is the fixed cost of a
+group holding almost nothing, not the geometry.
+
 The ego's contact shadow is faked with stacked translucent discs because **nothing in the scene
 can receive a real one**: the ego casts, and both `DirectionalLight`s are configured for it, but
 every large surface is a `NoLighting` material and those skip the lighting path entirely — so
@@ -1315,6 +1361,13 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   It has to exceed the vertical sampling gap on a wall (0.10 m at 50 m) so walls stay solid, and
   stay far under the clear air beneath a canopy or a bridge deck so those still split. Raising it
   to swallow noise would re-merge the tree with the grass under it.
+- `WORLD_ORIENT_CELL_M` (1.0) is a STRIDE, not the window: the window is a sliding 3x3 of tiles,
+  so it is 3 m. Long enough to hold a clear line through a wall, short enough that a curved one is
+  followed rather than averaged into a chord. `WORLD_ORIENT_BUCKETS` (12) is the angular
+  resolution — see the slab section for why finer is cheaper — and the two guards
+  (`WORLD_ORIENT_MIN_CELLS`, `WORLD_ORIENT_MIN_ANISOTROPY`) are what stop a bush being handed a
+  direction it does not have. Relax those and the failure is silent and everywhere: every clump of
+  foliage acquires a confident, wrong angle.
 - `WORLD_COLLISION_CEILING_M` (2.6) is a question about the VEHICLE, not the scene. Raise it for
   anything tall enough to hit a branch a car passes under.
 - `WORLD_CELL_MEMORY_M` (25) and `WORLD_COLUMN_MEMORY_M` (90) are **metres travelled, not
