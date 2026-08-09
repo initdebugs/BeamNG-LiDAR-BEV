@@ -42,15 +42,9 @@ from .config import (
     WORLD_CAM_DISTANCE_BASE_M,
     WORLD_CAM_DISTANCE_MAX_M,
     WORLD_CAM_DISTANCE_PER_MPS,
-    WORLD_CAM_DRIVE_SPEED_MPS,
     WORLD_CAM_HEIGHT_BASE_M,
     WORLD_CAM_HEIGHT_MAX_M,
     WORLD_CAM_HEIGHT_PER_MPS,
-    WORLD_CAM_PARK_DISTANCE_M,
-    WORLD_CAM_PARK_DWELL_S,
-    WORLD_CAM_PARK_HEIGHT_M,
-    WORLD_CAM_PARK_PITCH_DEG,
-    WORLD_CAM_PARK_SPEED_MPS,
     WORLD_CAM_PITCH_DEG,
     WORLD_CAM_PITCH_LIMIT_DEG,
     WORLD_CAM_REVERSE_SPEED_MPS,
@@ -939,12 +933,18 @@ def damp(current: float, target: float, dt: float, tau: float) -> float:
     return current + (target - current) * alpha
 
 
-def camera_target(
-    snapshot: PerceptionSnapshot, parked: bool, alerting: bool
-) -> CameraPose:
+def camera_target(snapshot: PerceptionSnapshot, alerting: bool) -> CameraPose:
     """
     Where the camera wants to be. Pure: the damping toward it lives in the
     assembler, which is the thing that has state.
+
+    There is ONE framing, and standing still is not a special case of it. A
+    top-down tilt at a standstill was tried and removed: the speed terms already
+    close the view in as the car slows, and every threshold that could switch
+    framings sits inside the range ordinary driving spends time in -- junctions,
+    queues, give-way lines -- so the view changed shape while nothing about the
+    situation had. Distance is cued here by depth tint and by a stable frame,
+    and both are worth more than a second framing.
     """
     speed = abs(snapshot.speed_mps)
     plan = snapshot.plan
@@ -953,18 +953,9 @@ def camera_target(
     )
     curvature = _travel_curvature(snapshot, reversing)
 
-    if parked:
-        # Stopped or manoeuvring: one state, not two. "Parked" and "shuffling
-        # into a space" are the same situation, and separate thresholds for them
-        # would fight each other at the speeds parking actually happens at.
-        height = WORLD_CAM_PARK_HEIGHT_M
-        distance = WORLD_CAM_PARK_DISTANCE_M
-        pitch = WORLD_CAM_PARK_PITCH_DEG
-    else:
-        height = WORLD_CAM_HEIGHT_BASE_M + speed * WORLD_CAM_HEIGHT_PER_MPS
-        height += abs(curvature) * WORLD_CAM_CORNER_LIFT_M
-        distance = WORLD_CAM_DISTANCE_BASE_M + speed * WORLD_CAM_DISTANCE_PER_MPS
-        pitch = WORLD_CAM_PITCH_DEG
+    height = WORLD_CAM_HEIGHT_BASE_M + speed * WORLD_CAM_HEIGHT_PER_MPS
+    height += abs(curvature) * WORLD_CAM_CORNER_LIFT_M
+    distance = WORLD_CAM_DISTANCE_BASE_M + speed * WORLD_CAM_DISTANCE_PER_MPS
     if alerting:
         height += WORLD_CAM_ALERT_LIFT_M
         distance += WORLD_CAM_ALERT_PULLBACK_M
@@ -981,15 +972,14 @@ def camera_target(
     return CameraPose(
         height_m=float(
             np.clip(height, WORLD_CAM_HEIGHT_BASE_M, WORLD_CAM_HEIGHT_MAX_M)
-            if not parked
-            else height
         ),
         distance_m=float(
             np.clip(distance, WORLD_CAM_DISTANCE_BASE_M, WORLD_CAM_DISTANCE_MAX_M)
-            if not parked
-            else distance
         ),
-        pitch_deg=float(max(pitch, WORLD_CAM_PITCH_LIMIT_DEG)),
+        # Kept as a guard rather than as a working limit: at exactly -90 the
+        # euler yaw is degenerate and the view spins on its own, so any future
+        # pitch term has to run into this rather than into that.
+        pitch_deg=float(max(WORLD_CAM_PITCH_DEG, WORLD_CAM_PITCH_LIMIT_DEG)),
         yaw_deg=(180.0 if reversing else 0.0) + corner,
     )
 
@@ -1026,8 +1016,6 @@ class WorldSceneAssembler:
         # land exactly on its target instead of easing in from a guess.
         self._camera_pose: CameraPose | None = None
         self._camera_at: float | None = None
-        self._parked = False
-        self._parked_for = 0.0
         # Parallel numpy arrays rather than dicts of dataclasses: both stores
         # are bin-and-reduce over the cloud and stay vectorised end to end.
         self._clear_geometry()
@@ -1933,9 +1921,7 @@ class WorldSceneAssembler:
             dt = max(0.0, float(snapshot.timestamp) - self._camera_at)
         self._camera_at = float(snapshot.timestamp)
 
-        target = camera_target(
-            snapshot, self._camera_parked(snapshot, dt), bool(alert)
-        )
+        target = camera_target(snapshot, bool(alert))
         if self._camera_pose is None:
             pose = target
         else:
@@ -1969,24 +1955,6 @@ class WorldSceneAssembler:
             ),
             (pose.pitch_deg, pose.yaw_deg, 0.0),
         )
-
-    def _camera_parked(self, snapshot: PerceptionSnapshot, dt: float) -> bool:
-        """
-        Whether the car has been stopped long enough to tilt the view down.
-
-        Hysteresis AND a dwell. Parking happens at 0.3-1 m/s, so a single
-        threshold nods the camera every time the car creeps; between the two
-        speeds the current state simply holds.
-        """
-        speed = abs(snapshot.speed_mps)
-        if speed >= WORLD_CAM_DRIVE_SPEED_MPS:
-            self._parked_for = 0.0
-            self._parked = False
-        elif speed <= WORLD_CAM_PARK_SPEED_MPS:
-            self._parked_for += dt
-            if self._parked_for >= WORLD_CAM_PARK_DWELL_S:
-                self._parked = True
-        return self._parked
 
     @staticmethod
     def _alert(aeb: AebState | None, rear_aeb: AebState | None) -> str:

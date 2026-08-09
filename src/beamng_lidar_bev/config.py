@@ -567,23 +567,19 @@ WORLD_CAM_TAU_S = 0.35
 # well over a second to arrive. ~0.16 s puts it there in about half of one.
 WORLD_CAM_YAW_TAU_S = 0.16
 
-# Stopped: tilt toward a near-vertical view that shows what is around the car
-# rather than what is far in front of it, and pull in close enough to park by.
+# There is no standstill framing, and the absence is deliberate. A near-vertical
+# top-down tilt at a stop was built, with a hysteresis and a dwell to keep it
+# from firing at every give-way line, and then removed: the speed terms above
+# already close the view in as the car slows, so the second framing bought very
+# little, and every threshold that could switch between the two sits inside the
+# band ordinary driving spends real time in -- junctions, queues, traffic,
+# parking. The view changing shape while the situation had not is worse than the
+# view being slightly too far back while stopped.
 #
-# Both a HYSTERESIS and a DWELL, because one alone is not enough. Parking
-# manoeuvres live at 0.3-1 m/s, so a single threshold would nod the camera every
-# time the car crept; the dwell means a give-way line or a moment of shuffling
-# never triggers it, and the higher release speed means pulling away restores
-# the driving view at once rather than lagging behind the car.
-WORLD_CAM_PARK_SPEED_MPS = 0.5
-WORLD_CAM_DRIVE_SPEED_MPS = 2.0
-WORLD_CAM_PARK_DWELL_S = 1.0
-WORLD_CAM_PARK_HEIGHT_M = 12.0
-WORLD_CAM_PARK_DISTANCE_M = 4.0
-WORLD_CAM_PARK_PITCH_DEG = -72.0
 # Never steeper than this. At exactly -90 the euler yaw becomes degenerate --
-# pitch and yaw rotate about the same axis and the view spins on its own -- and
-# -80 already reads as top-down, so there is nothing to buy by going closer.
+# pitch and yaw rotate about the same axis and the view spins on its own. With
+# the standstill tilt gone nothing approaches it, so it stands as a guard on
+# whatever pitch term comes next rather than as a working limit.
 WORLD_CAM_PITCH_LIMIT_DEG = -80.0
 # Yaw a few degrees into the bend, so the inside of the corner is not hidden
 # behind the ego. Bounded hard: the view is a chase camera, not a cinematic one,

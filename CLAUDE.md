@@ -459,13 +459,18 @@ Four things about it are load-bearing:
 - **The first frame snaps.** A pose of `None` means "no pose yet", so a fresh assembler lands on its
   target rather than easing in from a guess — which is what keeps every camera test that builds a
   fresh assembler measuring the scene instead of the initial condition.
-- **The standstill tilt needs a hysteresis AND a dwell.** Parking manoeuvres live at 0.3–1 m/s, so a
-  single threshold nods the view every time the car creeps; the dwell (`WORLD_CAM_PARK_DWELL_S`)
-  is what separates *stopping* from *being stopped*, and the higher release speed is what makes
-  pulling away restore the driving view at once. Pitch stops at `WORLD_CAM_PITCH_LIMIT_DEG` (−80°)
-  because at exactly −90° the euler yaw is degenerate and the view spins on its own; −80° already
-  reads as top-down. Parking and standing still are ONE state — separate thresholds for them would
-  fight each other at the speeds parking actually happens at.
+- **There is ONE framing, and standing still is not a special case of it.** A near-vertical
+  standstill tilt was built — with a hysteresis *and* a dwell, because parking manoeuvres live at
+  0.3–1 m/s and a single threshold nods the view every time the car creeps — and then removed. The
+  gating was never the real problem: every threshold that can switch framings sits inside the band
+  ordinary driving spends real time in (junctions, queues, traffic, parking), so no amount of
+  hysteresis stops the view changing shape while the situation has not. The speed terms already
+  close the view in as the car slows, so the second framing bought little, and distance is cued by
+  depth tint and by a *stable* frame. Don't reintroduce it as "just a small tilt": the failure is
+  the mode switch, not its magnitude. `WORLD_CAM_PITCH_LIMIT_DEG` (−80°) survives as a guard —
+  at exactly −90° the euler yaw is degenerate and the view spins on its own — but nothing
+  approaches it now, so it constrains whatever pitch term comes next rather than anything today.
+  Pinned by `test_stopping_does_not_change_the_framing`.
 - **The AEB framing move is gated on `_alert`'s own string**, which `update()` already computes and
   which is non-empty only while a pedal is down. Reusing it is what guarantees the camera and the
   overlay agree about what an event is; a view that moved for the armed state would be a nuisance
@@ -1238,9 +1243,8 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   never from `plan.command.mode`: `plan` is None whenever self-driving is off, which is exactly
   when a human is doing the reversing, so the old check only ever swung the camera round for the
   autonomous reverse recovery. `PerceptionSnapshot.forward_speed_mps` carries the sign because
-  `speed_mps` is `norm(vel)` and cannot. **The camera is now stateful and damped — see its own
-  section below; `WORLD_CAM_PARK_SPEED_MPS` and `WORLD_CAM_DRIVE_SPEED_MPS` are a hysteresis pair
-  and collapsing them nods the view at every give-way line.**
+  `speed_mps` is `norm(vel)` and cannot. **The camera is stateful and damped, and there is exactly
+  one framing — see its own section above before adding a second.**
 - `WORLD_COLUMN_VERTICAL_BRIDGE_BINS` went 1 → 2 when the reach went to 150 m, and it had to.
   Vertical sampling on a wall is `r·Δθ` at 0.118° — 0.10 m at 50 m but 0.31 m at 150 m — so at one
   0.25 m bin every return past ~110 m became its own sub-minimum run and was dropped, and the far

@@ -1043,54 +1043,35 @@ def test_the_reverse_swing_sweeps_round_instead_of_teleporting() -> None:
     assert max(abs(frame.camera_position[0]) for frame in frames) > 5.0
 
 
-def test_the_camera_tilts_down_once_the_car_has_been_stopped_a_while() -> None:
+def test_stopping_does_not_change_the_framing() -> None:
     """
-    The standstill ask. Stopped, the useful view is what is AROUND the car
-    rather than far in front of it.
-    """
-    assembler = WorldSceneAssembler()
-    assembler.update(_snapshot(speed_mps=8.0, forward_speed_mps=8.0))
+    There is ONE framing, and standing still is not a special case of it.
 
-    stopped = _roll(assembler, 4.0, speed_mps=0.0, forward_speed_mps=0.0)
-
-    assert stopped[-1].camera_euler[0] < -60.0
-    # Closer in than the driving view ever gets, and higher than it would be at
-    # this speed -- which is what "look at what is around the car" means.
-    assert stopped[-1].camera_position[2] < config.WORLD_CAM_DISTANCE_BASE_M
-    assert stopped[-1].camera_position[1] > config.WORLD_CAM_HEIGHT_BASE_M
-    assert stopped[-1].camera_position[2] < stopped[0].camera_position[2]
-
-
-def test_a_give_way_stop_does_not_nod_the_camera() -> None:
-    """
-    Hysteresis alone is not enough: parking manoeuvres live at 0.3-1 m/s, so a
-    bare speed threshold tilts the view at every junction. The dwell is what
-    distinguishes stopping from being stopped.
+    A near-vertical standstill tilt was built and removed. It had to be gated on
+    speed, and every threshold that could switch framings sits inside the band
+    ordinary driving spends real time in -- junctions, queues, parking -- so no
+    hysteresis or dwell stops the view changing shape while the situation has
+    not. Pitch is held here across a full stop and a pull-away, and the position
+    is left to the speed terms, which already close it in as the car slows.
     """
     assembler = WorldSceneAssembler()
     assembler.update(_snapshot(speed_mps=8.0, forward_speed_mps=8.0))
 
-    paused = _roll(
-        assembler,
-        config.WORLD_CAM_PARK_DWELL_S * 0.6,
-        speed_mps=0.0,
-        forward_speed_mps=0.0,
+    stopped = _roll(assembler, 6.0, speed_mps=0.0, forward_speed_mps=0.0)
+    away = _roll(assembler, 2.0, start=6.0, speed_mps=6.0, forward_speed_mps=6.0)
+
+    for frame in (*stopped, *away):
+        assert frame.camera_euler[0] == pytest.approx(
+            config.WORLD_CAM_PITCH_DEG, abs=1.0
+        )
+    # Stopped it settles ON the base framing rather than inside it, which is
+    # what makes the standstill view the near end of one continuum instead of a
+    # second mode.
+    assert stopped[-1].camera_position[1] == pytest.approx(
+        config.WORLD_CAM_HEIGHT_BASE_M, abs=0.5
     )
-
-    assert paused[-1].camera_euler[0] == pytest.approx(
-        config.WORLD_CAM_PITCH_DEG, abs=1.0
-    )
-
-
-def test_pulling_away_brings_the_driving_view_straight_back() -> None:
-    assembler = WorldSceneAssembler()
-    assembler.update(_snapshot(speed_mps=0.0, forward_speed_mps=0.0))
-    _roll(assembler, 4.0, speed_mps=0.0, forward_speed_mps=0.0)
-
-    driving = _roll(assembler, 2.0, start=4.0, speed_mps=6.0, forward_speed_mps=6.0)
-
-    assert driving[-1].camera_euler[0] == pytest.approx(
-        config.WORLD_CAM_PITCH_DEG, abs=1.5
+    assert stopped[-1].camera_position[2] == pytest.approx(
+        config.WORLD_CAM_DISTANCE_BASE_M, abs=0.5
     )
 
 
