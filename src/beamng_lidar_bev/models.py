@@ -213,6 +213,18 @@ class PerceptionSnapshot:
     plan: DrivingPlan | None = None
     aeb: AebState | None = None
     rear_aeb: AebState | None = None
+    surface_materials: np.ndarray | None = None
+    """
+    Per point, what the surface it belongs to is made of (a `semantics.SURFACE_*`
+    code), or None when the caller has none to offer.
+
+    Optional because it is display-only enrichment: the scene assembler decides
+    what IS a surface from shape alone, and this only decides what colour the
+    surface it found should be. None fills in as zeros, which is
+    `SURFACE_UNKNOWN` -- the value that renders as unidentified ground. That
+    constant is not imported here because `semantics` sits ABOVE `models` in the
+    layering, so the zero is a contract between the two.
+    """
     forward_speed_mps: float = 0.0
     """
     Velocity projected onto the vehicle's forward axis, so reverse is < 0.
@@ -237,8 +249,18 @@ class PerceptionSnapshot:
         ):
             if len(value) != 3:
                 raise ValueError(f"{name} must contain three components")
+        materials = (
+            np.zeros(len(points), dtype=np.uint8)
+            if self.surface_materials is None
+            else np.asarray(self.surface_materials, dtype=np.uint8).reshape(-1)
+        )
+        if len(materials) != len(points):
+            raise ValueError("Perception point and surface-material counts differ")
         object.__setattr__(self, "points_world", np.ascontiguousarray(points))
         object.__setattr__(self, "semantic_groups", np.ascontiguousarray(groups))
+        object.__setattr__(
+            self, "surface_materials", np.ascontiguousarray(materials)
+        )
 
 
 @dataclass(frozen=True)

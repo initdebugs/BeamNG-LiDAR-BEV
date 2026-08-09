@@ -264,6 +264,23 @@ WORLD_RADIUS_M = 150.0
 # rather than as distance. Beyond this the ground is simply not drawn, which is
 # honest: nothing was measured there.
 WORLD_ROAD_RADIUS_M = 70.0
+# ...and the UNPAVED surface stops sooner still, because bridging is what holds
+# a quarter-metre lattice together at range and past this it can no longer
+# reach. Ground rings land dr = (r^2/h)*dtheta apart, which for the roof unit is
+# 5.9e-4 * r^2: 0.24 m at 20 m, 0.72 m at 35 m, 1.19 m at 45 m, against the
+# 0.75 m WORLD_ROAD_BRIDGE_CELLS can close. Beyond about 36 m a single frame
+# therefore produces disconnected rings rather than a surface, so drawing it is
+# not a coarser answer but a wrong one.
+#
+# The ROAD keeps its 70 m because it is driven ALONG: accumulation over
+# WORLD_CELL_MEMORY_M sweeps the rings down its length and fills it in, which
+# never happens for the terrain out to one side.
+#
+# It is also the cost bound. The road is a ribbon; the ground is a disc, and a
+# 0.25 m lattice over the whole 70 m one meshed to 110k vertices and took the
+# scene build to 77 ms against a 40 ms tick. Area goes as r^2, so this is the
+# constant to move -- in either direction -- if SCENE BUILD starts logging.
+WORLD_SURFACE_RADIUS_M = 40.0
 # The outer band of the road surface is dissolved into the air rather than cut
 # off, because the road stops at its own radius while everything else runs on to
 # WORLD_RADIUS_M. A hard rim reads as a cliff -- a drawn edge where there is
@@ -404,6 +421,40 @@ WORLD_ROAD_RGB = "#6a7176"
 WORLD_BOUNDARY_RGB = "#171c20"       # shadowed faces; the ladder's 12.2:1 vs air
 WORLD_BOUNDARY_LIT_RGB = "#454f58"   # 2.0:1 above the shadow side
 WORLD_UNCERTAIN_RGB = "#545c62"
+# Surface materials. Every one of these sits on the ROAD's rung of the ladder
+# and separates by HUE, because there is no room for it to do anything else:
+# air-to-black is 14.96:1 in total, which supports two 3:1 steps and no more, so
+# a material that separated itself by lightness would have to leave the rung and
+# collide with either the air or the obstacle band.
+#
+# The usable band is therefore narrow and it is arithmetic rather than taste --
+# 0.1335 to 0.1992 relative luminance for 3:1 both ways -- and every colour here
+# was solved in CIELAB at a chosen hue and lightness and then converted back,
+# rather than picked by eye. Measured: worst contrast 3.04:1 against the
+# obstacle band and 3.08:1 against air, worst pairwise distance dE 7.1 (paved vs
+# unknown, which are deliberately the closest pair -- see below).
+# `test_world_palette.py` recomputes all of it.
+#
+# PAVED is WORLD_ROAD_RGB itself, so a road-classified surface is exactly the
+# colour the road has always been and nothing about the existing view moves.
+# The paved material IS the road colour, aliased rather than copied so the two
+# can never drift: every existing contrast fact about the road is a fact about
+# a paved surface, and a near-miss beside it would quietly invalidate them.
+WORLD_SURFACE_PAVED_RGB = WORLD_ROAD_RGB
+WORLD_SURFACE_UNKNOWN_RGB = "#6d6569"
+# Deliberately the least distinct, for the same reason WORLD_UNCERTAIN_RGB is
+# the weakest mark in the scene: this is ground the sensors resolved but nothing
+# identified, so reading as "some sort of surface" is honest. It is the only
+# pair below dE 10 and that is a choice, not a rounding error.
+WORLD_SURFACE_SIDEWALK_RGB = "#83786a"
+WORLD_SURFACE_VEGETATION_RGB = "#5d724f"
+WORLD_SURFACE_BARE_RGB = "#85664c"
+# Mud, sand, rock and gravel share one warm earth colour. Splitting rock off as
+# its own grey was tried and abandoned: paved, sidewalk and rock are all greys,
+# and three of them inside a band this narrow are not tellable apart -- rock
+# came out dE 6.7 from paved, below the pair this palette already treats as its
+# closest. Hard unpaved ground is one material here.
+WORLD_SURFACE_WATER_RGB = "#447195"
 WORLD_PATH_RGB = "#4ea8f2"
 WORLD_PATH_ALERT_RGB = "#c0271e"
 # Traffic drawn from LiDAR alone, in the same blue as the corroborated actor
@@ -612,6 +663,30 @@ ROAD_CLASSES = frozenset(
 GROUND_FALLBACK_CLASSES = frozenset({"BACKGROUND"})
 GROUND_FALLBACK_ABOVE_M = 0.12
 GROUND_FALLBACK_BELOW_M = 0.50
+
+# --- Surface materials --------------------------------------------------------
+#
+# What a surface is MADE OF, which is a different question from ROAD_CLASSES.
+# That set answers "may the car drive here" and feeds the road store; this
+# answers "what colour is the ground" and is display-only. A class can be in
+# both -- everything in ROAD_CLASSES is the paved material -- and being in
+# neither is fine and common, because most of the palette is not ground at all.
+#
+# The classes are BeamNG's own, verified against `tech/annotations.json` in
+# 0.38.5. Names that do not exist there (GRAVEL, DIRT, TERRAIN) are listed
+# anyway: a missing name simply never matches, and community maps and future
+# versions cost nothing to accommodate.
+#
+# Only what the SHAPE test has already accepted as ground is ever coloured by
+# these, so a class appearing here does not make it a surface. NATURE is the
+# clearest case: it covers both grass and tree canopy, and the canopy is a tall
+# run that never reaches the surface mesh at all.
+SIDEWALK_CLASSES = frozenset({"SIDEWALK"})
+VEGETATION_CLASSES = frozenset({"GRASS", "NATURE"})
+BARE_GROUND_CLASSES = frozenset(
+    {"DIRT", "GRAVEL", "MUD", "ROCK", "SAND", "TERRAIN"}
+)
+WATER_CLASSES = frozenset({"WATER"})
 
 # --- Self-driving ------------------------------------------------------------
 #

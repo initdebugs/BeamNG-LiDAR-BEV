@@ -291,6 +291,20 @@ coast briefly through a missed scan, fade by `WORLD_ACTOR_FADE_S`, and then
 disappear. Never render every simulator actor unconditionally; that would turn
 the display into ground truth rather than a perception visualization.
 
+**`classify_surface_materials` is a THIRD, orthogonal question, and keeping it separate is what
+makes unannotated maps work.** The groups say what kind of thing a return belongs to; the
+materials (`SURFACE_PAVED`/`SIDEWALK`/`VEGETATION`/`BARE`/`WATER`/`UNKNOWN`) say what the ground is
+made of, and nothing else. **Shape decides what IS a surface; semantics only decide what colour the
+surface it found should be** — so a map with no annotations at all still gets a floor, in the
+unidentified-ground colour, and `NATURE` appearing in `VEGETATION_CLASSES` does not turn a tree
+canopy into grass, because the canopy is a tall run that never reaches the surface mesh.
+
+It is one `searchsorted` over a sorted `(colour → material)` table rather than an `isin` sweep per
+material: the table is 29 entries and the cloud is 50–110k, and this tick already runs six O(cloud)
+sweeps. `ROAD_CLASSES` still answers its own separate question — *may the car drive here* — and
+anything the road rule accepted but no material named is forced to `SURFACE_PAVED`, so the
+geometric fallback band keeps looking exactly as it always has.
+
 **A car's VISIBILITY must never depend on that actor path, and it once did.** Vehicle returns
 were excluded from the scene geometry on the understanding that traffic would be drawn as
 corroborated actor models instead — and `_poll_actor_observations` gets its poses from
@@ -536,13 +550,55 @@ weakest mark at 1.37:1, because it is the least confident thing drawn.
 The old palette had this inverted: empty air was the *brightest* surface, so a building
 silhouetted against it was **1.35:1**.
 
+**The surface materials all live on the ROAD's rung and separate by HUE, and that is forced, not
+chosen.** With only two steps in the whole range, a material that separated itself by lightness has
+to leave the rung and collide with the air or with the obstacle band — the first attempt at a light
+concrete sidewalk (`#848a90`) came out at **2.48:1 against air**. The usable band is arithmetic:
+relative luminance 0.1335–0.1992 for 3:1 both ways. Every `WORLD_SURFACE_*_RGB` was therefore solved
+in CIELAB at a chosen hue and lightness and converted back, not picked by eye; measured worst case
+is 3.04:1 against the obstacle band, 3.08:1 against air.
+
+**Contrast is the wrong instrument for telling two of them apart** — two colours of equal lightness
+are 1.0:1 apart however different they look — so `test_world_palette.py` measures pairwise **CIELAB
+distance** instead, and requires ΔE ≥ 6. `SURFACE_PAVED` *is* `WORLD_ROAD_RGB`, aliased rather than
+copied, so every existing contrast fact about the road still describes what is on screen.
+`surface_unknown #6d6569` is deliberately the closest pair to it (ΔE 7.1) for the same reason
+`uncertain` is the weakest mark: it is ground the sensors resolved but nothing identified. Rock was
+tried as its own grey and abandoned at **ΔE 6.7 from paved** — paved, sidewalk and rock are three
+greys and a band this narrow will not hold them, so hard unpaved ground is one material.
+
 **The road is one continuous surface with SHARED corners, not a quilt of merged rectangles.** It
 used to be `merge_cell_runs` output drawn flat at each rectangle's mean height; neighbouring
 rectangles share no vertices, so every difference in mean height was a hard step and a sloping
 road terraced. Cells now share their lattice corners, which removes the failure rather than
 reducing it — a corner holds one height, so two cells meeting there cannot disagree. There is no
-Python loop left in `_road_mesh` at all, which is why dropping the merge is *cheaper* than
-keeping it despite emitting far more geometry.
+Python loop left in `_ground_mesh` at all, which is why dropping the merge is *cheaper* than
+keeping it despite emitting far more geometry. A corner holds one *material* and one *fade radius*
+for the same reason, so both average over the same cells the height does.
+
+**The ground mesh has TWO sources and only paved ground comes from the road store.** Everything the
+annotations did not call road arrives as a `SCENE_BOUNDARY` return, and the flat ones used to be
+dropped in `_column_runs` for being too short to be structure — so grass, dirt, a gravel yard, and
+the whole of any unannotated map rendered as **nothing at all**, a hole where the ground is. Those
+runs are now promoted to the ground surface, which is where their shape says they belong. Four
+things about it are load-bearing:
+
+- **The threshold is `WORLD_MIN_SLAB_HEIGHT_M` itself, not a second constant**, so the promotion
+  takes *exactly* what was being discarded and nothing that draws as a slab today changes. A 0.12 m
+  kerb is still structure the planner steers around, not floor.
+- **A promoted run must be the LOWEST in its column**, never merely a short one. A flat roof, the
+  top of a wall and the underside of a canopy are all short runs sitting above something, and a
+  floor drawn at roof height is a floor through the middle of the building.
+- **There is deliberately no ceiling test on it.** A hillside 10 m above the ego plane is still a
+  surface; `WORLD_COLLISION_CEILING_M` asks whether something can be driven *into*, which is a
+  different question from whether it can be stood on.
+- **Where both sources hold a cell the ROAD wins** — "the car may drive here" is the more specific
+  claim, and it is the one the view exists to make. It falls out of the same stable-sort
+  "last one wins" mechanic `_update_road_cells` uses, with the road appended last.
+
+`_column_runs` is called ONCE in `update` and its answer handed to both consumers, because the
+ground surface and the slabs are the two halves of one reduceat over the voxel store: what is flat
+enough to stand on, and what is not.
 
 **Going to 0.25 m cells outruns the sampling at range, and the road must be bridged or it breaks
 into a checkerboard.** Ground returns thin as `r²` radially and as `r` in azimuth, so past
@@ -649,17 +705,39 @@ can receive a real one**: the ego casts, and both `DirectionalLight`s are config
 every large surface is a `NoLighting` material and those skip the lighting path entirely — so
 `receivesShadows: true` on the road mesh is a no-op.
 
-**There are TWO radii, because the road and the things standing on it are not observable to the
-same distance.** `WORLD_RADIUS_M` is 150 m and covers structure, traffic and actors: the front
+**There are THREE radii, because structure, road and open ground are not observable to the same
+distance.** `WORLD_RADIUS_M` is 150 m and covers structure, traffic and actors: the front
 unit reaches 200 m, a wall is a big vertical target, and azimuth spacing (which grows only as
 `r`) still puts several returns on a building at 150 m. `WORLD_ROAD_RADIUS_M` is 70 m and covers
 the ground, because ground rings go as `r²` — 0.24 m apart at 20 m but ~1.5 m at 50 m and ~6 m at
 100 m — so past about 70 m there is no surface to reconstruct, only isolated rings metres apart,
 and meshing those gives a corrugated road rather than distance.
 
-The road's outer `WORLD_EDGE_FADE_M` dissolves into the air. It stops at its own radius while
-everything else runs on to 150 m, and without the fade that ends on a hard rim which reads as a
-cliff — a drawn boundary where there is only the end of what was measured.
+`WORLD_SURFACE_RADIUS_M` is 40 m and covers **unpaved** ground. Ring spacing is `(r²/h)·Δθ` =
+`5.9e-4·r²` for the roof unit — 0.72 m at 35 m, 1.19 m at 45 m — against the 0.75 m
+`WORLD_ROAD_BRIDGE_CELLS` can close, so past roughly 36 m a single frame yields disconnected rings
+rather than a surface. **The road reaches further because it is driven ALONG**: accumulation over
+`WORLD_CELL_MEMORY_M` sweeps the rings down its length and fills it in, which never happens for the
+terrain out to one side. It is also the cost bound — see the scene-build note below.
+
+Each half of the ground carries its own fade radius per cell, averaged to the corners exactly as
+height and colour are, so the seam between them is a gradient and each dissolves where it really
+ends. Without the fade a surface ends on a hard rim which reads as a cliff — a drawn boundary where
+there is only the end of what was measured.
+
+**Surfacing the whole ground is the change most likely to blow the scene budget, and it did once.**
+The road is a ribbon; the ground is a disc. A 0.25 m lattice over the full 70 m radius meshed to
+110k vertices and took the build to **77 ms against a 40 ms tick**; bounded to 40 m it is 40k
+vertices and 37 ms, pinned by `test_covering_the_ground_stays_inside_the_scene_budget`. Area goes
+as `r²`, so `WORLD_SURFACE_RADIUS_M` is the constant to move in either direction if SCENE BUILD
+starts logging. Note this runs on `SceneWorker`'s thread, so an overrun costs WORLD frames rather
+than control latency.
+
+**Corner averaging here uses `bincount` per channel and NOT the sort-once-and-`reduceat` idiom the
+two accumulators are built on.** That was tried and is *slower* — 43.4 ms against 37.4 on a 40k-cell
+disc — because reducing five channels together means materialising a `(4N, 5)` repeat and gathering
+it into sort order, and those two copies cost more than the sweeps they save. The accumulators win
+with it because there the sort is the thing being avoided; here `np.unique` has to sort anyway.
 
 Qt's `offscreen` platform plugin is not QRhi/3D capable, so an offscreen smoke
 can validate QML loading, property binding, lifecycle and fallback but cannot
@@ -1216,9 +1294,16 @@ had a measured failure:
 The WORLD constants have a trap of their own: **several of them are sized by the SENSOR and one
 is sized by the RENDERER, and it is no longer the renderer that binds.**
 
-- `WORLD_RADIUS_M` (150) vs `WORLD_ROAD_RADIUS_M` (70) are different questions — how far
-  STRUCTURE is observable, and how far the GROUND is. Collapsing them either shreds the road into
-  rings or throws away the reach. See the renderer section.
+- `WORLD_RADIUS_M` (150) vs `WORLD_ROAD_RADIUS_M` (70) vs `WORLD_SURFACE_RADIUS_M` (40) are three
+  different questions — how far STRUCTURE is observable, how far the ROAD is, and how far OPEN
+  GROUND is. Collapsing any pair either shreds a surface into rings or throws away the reach. The
+  road outreaches the terrain because it is driven along and accumulation fills it in; the terrain
+  beside it is never swept that way. The third one is also the scene-build cost bound, and it is
+  the constant to move if SCENE BUILD starts logging. See the renderer section.
+- `ROAD_CLASSES` (may the car drive here) vs the `WORLD_SURFACE_*` class sets (what is the ground
+  made of) are likewise different questions over the same palette, and a class can be in both. Do
+  not fold the material sets into the road set to "simplify": road feeds the road store and the
+  BEV split, materials feed colour only, and `NATURE` covers both grass and tree canopy.
 - `WORLD_CELL_SIZE_M` / `WORLD_COLUMN_SIZE_M` are 0.25, down from 0.5. They were 0.5 because of
   the `ProceduralMesh` Python loop, not because of the data; with the raw-buffer bridge the grid
   follows the sensors instead. 0.25 is what the roof unit supports — ring spacing is 0.24 m at

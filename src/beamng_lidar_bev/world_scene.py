@@ -79,6 +79,13 @@ from .config import (
     WORLD_SLAB_LIGHT_DIR,
     WORLD_SLAB_SIDE_SHADE_RANGE,
     WORLD_SLAB_TOP_SHADE,
+    WORLD_SURFACE_BARE_RGB,
+    WORLD_SURFACE_PAVED_RGB,
+    WORLD_SURFACE_RADIUS_M,
+    WORLD_SURFACE_SIDEWALK_RGB,
+    WORLD_SURFACE_UNKNOWN_RGB,
+    WORLD_SURFACE_VEGETATION_RGB,
+    WORLD_SURFACE_WATER_RGB,
     WORLD_UNCERTAIN_RGB,
     WORLD_VEHICLE_LIT_RGB,
     WORLD_VEHICLE_RGB,
@@ -100,6 +107,12 @@ from .semantics import (
     SCENE_UNKNOWN,
     SCENE_VEHICLE,
     SCENE_VULNERABLE,
+    SURFACE_BARE,
+    SURFACE_PAVED,
+    SURFACE_SIDEWALK,
+    SURFACE_UNKNOWN,
+    SURFACE_VEGETATION,
+    SURFACE_WATER,
 )
 
 _EMPTY_VERTICES = np.empty((0, 3), dtype=np.float32)
@@ -177,6 +190,30 @@ _BOUNDARY_LIT_LINEAR = linear_rgb(WORLD_BOUNDARY_LIT_RGB)
 _PATH_LINEAR = linear_rgb(WORLD_PATH_RGB)
 _PATH_ALERT_LINEAR = linear_rgb(WORLD_PATH_ALERT_RGB)
 _UNCERTAIN_LINEAR = linear_rgb(WORLD_UNCERTAIN_RGB)
+# Indexed by SURFACE_* code, so the lookup is one fancy-index over the cells.
+# Every entry sits on the road's rung of the contrast ladder and separates by
+# hue -- see the WORLD_SURFACE_* block in config for why it cannot be otherwise,
+# and `test_world_palette.py` for the recomputation.
+_SURFACE_LINEAR = np.stack(
+    [
+        linear_rgb(colour)
+        for _, colour in sorted(
+            (
+                (int(SURFACE_UNKNOWN), WORLD_SURFACE_UNKNOWN_RGB),
+                (int(SURFACE_PAVED), WORLD_SURFACE_PAVED_RGB),
+                (int(SURFACE_SIDEWALK), WORLD_SURFACE_SIDEWALK_RGB),
+                (int(SURFACE_VEGETATION), WORLD_SURFACE_VEGETATION_RGB),
+                (int(SURFACE_BARE), WORLD_SURFACE_BARE_RGB),
+                (int(SURFACE_WATER), WORLD_SURFACE_WATER_RGB),
+            )
+        )
+    ]
+)
+# The height field of a ground cell's key, so a bridge deck and the road beneath
+# it stay separate surfaces instead of averaging into one ramp. Shared by the
+# road store and by the runs promoted out of the voxel store, which is the whole
+# reason it is a named constant rather than a literal in each.
+_GROUND_LAYER_M = 0.75
 _VEHICLE_LINEAR = linear_rgb(WORLD_VEHICLE_RGB)
 _VEHICLE_LIT_LINEAR = linear_rgb(WORLD_VEHICLE_LIT_RGB)
 _AEB_ARMED_LINEAR = linear_rgb(WORLD_AEB_ARMED_RGB)
@@ -1036,6 +1073,11 @@ class WorldSceneAssembler:
         self._road_height = _EMPTY_CELL_VALUES.copy()
         # Odometer readings, not timestamps.
         self._road_seen = _EMPTY_CELL_VALUES.copy()
+        # What the surface is made of, for colour only. A value rather than a
+        # key field, exactly like `_voxel_class`: a cell must not be able to
+        # exist twice because a lane marking and the tarmac beside it were
+        # annotated differently.
+        self._road_material = np.empty(0, dtype=np.uint8)
         # (x, y, height-bin) voxels, not (x, y) columns holding one span. The
         # third field is what lets a tree be a canopy over a gap over a trunk.
         self._voxel_keys = _EMPTY_CELL_KEYS.copy()
@@ -1050,6 +1092,9 @@ class WorldSceneAssembler:
         # a fourth key field so a voxel cannot exist twice, and so the class can
         # be promoted in place when a parked car starts moving.
         self._voxel_class = np.empty(0, dtype=np.uint8)
+        # ...and what it is made of, for the runs `_column_runs` promotes to the
+        # ground surface. Meaningless on a wall or a car, and never read there.
+        self._voxel_material = np.empty(0, dtype=np.uint8)
 
     def update(self, snapshot: PerceptionSnapshot) -> WorldFrame:
         self._track_ego_motion(snapshot)
@@ -1059,11 +1104,28 @@ class WorldSceneAssembler:
         self._expire_boundary_columns(snapshot)
 
         alert = self._alert(snapshot.aeb, snapshot.rear_aeb)
-        road_vertices, road_colors, road_indices = self._road_mesh(snapshot)
+        # Collapsed ONCE and handed to both consumers. The pass is a reduceat
+        # over the whole voxel store, and the ground surface and the slabs are
+        # the two halves of its one answer -- what is flat enough to stand on,
+        # and what is not.
+        (
+            hazard_keys,
+            hazard_base,
+            hazard_top,
+            hazard_classes,
+            surface_keys,
+            surface_height,
+            surface_material,
+        ) = self._column_runs(snapshot)
+        road_vertices, road_colors, road_indices = self._ground_mesh(
+            snapshot, surface_keys, surface_height, surface_material
+        )
         (
             (boundary_vertices, boundary_colors, boundary_indices),
             (vehicle_vertices, vehicle_colors, vehicle_indices),
-        ) = self._solid_meshes(snapshot)
+        ) = self._solid_meshes(
+            snapshot, hazard_keys, hazard_base, hazard_top, hazard_classes
+        )
         (
             (aeb_vertices, aeb_colors, aeb_indices),
             (marker_vertices, marker_colors, marker_indices),
@@ -1142,17 +1204,25 @@ class WorldSceneAssembler:
         Python loop that touched every occupied 0.5 m square cost 33 ms on an
         open 40 m radius, before any meshing had happened.
         """
-        points = snapshot.points_world[
-            snapshot.semantic_groups == SCENE_ROAD
-        ].astype(np.float64, copy=False)
+        road = snapshot.semantic_groups == SCENE_ROAD
+        points = snapshot.points_world[road].astype(np.float64, copy=False)
         if not len(points):
             return
+        # Anything the road rule accepted but no material named is PAVED, which
+        # keeps the geometric fallback band -- unannotated ground near the ego
+        # plane -- looking exactly as it always has rather than switching to the
+        # unidentified-surface colour on every community map.
+        material = np.where(
+            snapshot.surface_materials[road] == SURFACE_UNKNOWN,
+            SURFACE_PAVED,
+            snapshot.surface_materials[road],
+        ).astype(np.uint8)
 
         keys = np.column_stack(
             (
                 np.floor(points[:, 0] / WORLD_CELL_SIZE_M),
                 np.floor(points[:, 1] / WORLD_CELL_SIZE_M),
-                np.floor(points[:, 2] / 0.75),
+                np.floor(points[:, 2] / _GROUND_LAYER_M),
             )
         ).astype(np.int32)
         # ONE sort, not np.unique's sort plus a lexsort on top of it. Sorting is
@@ -1166,9 +1236,15 @@ class WorldSceneAssembler:
         starts = _group_starts(packed[order])
         counts = np.diff(np.append(starts, len(order)))
         fresh_height = np.add.reduceat(points[order, 2], starts) / counts
+        # Height is the MEAN of the cell's returns; material cannot be averaged,
+        # so the cell takes the highest code present. Ties inside one 0.25 m
+        # square are between two materials that genuinely meet there, and at
+        # that size either answer is right.
+        fresh_material = np.maximum.reduceat(material[order], starts)
 
         all_keys = np.concatenate((self._road_keys, keys[order][starts]))
         all_height = np.concatenate((self._road_height, fresh_height))
+        all_material = np.concatenate((self._road_material, fresh_material))
         all_seen = np.concatenate(
             (self._road_seen, np.full(len(starts), self._travelled_m))
         )
@@ -1184,6 +1260,7 @@ class WorldSceneAssembler:
         newest = combined_order[_group_ends(combined_packed[combined_order])]
         self._road_keys = all_keys[newest]
         self._road_height = all_height[newest]
+        self._road_material = all_material[newest]
         self._road_seen = all_seen[newest]
 
     def _expire_road_cells(self, snapshot: PerceptionSnapshot) -> None:
@@ -1215,13 +1292,104 @@ class WorldSceneAssembler:
             indices = np.sort(indices[freshest])
         self._road_keys = self._road_keys[indices]
         self._road_height = self._road_height[indices]
+        self._road_material = self._road_material[indices]
         self._road_seen = self._road_seen[indices]
 
-    def _road_mesh(
-        self, snapshot: PerceptionSnapshot
+    def _ground_cells(
+        self,
+        snapshot: PerceptionSnapshot,
+        surface_keys: np.ndarray,
+        surface_height: np.ndarray,
+        surface_material: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Every ground cell to be drawn: road store plus the promoted surface.
+
+        Two sources, one surface. The road store holds what the semantics called
+        drivable; the promoted runs hold everything else the sensors found lying
+        flat on the floor, which before they were kept was simply not drawn --
+        grass, dirt, a gravel yard, and the whole of any map without
+        annotations. Where both have a cell the ROAD wins, because "the car may
+        drive here" is the more specific claim and it is the one the view exists
+        to make.
+
+        The two stores are keyed on their own grids (WORLD_CELL_SIZE_M and
+        WORLD_COLUMN_SIZE_M, equal today), so the promoted keys are converted
+        through world coordinates rather than reused, and a future divergence
+        between the two costs an arithmetic pass instead of a silent misalignment
+        of half a cell.
+        """
+        ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
+        if len(surface_keys):
+            # The road store was culled to WORLD_ROAD_RADIUS_M in
+            # `_expire_road_cells`; the voxel store runs on to WORLD_RADIUS_M,
+            # so the promoted half needs its own cull here -- and a TIGHTER one.
+            # See WORLD_SURFACE_RADIUS_M: past ~36 m the ground rings are
+            # further apart than WORLD_ROAD_BRIDGE_CELLS can close, so a
+            # quarter-metre lattice out there is disconnected rings rather than
+            # a surface. The road reaches further because it is driven along and
+            # accumulation fills it in; the terrain beside it is never swept
+            # that way.
+            centres = (surface_keys + 0.5) * WORLD_COLUMN_SIZE_M
+            offsets = centres - ego[:2]
+            inside = (
+                np.einsum("ij,ij->i", offsets, offsets)
+                <= WORLD_SURFACE_RADIUS_M**2
+            )
+            centres = centres[inside]
+            surface_height = surface_height[inside]
+            surface_material = surface_material[inside]
+        else:
+            centres = np.empty((0, 2))
+            surface_height = np.empty(0)
+            surface_material = np.empty(0, dtype=np.uint8)
+
+        promoted = np.column_stack(
+            (
+                np.floor(centres[:, 0] / WORLD_CELL_SIZE_M),
+                np.floor(centres[:, 1] / WORLD_CELL_SIZE_M),
+                np.floor(surface_height / _GROUND_LAYER_M),
+            )
+        ).astype(np.int32)
+
+        keys = np.concatenate((promoted, self._road_keys))
+        heights = np.concatenate((surface_height, self._road_height))
+        materials = np.concatenate((surface_material, self._road_material))
+        # Each half carries the radius it will dissolve at, because they end in
+        # different places and a mesh that ended abruptly at either would read
+        # as a cliff. Carried per cell rather than derived from the material,
+        # so the two questions -- what is this made of, how far can it be seen --
+        # stay independent.
+        limits = np.concatenate(
+            (
+                np.full(len(promoted), WORLD_SURFACE_RADIUS_M),
+                np.full(len(self._road_keys), WORLD_ROAD_RADIUS_M),
+            )
+        )
+        if not len(keys):
+            return keys, heights, materials, limits
+
+        # Road appended LAST, so the stable sort's final entry per cell is the
+        # road reading -- the same "newest wins" mechanic `_update_road_cells`
+        # uses, doing duty here as "more specific wins".
+        packed = pack_cell_keys(keys)
+        order = np.argsort(packed, kind="stable")
+        winner = order[_group_ends(packed[order])]
+        return keys[winner], heights[winner], materials[winner], limits[winner]
+
+    def _ground_mesh(
+        self,
+        snapshot: PerceptionSnapshot,
+        surface_keys: np.ndarray,
+        surface_height: np.ndarray,
+        surface_material: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Mesh the road cells as a CONTINUOUS surface with shared corners.
+        Mesh the ground cells as a CONTINUOUS surface with shared corners.
+
+        Still the WorldFrame's `road_*` channel, and still one draw: the QML
+        binds that buffer once and the material shows up as vertex colour, so
+        surfacing the rest of the world costs no extra geometry object.
 
         The road used to be `merge_cell_runs` rectangles, each drawn flat at the
         mean height of the cells that formed it. Neighbouring rectangles have no
@@ -1240,11 +1408,18 @@ class WorldSceneAssembler:
         # No radius test here: `_expire_road_cells` culled to exactly
         # WORLD_ROAD_RADIUS_M earlier in `update`, so everything still in the
         # store is drawable.
-        if not len(self._road_keys):
+        cells, heights, materials, limits = self._ground_cells(
+            snapshot, surface_keys, surface_height, surface_material
+        )
+        if not len(cells):
             return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
 
-        cells = self._road_keys
-        heights = self._road_height
+        # Colour is resolved per CELL, before bridging, so the interpolation
+        # below blends the two materials either side of a gap instead of trying
+        # to interpolate a material CODE -- which has no meaningful midpoint.
+        # It also means a material boundary is a gradient across one cell rather
+        # than a hard seam, which is what a grass verge actually looks like.
+        colour = _SURFACE_LINEAR[materials]
         # Close the sampling lattice before meshing. Ground returns thin as r^2
         # radially and as r in azimuth, so past roughly 20 m they stop reaching
         # every quarter-metre cell and the road breaks into a checkerboard of
@@ -1252,11 +1427,12 @@ class WorldSceneAssembler:
         # coarse grid it replaced. Bridging is applied to the MESH, never to the
         # store, so an inference is never accumulated as though it were an
         # observation.
+        values = np.column_stack((heights, colour, limits))
         for axis in (0, 1):
             cells, values = bridge_gaps(
-                cells, heights, axis, WORLD_ROAD_BRIDGE_CELLS
+                cells, values, axis, WORLD_ROAD_BRIDGE_CELLS
             )
-            heights = values[:, 0]
+        heights, colour, limits = values[:, 0], values[:, 1:4], values[:, 4]
 
         # Each cell contributes its height to its own four lattice corners; a
         # corner's height is the mean of the cells touching it. The layer stays
@@ -1268,14 +1444,40 @@ class WorldSceneAssembler:
         corner_keys[:, :, 2] = cells[:, None, 2]
         flat_keys = corner_keys.reshape(-1, 3)
 
+        # A corner holds ONE of each of these, which is the whole reason the
+        # surface is continuous: two cells meeting there cannot disagree about
+        # where it is, what it is made of, or how far away it fades. All five
+        # quantities average over exactly the same cells.
+        #
+        # `bincount` per channel, and NOT the sort-once-and-reduceat idiom the
+        # two accumulators use. That was tried here and is SLOWER -- 43.4 ms
+        # against 37.4 on a 40k-cell disc -- because reducing five channels
+        # together means materialising a (4N, 5) repeat and then gathering it
+        # into sort order, and those two copies cost more than the extra sweeps
+        # they save. The accumulators win with it because there the sort is the
+        # thing being avoided; here `np.unique` has to sort anyway.
+        #
+        # Averaging colour in LINEAR space is not incidental: the buffer is
+        # linear and the GPU multiplies there, so blending sRGB triples would
+        # darken every material boundary rather than crossfade it.
         unique, first, inverse = np.unique(
             pack_cell_keys(flat_keys), return_index=True, return_inverse=True
         )
         counts = np.bincount(inverse, minlength=len(unique))
-        totals = np.bincount(
-            inverse, weights=np.repeat(heights, 4), minlength=len(unique)
+
+        def _corner_mean(values: np.ndarray) -> np.ndarray:
+            return (
+                np.bincount(
+                    inverse, weights=np.repeat(values, 4), minlength=len(unique)
+                )
+                / counts
+            )
+
+        corner_height = _corner_mean(heights)
+        corner_colour = np.stack(
+            [_corner_mean(colour[:, channel]) for channel in range(3)], axis=1
         )
-        corner_height = totals / counts
+        corner_limit = _corner_mean(limits)
         corner_lattice = flat_keys[first]
 
         world = np.column_stack(
@@ -1286,12 +1488,12 @@ class WorldSceneAssembler:
             )
         )
         vertices = world_to_render(world, snapshot)
-        colours = depth_tint(_ROAD_LINEAR, vertices)
+        colours = depth_tint(corner_colour, vertices)
         # Dissolve the last few metres into the air. The road stops at its own
         # radius while everything else runs on to WORLD_RADIUS_M, so without
         # this the surface ends on a hard rim that reads as a cliff edge --
         # a drawn boundary where there is only the end of what was measured.
-        colours = _fade_to_air(colours, vertices, WORLD_ROAD_RADIUS_M)
+        colours = _fade_to_air(colours, vertices, corner_limit)
 
         quad = inverse.reshape(-1, 4).astype(np.uint32)
         indices = np.column_stack(
@@ -1329,13 +1531,21 @@ class WorldSceneAssembler:
         # the LiDAR saw, and the ground-truth model is enrichment on top.
         traffic_mask = groups == SCENE_VEHICLE
         static_mask = (groups == SCENE_BOUNDARY) | (groups == SCENE_VULNERABLE)
-        points, classes = self._limit_pair(
-            snapshot.points_world[static_mask | traffic_mask],
-            np.where(
-                traffic_mask[static_mask | traffic_mask], _TRAFFIC, _STATIC
-            ).astype(np.uint8),
-            WORLD_MAX_BOUNDARY_POINTS,
+        selected = static_mask | traffic_mask
+        # Class and material ride the same decimation, packed into one uint16 so
+        # `_limit_pair` still takes a single companion array. They are two
+        # different questions -- what kind of thing this is, and what the ground
+        # here is made of -- and only runs the shape test promotes ever read the
+        # second one.
+        labels = (
+            np.where(traffic_mask[selected], _TRAFFIC, _STATIC).astype(np.uint16)
+            << 8
+        ) | snapshot.surface_materials[selected].astype(np.uint16)
+        points, labels = self._limit_pair(
+            snapshot.points_world[selected], labels, WORLD_MAX_BOUNDARY_POINTS
         )
+        classes = (labels >> 8).astype(np.uint8)
+        materials = (labels & 0xFF).astype(np.uint8)
         points = points.astype(np.float64, copy=False)
 
         if len(points):
@@ -1354,6 +1564,7 @@ class WorldSceneAssembler:
             seen = np.empty(0)
             travel = np.empty(0)
             classes = np.empty(0, dtype=np.uint8)
+            materials = np.empty(0, dtype=np.uint8)
 
         all_keys = np.concatenate((self._voxel_keys, keys))
         if not len(all_keys):
@@ -1363,6 +1574,7 @@ class WorldSceneAssembler:
         all_seen = np.concatenate((self._voxel_seen, seen))
         all_travel = np.concatenate((self._voxel_travel, travel))
         all_class = np.concatenate((self._voxel_class, classes))
+        all_material = np.concatenate((self._voxel_material, materials))
 
         # One sort, and the store is LEFT in that sorted order. pack_cell_keys
         # puts x in the high bits, then y, then the height bin, so sorted-by-key
@@ -1389,6 +1601,9 @@ class WorldSceneAssembler:
         # the short vehicle TTL and cannot be pinned in place by an older static
         # reading of the same box.
         self._voxel_class = np.maximum.reduceat(all_class[order], starts)
+        # Highest code wins, so any identified material beats SURFACE_UNKNOWN
+        # (0) and a voxel that has ever been named keeps its name.
+        self._voxel_material = np.maximum.reduceat(all_material[order], starts)
 
     def _expire_boundary_columns(self, snapshot: PerceptionSnapshot) -> None:
         if not len(self._voxel_keys):
@@ -1419,6 +1634,7 @@ class WorldSceneAssembler:
             freshest = np.argsort(self._voxel_seen[indices])[-WORLD_MAX_COLUMNS:]
             indices = np.sort(indices[freshest])
         self._voxel_keys = self._voxel_keys[indices]
+        self._voxel_material = self._voxel_material[indices]
         self._voxel_low = self._voxel_low[indices]
         self._voxel_high = self._voxel_high[indices]
         self._voxel_seen = self._voxel_seen[indices]
@@ -1438,12 +1654,14 @@ class WorldSceneAssembler:
         canopy smeared down into the grass; runs keep the void, so the canopy is
         its own object and can be recognised as something you drive under.
 
-        Returns `(keys (N, 2) column, lows (N,), highs (N,), classes (N,))` for
-        every run that is a collision hazard -- overhead structures and runs too
-        short to be structure at all are both dropped here.
+        Returns the collision hazards -- `(keys (N, 2) column, lows, highs,
+        classes)` -- followed by the GROUND SURFACE the short runs describe:
+        `(keys (M, 2), heights (M,), materials (M,))`. Overhead structure is
+        dropped; nothing else is.
 
-        **Dropping the short ones HERE rather than after bridging is what keeps
-        the build inside the tick.** `_slab_mesh` used to bridge every run and
+        **Separating the short ones HERE rather than after bridging is what
+        keeps the build inside the tick.** `_slab_mesh` used to bridge every run
+        and
         then discard the ones under WORLD_MIN_SLAB_HEIGHT_M, so on open ground --
         where the whole surface is boundary-classified rather than road -- it
         bridged tens of thousands of flat ground runs across two axes and threw
@@ -1459,6 +1677,9 @@ class WorldSceneAssembler:
             return (
                 np.empty((0, 2), dtype=np.int32),
                 np.empty(0),
+                np.empty(0),
+                np.empty(0, dtype=np.uint8),
+                np.empty((0, 2), dtype=np.int32),
                 np.empty(0),
                 np.empty(0, dtype=np.uint8),
             )
@@ -1504,14 +1725,34 @@ class WorldSceneAssembler:
         )
         grounded = floor_per_run <= ego_ground + WORLD_COLLISION_CEILING_M
         reference = np.where(grounded, floor_per_run, ego_ground)
-        keep = (lows - reference < WORLD_COLLISION_CEILING_M) & (
-            highs - lows >= WORLD_MIN_SLAB_HEIGHT_M
-        )
+        tall = highs - lows >= WORLD_MIN_SLAB_HEIGHT_M
+        keep = (lows - reference < WORLD_COLLISION_CEILING_M) & tall
+
+        # ...and the runs too short to be structure are the GROUND, not rubbish.
+        # They were discarded here, which is why anything the annotations did not
+        # call road -- grass, dirt, sand, a gravel yard, the whole of an
+        # unannotated map -- rendered as nothing at all rather than as a surface:
+        # too flat to be a slab, and not road, so no store wanted it.
+        #
+        # Two conditions, and the second is what stops a rooftop or the underside
+        # of a canopy becoming ground: the run must be the LOWEST in its column.
+        # There is deliberately no ceiling test -- a hillside 10 m above the ego
+        # plane is still a surface, and `grounded` is asking whether something
+        # could be driven into rather than whether it can be stood on.
+        #
+        # The threshold is WORLD_MIN_SLAB_HEIGHT_M itself rather than a second
+        # constant, so this promotes EXACTLY what was being thrown away and
+        # nothing that currently draws as a slab changes. A 0.12 m kerb is still
+        # structure the planner steers around, not floor.
+        surface = (~tall) & (lows == floor_per_run)
         return (
             keys[keep],
             lows[keep],
             highs[keep],
             classes[keep],
+            keys[surface],
+            0.5 * (lows[surface] + highs[surface]),
+            self._voxel_material[starts][surface],
         )
 
     @staticmethod
@@ -1528,7 +1769,12 @@ class WorldSceneAssembler:
         return bridged, values[:, 0], values[:, 1]
 
     def _solid_meshes(
-        self, snapshot: PerceptionSnapshot
+        self,
+        snapshot: PerceptionSnapshot,
+        keys_2d: np.ndarray,
+        base: np.ndarray,
+        top: np.ndarray,
+        classes: np.ndarray,
     ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], ...]:
         """
         The static scenery and the traffic, as two independently coloured meshes.
@@ -1538,7 +1784,6 @@ class WorldSceneAssembler:
         would otherwise merge into it and take one colour for both, which is the
         one thing hue is carrying here.
         """
-        keys_2d, base, top, classes = self._column_runs(snapshot)
         return tuple(
             self._slab_mesh(
                 snapshot,

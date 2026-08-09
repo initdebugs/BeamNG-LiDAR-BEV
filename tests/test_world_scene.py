@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -13,7 +15,17 @@ from beamng_lidar_bev.models import (
     PerceptionSnapshot,
     VehicleGeometry,
 )
-from beamng_lidar_bev.semantics import SCENE_BOUNDARY, SCENE_ROAD, SCENE_VEHICLE
+from beamng_lidar_bev.semantics import (
+    SCENE_BOUNDARY,
+    SCENE_ROAD,
+    SCENE_VEHICLE,
+    SURFACE_BARE,
+    SURFACE_PAVED,
+    SURFACE_SIDEWALK,
+    SURFACE_UNKNOWN,
+    SURFACE_VEGETATION,
+    SURFACE_WATER,
+)
 from beamng_lidar_bev.world_scene import (
     WorldSceneAssembler,
     path_ribbon,
@@ -56,10 +68,14 @@ def _snapshot(
     ego_pos_world: tuple[float, float, float] = (0.0, 0.0, 0.0),
     aeb: object = None,
     rear_aeb: object = None,
+    materials: tuple[int, ...] | None = None,
 ) -> PerceptionSnapshot:
     return PerceptionSnapshot(
         points_world=np.asarray(points, dtype=np.float32).reshape(-1, 3),
         semantic_groups=np.asarray(groups, dtype=np.uint8),
+        surface_materials=(
+            None if materials is None else np.asarray(materials, dtype=np.uint8)
+        ),
         ego_pos_world=ego_pos_world,
         ego_dir_world=(0.0, 1.0, 0.0),
         ego_up_world=(0.0, 0.0, 1.0),
@@ -1161,3 +1177,217 @@ def test_the_first_frame_lands_on_its_target_rather_than_easing_in() -> None:
     assert fresh.camera_position[1] == pytest.approx(
         settled._camera_pose.height_m, abs=0.2
     )
+
+
+# --- Unpaved ground -----------------------------------------------------------
+#
+# Anything the annotations did not call road arrives as a BOUNDARY return, and
+# the flat ones used to be dropped in `_column_runs` for being too short to be
+# structure. Nothing else wanted them either, so grass, dirt, a gravel yard --
+# and the whole of a map without annotations -- rendered as nothing at all: a
+# hole where the ground is. They are now promoted to the ground surface, which
+# is where the shape they have says they belong.
+
+
+def _flat_ground(
+    x_from: float,
+    x_to: float,
+    group: int,
+    material: int,
+    z: float = 0.0,
+    step: float = 0.25,
+) -> tuple[tuple, tuple, tuple]:
+    """A flat strip of ground, one return per cell."""
+    points, groups, materials = [], [], []
+    for x in np.arange(x_from, x_to, step):
+        for y in np.arange(3.0, 20.0, step):
+            points.append((float(x), float(y), z))
+            groups.append(group)
+            materials.append(material)
+    return tuple(points), tuple(groups), tuple(materials)
+
+
+def _ground_span(frame: object) -> float:
+    """How wide the drawn ground surface is, in render-space metres."""
+    vertices = frame.road_vertices  # type: ignore[attr-defined]
+    if not len(vertices):
+        return 0.0
+    return float(vertices[:, 0].max() - vertices[:, 0].min())
+
+
+def test_unpaved_ground_is_drawn_instead_of_leaving_a_hole() -> None:
+    """
+    The headline. A 4 m road with grass either side has to render as one
+    continuous floor, not as a 4 m ribbon in a void.
+    """
+    road = _flat_ground(-2.0, 2.0, SCENE_ROAD, SURFACE_PAVED)
+    verge = _flat_ground(-10.0, -2.0, SCENE_BOUNDARY, SURFACE_VEGETATION)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            road[0] + verge[0],
+            road[1] + verge[1],
+            materials=road[2] + verge[2],
+        )
+    )
+
+    assert _ground_span(frame) > 11.0, "the verge is still a hole"
+    # ...and it did NOT become structure. Flat ground extruded into slabs would
+    # be a far worse answer than not drawing it.
+    assert not len(frame.boundary_vertices)
+
+
+def test_an_unannotated_map_still_gets_a_floor() -> None:
+    """
+    The case the geometric half exists for. With no materials at all the ground
+    is still found -- shape decides what IS a surface, and the annotations only
+    decide what colour it is.
+    """
+    bare = _flat_ground(-10.0, 10.0, SCENE_BOUNDARY, SURFACE_UNKNOWN)
+
+    frame = WorldSceneAssembler().update(_snapshot(bare[0], bare[1]))
+
+    assert _ground_span(frame) > 19.0
+
+
+def test_a_wall_is_still_structure_and_not_a_floor() -> None:
+    """
+    The promotion may only take what was being thrown away. Its threshold is
+    WORLD_MIN_SLAB_HEIGHT_M itself for exactly that reason, so nothing that
+    draws as a slab today changes.
+    """
+    wall_points = tuple(
+        (float(x), 12.0, float(z))
+        for x in np.arange(-1.0, 1.0, 0.25)
+        for z in np.arange(0.0, 3.0, 0.1)
+    )
+    ground = _flat_ground(-6.0, 6.0, SCENE_BOUNDARY, SURFACE_BARE)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            ground[0] + wall_points,
+            ground[1] + (SCENE_BOUNDARY,) * len(wall_points),
+            materials=ground[2] + (SURFACE_UNKNOWN,) * len(wall_points),
+        )
+    )
+
+    assert len(_boxes(frame)) >= 1, "the wall stopped being a slab"
+    assert _ground_span(frame) > 11.0, "and the ground around it went missing"
+
+
+def test_a_roof_does_not_become_ground() -> None:
+    """
+    Promotion takes the LOWEST run in a column, never merely a short one. A flat
+    roof, the top of a wall or the underside of a canopy are all short runs
+    sitting above something, and a floor drawn at roof height would be a floor
+    through the middle of the building.
+    """
+    column = tuple(
+        (0.0, 12.0, float(z)) for z in np.arange(0.0, 3.0, 0.1)
+    ) + tuple(
+        # A separate flat run 4 m up, clear of the vertical bridging slack.
+        (0.0, 12.0, 4.0 + float(z))
+        for z in np.arange(0.0, 0.05, 0.02)
+    )
+
+    assembler = WorldSceneAssembler()
+    frame = assembler.update(
+        _snapshot(column, (SCENE_BOUNDARY,) * len(column))
+    )
+
+    heights = frame.road_vertices[:, 1] if len(frame.road_vertices) else np.empty(0)
+    assert not len(heights) or heights.max() < 3.5, (
+        "a floor was drawn at roof height"
+    )
+
+
+def test_the_road_wins_where_both_stores_cover_a_cell() -> None:
+    """
+    "The car may drive here" is the more specific claim, and it is the one the
+    view exists to make, so it takes the cell wherever the two sources overlap.
+    """
+    road = _flat_ground(-2.0, 2.0, SCENE_ROAD, SURFACE_PAVED)
+    over = _flat_ground(-2.0, 2.0, SCENE_BOUNDARY, SURFACE_VEGETATION)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            over[0] + road[0],
+            over[1] + road[1],
+            materials=over[2] + road[2],
+        )
+    )
+
+    near = np.abs(frame.road_vertices[:, 2]) < 8.0
+    paved = world_scene.linear_rgb(config.WORLD_SURFACE_PAVED_RGB)
+    np.testing.assert_allclose(
+        frame.road_colors[near][:, :3].mean(axis=0), paved, atol=0.01
+    )
+
+
+@pytest.mark.parametrize(
+    "material, colour_name",
+    (
+        (SURFACE_VEGETATION, "WORLD_SURFACE_VEGETATION_RGB"),
+        (SURFACE_BARE, "WORLD_SURFACE_BARE_RGB"),
+        (SURFACE_WATER, "WORLD_SURFACE_WATER_RGB"),
+        (SURFACE_SIDEWALK, "WORLD_SURFACE_SIDEWALK_RGB"),
+        (SURFACE_UNKNOWN, "WORLD_SURFACE_UNKNOWN_RGB"),
+    ),
+)
+def test_each_material_paints_its_own_ground(
+    material: int, colour_name: str
+) -> None:
+    """
+    The other half: the surface is found by shape, and coloured by semantics.
+    Sampled inside WORLD_DEPTH_NEAR_M so the depth tint is not part of the
+    measurement, and away from the edge fade for the same reason.
+    """
+    patch = _flat_ground(-6.0, 6.0, SCENE_BOUNDARY, material)
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(patch[0], patch[1], materials=patch[2])
+    )
+
+    near = (np.abs(frame.road_vertices[:, 2]) < 7.0) & (
+        np.abs(frame.road_vertices[:, 0]) < 4.0
+    )
+    np.testing.assert_allclose(
+        frame.road_colors[near][:, :3].mean(axis=0),
+        world_scene.linear_rgb(getattr(config, colour_name)),
+        atol=0.01,
+    )
+
+
+def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
+    """
+    The road is a ribbon and the ground is a DISC, so surfacing everything is
+    the change most likely to blow the build budget -- and it did: a 0.25 m
+    lattice over the full WORLD_ROAD_RADIUS_M meshed to 110k vertices at 77 ms
+    against a 40 ms tick. WORLD_SURFACE_RADIUS_M is what bounds it, and it is
+    bounded by the sampling anyway (see its comment).
+
+    The scene build runs on `SceneWorker`'s own thread, so overrunning costs
+    WORLD frames rather than control latency -- but it is logged for a reason,
+    and this is the case that would trip it.
+    """
+    points, groups, materials = [], [], []
+    for x in np.arange(-60.0, 60.0, 0.35):
+        for y in np.arange(3.0, 70.0, 0.35):
+            if x * x + y * y > config.WORLD_ROAD_RADIUS_M**2:
+                continue
+            on_road = abs(x) <= 3.5
+            points.append((float(x), float(y), 0.0))
+            groups.append(SCENE_ROAD if on_road else SCENE_BOUNDARY)
+            materials.append(SURFACE_PAVED if on_road else SURFACE_VEGETATION)
+    snapshot = _snapshot(tuple(points), tuple(groups), materials=tuple(materials))
+
+    assembler = WorldSceneAssembler()
+    assembler.update(snapshot)  # prime the stores, so this measures a steady state
+    started = time.perf_counter()
+    for _ in range(3):
+        frame = assembler.update(snapshot)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0 / 3
+
+    assert len(points) > 40_000, "the timing scene stopped being a worst case"
+    assert len(frame.road_vertices) > 10_000, "the ground stopped being covered"
+    assert elapsed_ms < 40.0, f"scene build took {elapsed_ms:.1f} ms"

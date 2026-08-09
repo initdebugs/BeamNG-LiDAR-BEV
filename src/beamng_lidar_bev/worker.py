@@ -100,6 +100,7 @@ from .semantics import (
     SCENE_ROAD,
     SemanticPalette,
     classify_scene_groups,
+    classify_surface_materials,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -788,6 +789,7 @@ class BeamNgWorker(QObject):
         obstacle_points = _EMPTY_BEV
         scene_points_world = _EMPTY_WORLD
         scene_groups = _EMPTY_GROUPS
+        scene_materials = _EMPTY_GROUPS
         # Kept in scope for the planner, which needs the undecimated cloud and
         # the heights the semantic split throws away.
         bev = _EMPTY_BEV
@@ -885,6 +887,14 @@ class BeamNgWorker(QObject):
                     heights,
                     geometry.ground_z_vehicle,
                     self._palette,
+                )
+                # What each surface is MADE OF, which is a separate question
+                # from which group a return belongs to and is answered from the
+                # colour alone -- one searchsorted, no height and no ground
+                # plane. WORLD decides what IS ground from shape; this only
+                # says what colour the ground it finds should be.
+                scene_materials = classify_surface_materials(
+                    colours, self._palette
                 )
                 road_mask = scene_groups == SCENE_ROAD
                 road_points = self._limit_points(
@@ -1086,6 +1096,7 @@ class BeamNgWorker(QObject):
                 PerceptionSnapshot(
                     points_world=scene_points_world,
                     semantic_groups=scene_groups,
+                    surface_materials=scene_materials,
                     ego_pos_world=tuple(
                         float(value) for value in vec3(state["pos"])
                     ),

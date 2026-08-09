@@ -294,3 +294,113 @@ def test_slab_shading_is_fixed_to_the_camera_not_to_the_world() -> None:
     # The same six shades are handed out either way; which world-facing side
     # receives which one is exactly what should change with heading.
     np.testing.assert_allclose(sorted(straight), sorted(turned), atol=1e-9)
+
+
+# --- Surface materials --------------------------------------------------------
+#
+# Every material sits on the ROAD's rung of the ladder and separates by hue,
+# because there is nowhere else for it to go: air-to-black is 14.96:1 in total,
+# which supports two 3:1 steps and no more. A material that separated itself by
+# lightness would have to leave the rung and collide with the air or with the
+# obstacle band, which is exactly what the first attempt at a light concrete
+# sidewalk (#848a90) did -- 2.48:1 against air.
+#
+# Contrast is therefore the wrong instrument for telling two of them apart, and
+# CIELAB distance is the right one. These recompute both from the shipped
+# values, in the same spirit as the rest of this file: a colour claim that is
+# not recomputed is a comment, not evidence.
+
+SURFACES = (
+    "surface_paved",
+    "surface_sidewalk",
+    "surface_vegetation",
+    "surface_bare",
+    "surface_water",
+    "surface_unknown",
+)
+
+
+def _surface_palette() -> dict[str, np.ndarray]:
+    return {
+        "surface_paved": _ROAD_LINEAR,
+        "surface_sidewalk": linear_rgb(config.WORLD_SURFACE_SIDEWALK_RGB),
+        "surface_vegetation": linear_rgb(config.WORLD_SURFACE_VEGETATION_RGB),
+        "surface_bare": linear_rgb(config.WORLD_SURFACE_BARE_RGB),
+        "surface_water": linear_rgb(config.WORLD_SURFACE_WATER_RGB),
+        "surface_unknown": linear_rgb(config.WORLD_SURFACE_UNKNOWN_RGB),
+    }
+
+
+def _lab(linear: np.ndarray) -> np.ndarray:
+    """CIELAB under D65, from the LINEAR values the buffer actually carries."""
+    matrix = np.asarray(
+        (
+            (0.4124, 0.3576, 0.1805),
+            (0.2126, 0.7152, 0.0722),
+            (0.0193, 0.1192, 0.9505),
+        )
+    )
+    xyz = (matrix @ np.asarray(linear, dtype=np.float64)) / (
+        0.95047,
+        1.0,
+        1.08883,
+    )
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16.0 / 116.0)
+    return np.asarray(
+        (116.0 * f[1] - 16.0, 500.0 * (f[0] - f[1]), 200.0 * (f[1] - f[2]))
+    )
+
+
+def _delta_e(first: np.ndarray, second: np.ndarray) -> float:
+    return float(np.linalg.norm(_lab(first) - _lab(second)))
+
+
+@pytest.mark.parametrize("name", SURFACES)
+def test_every_surface_material_stays_on_the_ladder(name: str) -> None:
+    """
+    A material has to read as ground from both sides: paler than the obstacle
+    band and darker than the air, by the same 3:1 the road itself holds. This is
+    the constraint that forces hue to do the work, and the one that killed the
+    obvious "make the sidewalk a light grey".
+    """
+    palette = _palette() | _surface_palette()
+    colour = palette[name]
+
+    assert contrast_ratio(colour, palette["air"]) >= 3.0
+    assert contrast_ratio(colour, palette["boundary"]) >= 3.0
+
+
+def test_no_two_surface_materials_look_the_same() -> None:
+    """
+    Contrast cannot answer this -- two colours of equal lightness are 1.0:1
+    apart however different they look -- so it is measured as CIELAB distance.
+    dE 6 is comfortably visible across an area the size of a road.
+
+    Paved and unknown are the closest pair on purpose, and by a clear margin:
+    unknown is ground the sensors resolved but nothing identified, so reading as
+    "some sort of surface" is the honest look for it. That is the same reasoning
+    WORLD_UNCERTAIN_RGB is built on.
+    """
+    palette = _surface_palette()
+    distances = {
+        (first, second): _delta_e(palette[first], palette[second])
+        for index, first in enumerate(SURFACES)
+        for second in SURFACES[index + 1 :]
+    }
+
+    worst = min(distances, key=distances.get)
+    assert distances[worst] >= 6.0, (
+        f"{worst[0]} and {worst[1]} are only dE {distances[worst]:.1f} apart"
+    )
+    assert worst == ("surface_paved", "surface_unknown"), (
+        "the closest pair is meant to be the deliberate one"
+    )
+
+
+def test_a_road_is_still_exactly_the_colour_it_always_was() -> None:
+    """
+    Surfacing the rest of the world must not restyle the road. PAVED is
+    WORLD_ROAD_RGB itself rather than a near-miss beside it, so every existing
+    contrast fact in this file still describes what is on screen.
+    """
+    assert config.WORLD_SURFACE_PAVED_RGB == config.WORLD_ROAD_RGB
