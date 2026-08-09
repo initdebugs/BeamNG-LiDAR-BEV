@@ -66,7 +66,13 @@ the steering gain settling near a per-vehicle constant while cornering, and a co
 that visibly brakes to the bend's entry speed rather than toward a stop.
 
 AEB has its own live checklist, and the phantom-braking half of it is the part the offline suite
-cannot reach: read the `AEB check:` line at arm, then drive **with self-driving off** and confirm
+cannot reach. Two of its cases now have dedicated geometry behind them and both need re-proving on
+a real map: **a gradient** (drive a hill at 40–70 km/h and reverse up a driveway ramp — the vertical
+extent test is what should keep it ARMED, where the old slope cone could not) and **roadside
+foliage** (drive the scrub — the porosity test is what should keep it ARMED). If either still
+fires, the `AEB evidence:` line says which: a large height spread means it really was solid, a small
+one means the extent threshold wants raising. Then the rest, unchanged:
+read the `AEB check:` line at arm, then drive **with self-driving off** and confirm
 the AEB metric never leaves ARMED — flat and empty **at well over the 40 km/h self-driving cap**
 (the first reported phantom only appeared above 64 km/h, which self-driving can never reach), over
 crests and dips, through corners close to the kerb, and under hard manual braking (the brake dive
@@ -80,6 +86,44 @@ trusting either in anything heavier. The
 `AEB check:` line prints the brake-now distance for this vehicle at 30/50/70/100 km/h -- compare what the car actually does against those four
 numbers, because "it braked too late" and "it braked too early" are the two complaints that need
 a number to settle. Expect one continuous full application, never a series of pulses.
+
+### The plant is one car's, and three log lines now say so
+
+**Every braking figure in `config` is a property of ONE vehicle, and nothing recorded which**, so
+"it phantom-brakes on the pickup but not on this" had no baseline to be measured against.
+`PLANT_REFERENCE_VEHICLE` now names it and three diagnostics report against it. **None of them
+changes what AEB does** — there is no per-vehicle registry, no auto-calibration and no altered
+default; they exist so the decision about those can be made from numbers.
+
+- **`Vehicle check:`** at attach — `vehicle.model`, the bbox, both overhangs, `ground_z_vehicle`
+  and every mount height, plus a warning when the model is not the one the plant came from. **Read
+  the WIDTH first.** It is the full oriented bounding box and the corridor both AEB systems scan is
+  that width plus `AEB_CLEARANCE_MARGIN_M`, so anything bolted on (large mirrors, wide arches) is
+  inside it — a corridor well over the real body width sweeps a band no collision can happen in,
+  and a kerb face in it easily supplies the `AEB_MIN_HITS` returns.
+- **`Brake measure:`** after any full stop, whether AEB fired it or a human did. The manual half is
+  the important one: it needs no AEB event, and it runs **whether or not either system is armed**,
+  because switching AEB off is the first thing anyone does when it brakes for nothing. Reports
+  achieved mean and peak deceleration beside the configured figure, and the ratio. **Validate the
+  instrument on the reference car first** — a hard stop there should read ≈10 m/s² and ≈1.0x — then
+  measure the new one at 30/50/70 km/h forward and 10/20/30 reversing. Those rows are what a
+  per-vehicle plant would be built from. Body pitch is logged with each one, because a stop down a
+  grade flatters the plant and one up it slanders it.
+- **`AEB evidence:`** once per firing. `AEB: BRAKING` names a distance, and a distance cannot say
+  whether what blocked the corridor was a wall or the road surface arriving in the height band —
+  which is the whole difference between a correct firing and a phantom. This line reports the
+  **vertical extent** of the returns around the threat, which is invariant to both grade and ride
+  height, plus the measured ground rise and the value the slope cone clamped it to:
+
+  | spread (read against the range span) | what fired the brake |
+  |---|---|
+  | < ~0.10 m over metres of range | a surface lying along the ground — flat road under a brake dive, or a hillside crossing the floor because `ground_rise` is clamped into a 1.5% cone. **Not a plant or width problem** |
+  | ~0.10–0.20 m | a kerb or low lip: real, but not a crash — corridor too wide, or the floor too low |
+  | tens of cm over almost no range | genuinely solid, and the brake was right |
+
+  A wide gap between the measured rise and the clamped one means the estimator saw a grade the
+  floor was not allowed to believe. On any real gradient that is the expected reading, and it is
+  a different defect from anything the vehicle's size causes.
 
 ## Architecture
 
@@ -256,10 +300,45 @@ free-roam, pick a car) no actor is ever confirmed, so traffic was drawn by neith
 was completely invisible, not even a solid. `SCENE_VEHICLE` now feeds the voxel store like any
 other solid and is meshed as its own class in the actor blue, so a car is drawn from LiDAR alone;
 the ground-truth model is enrichment on top. Traffic runs on `WORLD_VEHICLE_TTL_S` rather than
-`WORLD_COLUMN_TTL_S`, because a car MOVES and the scenery window would draw it as a
-four-second streak of itself.
+`WORLD_COLUMN_MEMORY_M`, because a car MOVES and the scenery window would draw it as a streak of
+itself — and, as below, the two are not merely different thresholds but different **clocks**.
 
 ### WORLD scene assembly
+
+**Static geometry is forgotten by the METRE and traffic by the SECOND, and that is two clocks, not
+two thresholds.** What the display shows is ego motion sweeping the LiDAR's ground rings and
+azimuth stripes through the world; a wall-clock TTL was only ever a proxy for how much of that
+sweep sat in the window. Stop the car and the sweep stops while the clock does not, so the store
+drained and the view collapsed to what a single stationary frame resolves — concentric arcs with
+empty bands between them, which is the whole complaint.
+
+`WorldSceneAssembler` therefore keeps its own odometer, summed in `_track_ego_motion` from
+successive `snapshot.ego_pos_world` values, and road cells and static voxels are stamped with it
+(`WORLD_CELL_MEMORY_M`, `WORLD_COLUMN_MEMORY_M`). Three things make that safe here that would not
+be safe on a real vehicle:
+
+- **Ego pose is ground truth.** There is no odometry drift, which is the reason real mapping
+  systems must decay old observations at all. Static geometry seen a minute ago is exactly as valid
+  as geometry from this frame.
+- **Anything that moves is class-separated already** and stays on the wall clock. A car crossing in
+  front of a *stopped* ego must still fade in `WORLD_VEHICLE_TTL_S`, and it cannot if it shares an
+  odometer that is not advancing — so `_expire_boundary_columns` selects per class between two
+  parallel stamp arrays (`_voxel_seen`, `_voxel_travel`). Both are non-decreasing, so
+  `maximum.reduceat` still means "most recently seen" under either.
+- **"Newest wins" never compared the stamps.** `_update_road_cells` relies on a stable sort with
+  this frame's cells appended last, so a stamp that *stalls* while parked — rather than a clock that
+  always advances — changes nothing there.
+
+**The road store had no bound of its own, and distance-stamping is what forced it to grow one.**
+The radius test used to live in `_road_mesh` and decided only what was *drawn*; the 1.2 s TTL was
+the only thing bounding the store itself. Parked, a distance-stamped store would have kept every
+cell the sensors ever reached. The cull now sits in `_expire_road_cells` with a
+`WORLD_MAX_ROAD_CELLS` cap beside it, mirroring `_expire_boundary_columns` exactly, and `update`
+expires before it meshes so the drawn surface is unchanged.
+
+Two known costs, both intended: geometry that *changes* while you sit still persists until it is
+re-observed (only free-space carving fixes that), and the stores are larger on a long drive — watch
+SCENE BUILD, which already logs over-budget builds.
 
 **Both accumulators are parallel numpy arrays, and every stage is vectorized.** `WorldSceneAssembler`
 holds road cells and boundary voxels as `(N, 3)` int keys plus value/timestamp arrays, never as
@@ -269,7 +348,8 @@ the scene build went **109 ms → 25.7 ms** against a 40 ms tick — it was runn
 Three separate things were wrong and all three were per-cell Python:
 
 - `_road_mesh` filtered by radius with a `np.linalg.norm` call **per cell** in a list
-  comprehension (66 ms), and the merge then did a dict lookup and tuple build per cell.
+  comprehension (66 ms), and the merge then did a dict lookup and tuple build per cell. (That
+  filter has since moved into `_expire_road_cells` — see above — but it is the same one pass.)
 - `_update_road_cells` built a `_RoadCell` per unique cell in a Python loop (33 ms).
 - `np.unique(..., axis=0)` sorts a void view of each row and is dramatically slower than sorting
   plain integers — 41 ms against 6 ms for the same cells. `pack_cell_keys` packs three 21-bit
@@ -296,17 +376,31 @@ appended last makes "newest wins" simply "take the last of each group", with no 
 comparison. `_update_boundary_columns` likewise ran `np.unique` and then re-sorted its own
 inverse. Removing the redundant passes took the build from **24.0 ms → 20.9 ms** on a 73k cloud.
 
+**A run too short to be structure is dropped in `_column_runs`, BEFORE bridging, and that is worth
+half the build.** `_slab_mesh` used to bridge every run and then discard the ones under
+`WORLD_MIN_SLAB_HEIGHT_M`. On open ground — a dirt yard, or anything whose surface is not
+road-classified and so arrives as boundary returns — that meant bridging tens of thousands of flat
+ground runs across two axes and throwing nearly all of them away: `bridge_gaps` alone was 41 ms of
+an 85 ms build, against a 40 ms tick. Measured on a synthetic street with striped facades, kerbs and
+open ground, **69.1 ms → 26.7 ms with every structure over a metre tall preserved exactly** (41
+boxes either way). What disappears is short ground fragments bridging was inventing, so it is also
+the more honest rule: interpolating between a flat ground column and a kerb manufactures a ramp
+nobody observed. Note the tidier-looking alternative — pre-culling whole *layers* that cannot
+survive — is provably output-identical but saves only 5 ms, because `WORLD_MIN_SLAB_HEIGHT_M` (0.10)
+sits inside the first `WORLD_SLAB_HEIGHT_BUCKET_M` (0.5) bucket, which is exactly where the ground
+lives.
+
 **The road is bridged at MESH time and the store is never told.** `bridge_gaps` is shared by both
 accumulators because both suffer the same sampling asymmetry, just on different axes — see the
 road-mesh section below. Bridging the *store* instead would accumulate an inference as though it
-were an observation, and it would then survive its own TTL.
+were an observation, and it would then outlive its own memory window.
 
 **Boundary returns are accumulated VOXELS extruded into slabs, not billboards and not columns.**
 They were once one 0.16 × 0.32 m card per point, rebuilt from the current snapshot only and
 capped at 4,000 marks: 70–80% of the wall evidence was discarded before rendering, the survivors
 were re-chosen every frame from a re-ordered array so they shimmered, and a wall drawn as
 confetti has gaps between the confetti by construction. Now world-anchored `(x, y, height-bin)`
-voxels keep min/max height with a `WORLD_COLUMN_TTL_S` window, collapse into vertical runs, merge
+voxels keep min/max height over a `WORLD_COLUMN_MEMORY_M` window, collapse into vertical runs, merge
 into slabs and extrude. A dense 10 m wall costs **24 vertices against 2,560**.
 
 **The third key field is what lets a tree be a tree, and it is not a refinement.** The store used
@@ -347,6 +441,40 @@ Five things there are load-bearing:
   vertical runs needs, so the run pass sorts nothing. Expiry only ever drops rows, so it
   preserves the order; anything that reorders the voxel arrays must re-sort or the runs silently
   fragment.
+
+### The chase camera
+
+**Every quantity is damped toward a target, and nothing was.** `_camera` used to be a stateless
+pure function, so continuity came entirely from speed being continuous — which is exactly why the
+reverse flip teleported, and why any state keyed on a threshold would have snapped. It is now an
+instance method holding a `CameraPose`, with the target still computed by a pure
+`camera_target(snapshot, parked, alerting)` and the step by a pure `damp(current, target, dt, tau)`.
+Four things about it are load-bearing:
+
+- **The position is DERIVED from an orbit angle**, not chosen per branch. `(d·sin θ, h, d·cos θ)`
+  reproduces the old `(0, h, ±d)` at θ = 0 and 180 exactly, and damping that one number sweeps the
+  reverse swing round the *side* of the car instead of cutting through it. The yaw is kept as a
+  plain scalar rather than wrapped: the only targets are ~0 and ~180 plus a bounded corner offset,
+  so it never leaves [-30, 210] and there is no shortest-path ambiguity to resolve.
+- **The first frame snaps.** A pose of `None` means "no pose yet", so a fresh assembler lands on its
+  target rather than easing in from a guess — which is what keeps every camera test that builds a
+  fresh assembler measuring the scene instead of the initial condition.
+- **The standstill tilt needs a hysteresis AND a dwell.** Parking manoeuvres live at 0.3–1 m/s, so a
+  single threshold nods the view every time the car creeps; the dwell (`WORLD_CAM_PARK_DWELL_S`)
+  is what separates *stopping* from *being stopped*, and the higher release speed is what makes
+  pulling away restore the driving view at once. Pitch stops at `WORLD_CAM_PITCH_LIMIT_DEG` (−80°)
+  because at exactly −90° the euler yaw is degenerate and the view spins on its own; −80° already
+  reads as top-down. Parking and standing still are ONE state — separate thresholds for them would
+  fight each other at the speeds parking actually happens at.
+- **The AEB framing move is gated on `_alert`'s own string**, which `update()` already computes and
+  which is non-empty only while a pedal is down. Reusing it is what guarantees the camera and the
+  overlay agree about what an event is; a view that moved for the armed state would be a nuisance
+  rather than an alarm.
+
+Curvature for the corner lean comes from the plan when self-driving, and otherwise from
+`AebState.curvature` — which is derived from *measured* yaw and runs under a human driver, which is
+when the camera most needs it. Verified on the real D3D11 backend by rendering a synthetic drive
+through `WorldView.grab()`, per the pixel-questions-get-measured rule below.
 
 ### WORLD renderer and RAW BEV toggle
 
@@ -872,17 +1000,15 @@ controller:
 - **Above ~170 km/h it is a mitigation system, not an avoidance one**, which is now a sensor
   limit rather than a tuning choice.
 
-**Three filters stand between flat, empty road and the pedal**, because a false positive here is
+**Five filters stand between flat, empty road and the pedal**, because a false positive here is
 a full-authority brake rather than a cost term:
 
 - **Height.** AEB has its own obstacle floor, `AEB_OBSTACLE_MIN_HEIGHT_M = 0.30`, against the
   planner's 0.12. The planner steers around kerbs; AEB brakes for crashes, and nobody wants an
-  emergency stop for a kerb they were driving over deliberately. It is also what keeps the road
-  itself out: the ego ground plane is body-fixed while heights are gravity-referenced, so a brake
-  dive lifts the whole surface in the height band, and `ground_rise` cannot absorb it inside
-  `SLOPE_ALLOWANCE_START_M` where the clamping cone is zero — which is exactly the near field AEB
-  works in. That failure is a latch (brake → dive → see more road → brake harder), the same one
-  gravity-referenced heights were introduced to kill for the planner.
+  emergency stop for a kerb they were driving over deliberately.
+- **Vertical extent**, and it is the one that makes AEB grade-proof — the height test above cannot
+  be, at any value. See below.
+- **Porosity**: a bush is see-through and a wall is not. Also below.
 - **Support.** The blocking distance is the `AEB_MIN_HITS`-th nearest return in the corridor, not
   the nearest. The corridor scan is a nearest-return measurement, so one speck that survived
   `despeckle` would end it on its own — with a full brake on the end of it.
@@ -904,10 +1030,91 @@ last measured distance is held). This is the opposite of the planner's `_BLIND_A
 deliberately so: the planner is the primary system and must fail safe by stopping, while AEB is
 a supplementary layer whose false positives are what get it switched off.
 
+### AEB decides obstacle-ness by SHAPE, and that is what fixed hills and bushes
+
+Two filters answer "what shape is the thing standing here" instead of "how high above an estimated
+ground plane is this return". They are the answer to two live complaints — braking on any gradient,
+and braking for every roadside bush — and they run on **AEB's band only**: the planner should keep
+steering around kerbs and bushes, and `ObstacleBand` defaults both off so its band is untouched.
+Both can only ever *remove* candidates, so neither can invent an obstacle; that is what makes them
+safe under a full-authority brake, and why the live checklist only has to re-prove that it fires.
+
+**Vertical extent, measured per 0.4 m cell over EVERY return in it.** The height floor cannot be
+made grade-proof by tuning, because on a climb the road itself rises through any fixed value:
+`planner.ground_rise` is clamped into a 1.5% cone to protect the planner's kerb detection, so at 5%
+and 25 m the estimator measured **1.20 m of rise against 0.225 m allowed** and the whole hillside
+entered the band as a dense, persistent surface. Extent is immune — 0.08 m of spread on a 20% slope
+against metres for a wall — and being a *difference* it is equally immune to brake dive and to
+suspension heave, which is the near field the cone could never reach and the entire operating range
+of the reverse system. Three things about it are load-bearing:
+
+- **Measured over the whole cell, floor-rejected returns included.** A 0.35 m rock puts 0.05 m above
+  the 0.30 m floor; measuring the survivors would call it 0.05 m tall and delete every kerbstone,
+  bollard and low post there is.
+- **The cell BASE is then the ground reference for the floor *and* the ceiling.** Referencing the
+  ceiling to the clamped estimate instead made AEB go blind to real walls on steep hills — at 20%
+  and 30 m the surface is 6 m up, so a wall standing on it starts above `OBSTACLE_MAX_HEIGHT_M` and
+  was discarded as overhead. Caught by `test_a_wall_on_that_same_hill_is_still_an_obstacle`.
+- It also makes AEB independent of `SLOPE_ALLOWANCE_PER_M` in both directions, so the planner's cone
+  can be tuned without touching the brake.
+
+**Porosity: the window is the shadow a SOLID twin would cast.** An object of height `a` at range `r`
+seen from a sensor at height `h` hides the ground behind it for `r·a/(h − a)`; ground returns inside
+that shadow mean the rays got through, which is a bush. At 20 m a 0.6 m bush would have hidden
+12.2 m and the ground comes back at 21–32 m; a 0.6 m post genuinely hides it and stays an obstacle.
+
+- **`a ≥ h` makes the shadow infinite and the window EMPTY, so anything as tall as the roof unit can
+  never be vetoed.** That is the safety property and it is *derived*, not imposed: no parallax
+  between the five mount positions can talk AEB out of braking for a wall, a car or a person. It is
+  written as an explicit negative shadow rather than left to the arithmetic, so it cannot depend on
+  the cloud happening to contain nothing beyond a wall.
+- **It must be the ROOF unit's height.** From the 0.20 m mounts a 0.6 m bush hides the ground behind
+  it completely, so from down there a bush and a wall are indistinguishable by construction. No roof
+  mount ⇒ height 0 ⇒ nothing is ever vetoed, the conservative direction.
+- Decided per **cell**, not per return, and the shadow length comes from the cell's extent — the
+  whole object casts it. Using a return's own height up the object would shorten every window and,
+  worse, make a wall's lower half testable when the wall as a whole must never be.
+- **The window's WIDTH is derived too, and treating it as a constant is what made AEB brake late.**
+  Evidence only counts if the candidate would have blocked it, so the azimuth window is the cell's
+  own angular width, `OBSTACLE_CELL_M / r`. `AEB_POROSITY_AZIMUTH_DEG` was 2.0 and *was* the window:
+  a fixed angle against objects of fixed width, so it outgrew them with range — a 1.8 m car spans a
+  2° bin only inside ~52 m and covers one outright only inside ~26 m, past which the road **beside**
+  the car, which no part of it ever stood in front of, vetoed it. It is now the grid **resolution**
+  (0.5°), and only bins lying entirely inside a candidate's wedge are consulted; none fully inside
+  means no evidence, which reads as solid.
+- **The (bin, range) key must be clamped to its own bin.** A shadow longer than the key stride ran
+  into the *next* bin and counted the road in **front** of the object as proof of seeing through it.
+  A car's shadow is over 3× its range, so this fired for every car past ~15 m.
+  Together the two defects made AEB blind to a stopped car beyond about 10 m — measured on a
+  ring-sampled scene at 15/20/30/40/50/60 m and three lateral offsets, all eighteen blind, which is
+  the whole 20–49 m band the trigger fires in at 60–100 km/h. Pinned by
+  `test_a_stopped_car_survives_both_shape_tests_at_every_firing_range`, which fails 18/18 against
+  the old window while the bush and post cases pass either way — a filter that only ever *removes*
+  candidates still has to be proved not to remove the target.
+- Two honest limits: a candidate near the scan horizon has nothing beyond it to see, and neither
+  does one on a crest. Both fail toward braking.
+
 `planner.geometric_obstacle_sets` builds both floors from **one** ground estimate. Measured on a
 60k worst case, the shared ranges + `ground_rise` are 2.6 ms of 3.3 while a second floor's mask
 and despeckle add 0.7 — calling the whole function twice took the both-features-on tick from 4.0
 to 7.8 ms. `geometric_obstacles` is now a single-floor wrapper over it.
+
+The shape tests are the expensive part now, and both are O(cloud). Measured on a synthetic street
+sampled the way the sensors actually lay it down (ground *rings*, not uniform noise): **8.0 ms at a
+50 km/h horizon, 9.7 at 100 km/h, 11.4 at 125** for both bands together, against 1.2–1.8 ms for the
+planner's band alone. Three things keep it there, and all three matter:
+
+- `_cell_profile` **sorts rather than argsorts** — the height is packed into the low bits of the
+  same integer key, so the group minimum and maximum are the first and last of each run and the
+  permutation is never needed. That alone was 5.9 ms of a 10.6 ms profile on a 110k cloud.
+- Porosity is asked **only of cells shorter than the sensor**, since taller ones are immune anyway.
+  In a street scene that skips building the evidence set entirely.
+- Keys are integers end to end (range quantised to the centimetre), because numpy sorts integers by
+  radix and floats by comparison.
+
+Benchmark on *uniform noise* instead and it is roughly twice that, because one return per cell is
+the worst possible case for a per-cell test and nothing like a scene. `test_the_shape_tests_stay_
+inside_the_tick` uses ring-sampled ground for that reason.
 
 The BEV overlay draws the corridor from `AebState`'s own curvature and half-width (so it is
 provably what was scanned), filled **only as far as the blockage** — filling to the horizon reads
@@ -1010,6 +1217,15 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   to swallow noise would re-merge the tree with the grass under it.
 - `WORLD_COLLISION_CEILING_M` (2.6) is a question about the VEHICLE, not the scene. Raise it for
   anything tall enough to hit a branch a car passes under.
+- `WORLD_CELL_MEMORY_M` (25) and `WORLD_COLUMN_MEMORY_M` (90) are **metres travelled, not
+  seconds**, and `WORLD_VEHICLE_TTL_S` (0.15) deliberately still is. Do not "tidy" the three into
+  one unit: static geometry and traffic are on different clocks by design, and the second one is
+  what lets a car cross in front of a stopped ego and still fade. The two distances are sized to
+  reproduce the old windows at cruising speed (1.2 s was 17 m at 50 km/h; 4 s was 56 m), so raising
+  them costs store size and scene-build time rather than correctness.
+- `WORLD_MAX_ROAD_CELLS` (120k) is the bound the road store never needed while a TTL emptied it,
+  and needs now. Its companion is the radius cull in `_expire_road_cells`; the cap alone would let
+  a parked car in open terrain accumulate whatever fits inside it.
 - `WORLD_DEPTH_*` is **exponential extinction over `WORLD_DEPTH_SCALE_M`, not a ramp to a far
   distance**, and the shape had to change when the view went from a 45 m rim to a 150 m one. A
   ramp has to spend its gradient somewhere: normalised to 150 m, a wall at 12 m and a building at
@@ -1022,7 +1238,9 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   never from `plan.command.mode`: `plan` is None whenever self-driving is off, which is exactly
   when a human is doing the reversing, so the old check only ever swung the camera round for the
   autonomous reverse recovery. `PerceptionSnapshot.forward_speed_mps` carries the sign because
-  `speed_mps` is `norm(vel)` and cannot.
+  `speed_mps` is `norm(vel)` and cannot. **The camera is now stateful and damped — see its own
+  section below; `WORLD_CAM_PARK_SPEED_MPS` and `WORLD_CAM_DRIVE_SPEED_MPS` are a hysteresis pair
+  and collapsing them nods the view at every give-way line.**
 - `WORLD_COLUMN_VERTICAL_BRIDGE_BINS` went 1 → 2 when the reach went to 150 m, and it had to.
   Vertical sampling on a wall is `r·Δθ` at 0.118° — 0.10 m at 50 m but 0.31 m at 150 m — so at one
   0.25 m bin every return past ~110 m became its own sub-minimum run and was dropped, and the far
@@ -1035,6 +1253,17 @@ The AEB constants have the same "looks like one quantity, is two" trap as the dr
 - `AEB_OBSTACLE_MIN_HEIGHT_M` (0.30) vs `OBSTACLE_MIN_HEIGHT_M` (0.12). Different questions —
   steer around it, or brake for it. Lowering AEB's to match is what puts the road surface into
   its obstacle set under a brake dive.
+- `AEB_MIN_VERTICAL_EXTENT_M` (0.25) is not a third floor: it is a question about the OBJECT
+  (how tall is it) rather than about a return (how high is it). Raising it toward a bush's height
+  to swallow foliage would also delete kerb-height solids; foliage is porosity's job.
+- `AEB_POROSITY_GAP_M` keeps an object's own returns out of its own window and
+  `AEB_POROSITY_MIN_HITS` means one stray return cannot clear a real obstacle. Neither sets *how
+  far* the test looks — that is the shadow length, which is geometry and has no constant. Nor does
+  `AEB_POROSITY_AZIMUTH_DEG` set how *wide*: that is the candidate's own wedge, equally derived.
+  It is the grid **resolution** (0.5°, two of the front unit's 0.26° columns) and wants to stay fine
+  enough that a candidate still covers a whole bin at the ranges the test is for — a 0.4 m cell does
+  out to ~46 m. Coarsening it back toward the object's own angular size re-creates the late-braking
+  regression above.
 - `AEB_TRIGGER_MARGIN` (1.15, *when* to fire) vs `AEB_RELEASE_MARGIN` (2.0, when to let go).
   Both multiply the same `stopping_distance(v)`; equal values chatter on the boundary.
 - `AEB_MAX_HORIZON_M` (70, how far AEB looks) vs `PLANNER_HORIZON_M` (35, how far a *path* is
