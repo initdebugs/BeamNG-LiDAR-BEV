@@ -34,21 +34,35 @@ from .config import (
     WORLD_AIR_RGB,
     WORLD_BOUNDARY_LIT_RGB,
     WORLD_BOUNDARY_RGB,
+    WORLD_CAM_ALERT_LIFT_M,
+    WORLD_CAM_ALERT_PULLBACK_M,
     WORLD_CAM_CORNER_LIFT_M,
+    WORLD_CAM_CORNER_YAW_DEG,
+    WORLD_CAM_CORNER_YAW_PER_CURVATURE,
     WORLD_CAM_DISTANCE_BASE_M,
     WORLD_CAM_DISTANCE_MAX_M,
     WORLD_CAM_DISTANCE_PER_MPS,
+    WORLD_CAM_DRIVE_SPEED_MPS,
     WORLD_CAM_HEIGHT_BASE_M,
     WORLD_CAM_HEIGHT_MAX_M,
     WORLD_CAM_HEIGHT_PER_MPS,
+    WORLD_CAM_PARK_DISTANCE_M,
+    WORLD_CAM_PARK_DWELL_S,
+    WORLD_CAM_PARK_HEIGHT_M,
+    WORLD_CAM_PARK_PITCH_DEG,
+    WORLD_CAM_PARK_SPEED_MPS,
+    WORLD_CAM_PITCH_DEG,
+    WORLD_CAM_PITCH_LIMIT_DEG,
     WORLD_CAM_REVERSE_SPEED_MPS,
+    WORLD_CAM_TAU_S,
+    WORLD_CAM_YAW_TAU_S,
+    WORLD_CELL_MEMORY_M,
     WORLD_CELL_SIZE_M,
-    WORLD_CELL_TTL_S,
     WORLD_COLLISION_CEILING_M,
     WORLD_COLUMN_BRIDGE_CELLS,
     WORLD_COLUMN_HEIGHT_M,
+    WORLD_COLUMN_MEMORY_M,
     WORLD_COLUMN_SIZE_M,
-    WORLD_COLUMN_TTL_S,
     WORLD_COLUMN_VERTICAL_BRIDGE_BINS,
     WORLD_DEPTH_HAZE,
     WORLD_DEPTH_NEAR_M,
@@ -56,6 +70,7 @@ from .config import (
     WORLD_EDGE_FADE_M,
     WORLD_MAX_BOUNDARY_POINTS,
     WORLD_MAX_COLUMNS,
+    WORLD_MAX_ROAD_CELLS,
     WORLD_MAX_UNCERTAIN_POINTS,
     WORLD_MIN_SLAB_HEIGHT_M,
     WORLD_PATH_ALERT_RGB,
@@ -891,6 +906,109 @@ def merge_cell_runs(
     )
 
 
+@dataclass(frozen=True)
+class CameraPose:
+    """Where the chase camera is, as four independently damped scalars."""
+
+    height_m: float
+    distance_m: float
+    pitch_deg: float
+    yaw_deg: float
+    """
+    Orbit angle about the ego, 0 behind and 180 ahead. The camera POSITION is
+    derived from it, so damping this one number sweeps the reverse swing round
+    the side instead of teleporting through the car.
+
+    Kept as a plain scalar rather than wrapped: the only targets are ~0 and ~180
+    give or take the corner offset, so the value never leaves [-30, 210] and
+    there is no shortest-path ambiguity to resolve.
+    """
+
+
+def damp(current: float, target: float, dt: float, tau: float) -> float:
+    """
+    One exponential step toward a target, independent of the frame rate.
+
+    ``1 - exp(-dt/tau)`` rather than a fixed fraction per frame, because the
+    scene thread's rate varies with the scene: a per-frame constant would make
+    the camera lazier exactly when the build is slow.
+    """
+    if tau <= 0.0 or dt <= 0.0:
+        return target
+    alpha = 1.0 - math.exp(-dt / tau)
+    return current + (target - current) * alpha
+
+
+def camera_target(
+    snapshot: PerceptionSnapshot, parked: bool, alerting: bool
+) -> CameraPose:
+    """
+    Where the camera wants to be. Pure: the damping toward it lives in the
+    assembler, which is the thing that has state.
+    """
+    speed = abs(snapshot.speed_mps)
+    plan = snapshot.plan
+    reversing = snapshot.forward_speed_mps < -WORLD_CAM_REVERSE_SPEED_MPS or (
+        plan is not None and plan.command.mode == "REVERSING"
+    )
+    curvature = _travel_curvature(snapshot, reversing)
+
+    if parked:
+        # Stopped or manoeuvring: one state, not two. "Parked" and "shuffling
+        # into a space" are the same situation, and separate thresholds for them
+        # would fight each other at the speeds parking actually happens at.
+        height = WORLD_CAM_PARK_HEIGHT_M
+        distance = WORLD_CAM_PARK_DISTANCE_M
+        pitch = WORLD_CAM_PARK_PITCH_DEG
+    else:
+        height = WORLD_CAM_HEIGHT_BASE_M + speed * WORLD_CAM_HEIGHT_PER_MPS
+        height += abs(curvature) * WORLD_CAM_CORNER_LIFT_M
+        distance = WORLD_CAM_DISTANCE_BASE_M + speed * WORLD_CAM_DISTANCE_PER_MPS
+        pitch = WORLD_CAM_PITCH_DEG
+    if alerting:
+        height += WORLD_CAM_ALERT_LIFT_M
+        distance += WORLD_CAM_ALERT_PULLBACK_M
+
+    # Positive curvature turns left, and the camera orbits toward the outside of
+    # the bend, which is what puts the inside of it in view past the ego.
+    corner = float(
+        np.clip(
+            -curvature * WORLD_CAM_CORNER_YAW_PER_CURVATURE,
+            -WORLD_CAM_CORNER_YAW_DEG,
+            WORLD_CAM_CORNER_YAW_DEG,
+        )
+    )
+    return CameraPose(
+        height_m=float(
+            np.clip(height, WORLD_CAM_HEIGHT_BASE_M, WORLD_CAM_HEIGHT_MAX_M)
+            if not parked
+            else height
+        ),
+        distance_m=float(
+            np.clip(distance, WORLD_CAM_DISTANCE_BASE_M, WORLD_CAM_DISTANCE_MAX_M)
+            if not parked
+            else distance
+        ),
+        pitch_deg=float(max(pitch, WORLD_CAM_PITCH_LIMIT_DEG)),
+        yaw_deg=(180.0 if reversing else 0.0) + corner,
+    )
+
+
+def _travel_curvature(snapshot: PerceptionSnapshot, reversing: bool) -> float:
+    """
+    How hard the car is turning, however it is being driven.
+
+    The plan carries it when self-driving; otherwise the armed AEB state does,
+    because that one derives curvature from MEASURED yaw and runs under a human
+    driver -- which is exactly when the camera most needs to know.
+    """
+    plan = snapshot.plan
+    if plan is not None:
+        return float(plan.arc.next_curvature)
+    state = snapshot.rear_aeb if reversing else snapshot.aeb
+    return float(state.curvature) if state is not None else 0.0
+
+
 @dataclass
 class _ActorTrack:
     observation: ActorObservation
@@ -904,6 +1022,12 @@ class WorldSceneAssembler:
     def __init__(self) -> None:
         self._actor_tracks: dict[str, _ActorTrack] = {}
         self._last_ego_pos: np.ndarray | None = None
+        # Camera state. None means "no pose yet", which makes the first frame
+        # land exactly on its target instead of easing in from a guess.
+        self._camera_pose: CameraPose | None = None
+        self._camera_at: float | None = None
+        self._parked = False
+        self._parked_for = 0.0
         # Parallel numpy arrays rather than dicts of dataclasses: both stores
         # are bin-and-reduce over the cloud and stay vectorised end to end.
         self._clear_geometry()
@@ -914,24 +1038,35 @@ class WorldSceneAssembler:
         self._clear_geometry()
 
     def _clear_geometry(self) -> None:
+        # Metres of ego travel since the store was last cleared. Static geometry
+        # expires against THIS rather than against the wall clock -- see
+        # WORLD_CELL_MEMORY_M for why, and `_track_ego_motion` for where it comes
+        # from. Reset here so the odometer and the stamps written against it can
+        # never disagree.
+        self._travelled_m = 0.0
         self._road_keys = _EMPTY_CELL_KEYS.copy()
         self._road_height = _EMPTY_CELL_VALUES.copy()
+        # Odometer readings, not timestamps.
         self._road_seen = _EMPTY_CELL_VALUES.copy()
         # (x, y, height-bin) voxels, not (x, y) columns holding one span. The
         # third field is what lets a tree be a canopy over a gap over a trunk.
         self._voxel_keys = _EMPTY_CELL_KEYS.copy()
         self._voxel_low = _EMPTY_CELL_VALUES.copy()
         self._voxel_high = _EMPTY_CELL_VALUES.copy()
+        # TWO clocks, because the two classes are different kinds of thing.
+        # Scenery is remembered for a distance driven; traffic is remembered for
+        # a duration, so a car crossing in front of a STOPPED ego still fades.
         self._voxel_seen = _EMPTY_CELL_VALUES.copy()
+        self._voxel_travel = _EMPTY_CELL_VALUES.copy()
         # _STATIC or _TRAFFIC, parallel to the keys. Kept as a value rather than
         # a fourth key field so a voxel cannot exist twice, and so the class can
         # be promoted in place when a parked car starts moving.
         self._voxel_class = np.empty(0, dtype=np.uint8)
 
     def update(self, snapshot: PerceptionSnapshot) -> WorldFrame:
-        self._reset_after_pose_jump(snapshot)
+        self._track_ego_motion(snapshot)
         self._update_road_cells(snapshot)
-        self._expire_road_cells(snapshot.timestamp)
+        self._expire_road_cells(snapshot)
         self._update_boundary_columns(snapshot)
         self._expire_boundary_columns(snapshot)
 
@@ -948,7 +1083,7 @@ class WorldSceneAssembler:
         uncertain, uncertain_colors = self._uncertain_points(snapshot)
         actors = self._update_actors(snapshot)
         path_vertices, path_colors, path_indices = self._planned_path(snapshot, alert)
-        camera_position, camera_euler = self._camera(snapshot)
+        camera_position, camera_euler = self._camera(snapshot, alert)
         plan = snapshot.plan
 
         return WorldFrame(
@@ -990,14 +1125,25 @@ class WorldSceneAssembler:
             perception_available=bool(len(snapshot.points_world)),
         )
 
-    def _reset_after_pose_jump(self, snapshot: PerceptionSnapshot) -> None:
+    def _track_ego_motion(self, snapshot: PerceptionSnapshot) -> None:
+        """
+        Advance the odometer, and drop everything on a teleport.
+
+        The odometer is summed from successive ego positions rather than
+        integrated from speed, because the positions ARE the ground truth the
+        whole store is anchored on -- there is nothing to drift against. A
+        snapshot dropped by `SceneWorker`'s one-slot handoff costs a chord
+        instead of an arc, which at these speeds is nothing.
+        """
         position = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
-        if (
-            self._last_ego_pos is not None
-            and np.linalg.norm(position - self._last_ego_pos)
-            > WORLD_POSE_JUMP_RESET_M
-        ):
-            self.clear()
+        if self._last_ego_pos is not None:
+            step = float(np.linalg.norm(position - self._last_ego_pos))
+            if step > WORLD_POSE_JUMP_RESET_M:
+                # A teleport, not a drive. Clearing resets the odometer too, so
+                # the jump is never counted as travel.
+                self.clear()
+            else:
+                self._travelled_m += step
         self._last_ego_pos = position
 
     def _update_road_cells(self, snapshot: PerceptionSnapshot) -> None:
@@ -1036,13 +1182,15 @@ class WorldSceneAssembler:
         all_keys = np.concatenate((self._road_keys, keys[order][starts]))
         all_height = np.concatenate((self._road_height, fresh_height))
         all_seen = np.concatenate(
-            (self._road_seen, np.full(len(starts), snapshot.timestamp))
+            (self._road_seen, np.full(len(starts), self._travelled_m))
         )
         # Newest observation wins, which is exactly what a dict write did. The
         # sort is STABLE and this frame's cells were appended after the stored
-        # ones, so the last entry of each cell's block is the freshest reading
-        # -- no timestamp comparison needed, because snapshot timestamps only
-        # ever advance and a pose jump clears the whole store anyway.
+        # ones, so the last entry of each cell's block is the freshest reading.
+        # Note this compares NOTHING: it is the append order that decides, which
+        # is why the stamp being an odometer -- a value that stalls whenever the
+        # car is parked, instead of a clock that always advances -- changes
+        # nothing here. A pose jump clears the whole store anyway.
         combined_packed = pack_cell_keys(all_keys)
         combined_order = np.argsort(combined_packed, kind="stable")
         newest = combined_order[_group_ends(combined_packed[combined_order])]
@@ -1050,15 +1198,36 @@ class WorldSceneAssembler:
         self._road_height = all_height[newest]
         self._road_seen = all_seen[newest]
 
-    def _expire_road_cells(self, now: float) -> None:
+    def _expire_road_cells(self, snapshot: PerceptionSnapshot) -> None:
+        """
+        Forget road the car has DRIVEN PAST, and road it can no longer draw.
+
+        Both bounds live here rather than in `_road_mesh`. The radius test used
+        to sit in the mesh and decide only what was drawn, which was survivable
+        while a 1.2 s TTL bounded the store by itself; a distance-stamped store
+        parked in one spot would otherwise keep every cell the sensors ever
+        reached. `_expire_boundary_columns` has always owned its own cull for
+        the same reason, and `update` expires before it meshes, so the surface
+        drawn is unchanged.
+        """
         if not len(self._road_keys):
             return
-        keep = now - self._road_seen <= WORLD_CELL_TTL_S
-        if keep.all():
+        ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
+        centres = (self._road_keys[:, :2] + 0.5) * WORLD_CELL_SIZE_M
+        offsets = centres - ego[:2]
+        keep = (self._travelled_m - self._road_seen <= WORLD_CELL_MEMORY_M) & (
+            np.einsum("ij,ij->i", offsets, offsets) <= WORLD_ROAD_RADIUS_M**2
+        )
+        if keep.all() and len(self._road_keys) <= WORLD_MAX_ROAD_CELLS:
             return
-        self._road_keys = self._road_keys[keep]
-        self._road_height = self._road_height[keep]
-        self._road_seen = self._road_seen[keep]
+        indices = np.flatnonzero(keep)
+        if len(indices) > WORLD_MAX_ROAD_CELLS:
+            # Drop what was seen longest ago, as the voxel store does.
+            freshest = np.argsort(self._road_seen[indices])[-WORLD_MAX_ROAD_CELLS:]
+            indices = np.sort(indices[freshest])
+        self._road_keys = self._road_keys[indices]
+        self._road_height = self._road_height[indices]
+        self._road_seen = self._road_seen[indices]
 
     def _road_mesh(
         self, snapshot: PerceptionSnapshot
@@ -1080,17 +1249,14 @@ class WorldSceneAssembler:
         is no Python loop left here at all, which is why this is cheaper than
         the merge it replaces despite emitting far more geometry.
         """
+        # No radius test here: `_expire_road_cells` culled to exactly
+        # WORLD_ROAD_RADIUS_M earlier in `update`, so everything still in the
+        # store is drawable.
         if not len(self._road_keys):
             return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
-        ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
-        centres = (self._road_keys[:, :2] + 0.5) * WORLD_CELL_SIZE_M
-        offsets = centres - ego[:2]
-        near = np.einsum("ij,ij->i", offsets, offsets) <= WORLD_ROAD_RADIUS_M**2
-        if not near.any():
-            return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
 
-        cells = self._road_keys[near]
-        heights = self._road_height[near]
+        cells = self._road_keys
+        heights = self._road_height
         # Close the sampling lattice before meshing. Ground returns thin as r^2
         # radially and as r in azimuth, so past roughly 20 m they stop reaching
         # every quarter-metre cell and the road breaks into a checkerboard of
@@ -1193,10 +1359,12 @@ class WorldSceneAssembler:
             ).astype(np.int32)
             heights = points[:, 2]
             seen = np.full(len(points), snapshot.timestamp)
+            travel = np.full(len(points), self._travelled_m)
         else:
             keys = np.empty((0, 3), dtype=np.int32)
             heights = np.empty(0)
             seen = np.empty(0)
+            travel = np.empty(0)
             classes = np.empty(0, dtype=np.uint8)
 
         all_keys = np.concatenate((self._voxel_keys, keys))
@@ -1205,6 +1373,7 @@ class WorldSceneAssembler:
         all_low = np.concatenate((self._voxel_low, heights))
         all_high = np.concatenate((self._voxel_high, heights))
         all_seen = np.concatenate((self._voxel_seen, seen))
+        all_travel = np.concatenate((self._voxel_travel, travel))
         all_class = np.concatenate((self._voxel_class, classes))
 
         # One sort, and the store is LEFT in that sorted order. pack_cell_keys
@@ -1223,7 +1392,11 @@ class WorldSceneAssembler:
         self._voxel_keys = ordered_keys[starts]
         self._voxel_low = np.minimum.reduceat(all_low[order], starts)
         self._voxel_high = np.maximum.reduceat(all_high[order], starts)
+        # Both clocks, reduced the same way. Each is non-decreasing -- the
+        # odometer stalls while parked but never runs backwards -- so the
+        # maximum is still "most recently seen" under either measure.
         self._voxel_seen = np.maximum.reduceat(all_seen[order], starts)
+        self._voxel_travel = np.maximum.reduceat(all_travel[order], starts)
         # _TRAFFIC outranks _STATIC, so a voxel a car has just moved into takes
         # the short vehicle TTL and cannot be pinned in place by an older static
         # reading of the same box.
@@ -1235,13 +1408,18 @@ class WorldSceneAssembler:
         ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
         centres = (self._voxel_keys[:, :2] + 0.5) * WORLD_COLUMN_SIZE_M
         offsets = centres - ego[:2]
-        # Per CLASS, because the two are different kinds of thing: scenery only
-        # improves with more looks, while a car accumulated over the same window
-        # is drawn as a four-second streak of itself.
-        ttl = np.where(
-            self._voxel_class == _TRAFFIC, WORLD_VEHICLE_TTL_S, WORLD_COLUMN_TTL_S
+        # Per CLASS, and on different CLOCKS, because the two are different
+        # kinds of thing. Scenery only improves with more looks and is forgotten
+        # by the metre, so a stopped car keeps everything it has seen. Traffic
+        # is forgotten by the second: accumulated over the scenery window a car
+        # is drawn as a streak of itself, and one crossing in front of a STOPPED
+        # ego would never fade at all if it shared the odometer.
+        stale = np.where(
+            self._voxel_class == _TRAFFIC,
+            snapshot.timestamp - self._voxel_seen > WORLD_VEHICLE_TTL_S,
+            self._travelled_m - self._voxel_travel > WORLD_COLUMN_MEMORY_M,
         )
-        keep = (snapshot.timestamp - self._voxel_seen <= ttl) & (
+        keep = (~stale) & (
             np.einsum("ij,ij->i", offsets, offsets) <= WORLD_RADIUS_M**2
         )
         if keep.all() and len(self._voxel_keys) <= WORLD_MAX_COLUMNS:
@@ -1256,6 +1434,7 @@ class WorldSceneAssembler:
         self._voxel_low = self._voxel_low[indices]
         self._voxel_high = self._voxel_high[indices]
         self._voxel_seen = self._voxel_seen[indices]
+        self._voxel_travel = self._voxel_travel[indices]
         self._voxel_class = self._voxel_class[indices]
 
     def _column_runs(
@@ -1272,8 +1451,21 @@ class WorldSceneAssembler:
         its own object and can be recognised as something you drive under.
 
         Returns `(keys (N, 2) column, lows (N,), highs (N,), classes (N,))` for
-        every run that is a collision hazard -- overhead structures are dropped
-        here.
+        every run that is a collision hazard -- overhead structures and runs too
+        short to be structure at all are both dropped here.
+
+        **Dropping the short ones HERE rather than after bridging is what keeps
+        the build inside the tick.** `_slab_mesh` used to bridge every run and
+        then discard the ones under WORLD_MIN_SLAB_HEIGHT_M, so on open ground --
+        where the whole surface is boundary-classified rather than road -- it
+        bridged tens of thousands of flat ground runs across two axes and threw
+        nearly all of them away. Measured on a synthetic street with striped
+        facades, kerbs and open ground: **69.1 ms -> 34.7 ms**, with every
+        structure over a metre tall preserved exactly (41 boxes either way).
+        What disappears is short ground fragments that bridging was inventing --
+        interpolating between a flat ground column and a kerb manufactures a
+        ramp nobody observed, so bridging only ever joining structure to
+        structure is also the more honest rule.
         """
         if not len(self._voxel_keys):
             return (
@@ -1324,12 +1516,14 @@ class WorldSceneAssembler:
         )
         grounded = floor_per_run <= ego_ground + WORLD_COLLISION_CEILING_M
         reference = np.where(grounded, floor_per_run, ego_ground)
-        reachable = lows - reference < WORLD_COLLISION_CEILING_M
+        keep = (lows - reference < WORLD_COLLISION_CEILING_M) & (
+            highs - lows >= WORLD_MIN_SLAB_HEIGHT_M
+        )
         return (
-            keys[reachable],
-            lows[reachable],
-            highs[reachable],
-            classes[reachable],
+            keys[keep],
+            lows[keep],
+            highs[keep],
+            classes[keep],
         )
 
     @staticmethod
@@ -1399,11 +1593,10 @@ class WorldSceneAssembler:
         for axis in (0, 1):
             keys, base, top = self._bridge_column_gaps(keys, base, top, axis)
 
-        tall = top - base >= WORLD_MIN_SLAB_HEIGHT_M
-        if not tall.any():
-            return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
-        keys, base, top = keys[tall], base[tall], top[tall]
-
+        # No height cull here: `_column_runs` already dropped everything under
+        # WORLD_MIN_SLAB_HEIGHT_M, and doing it there rather than here is what
+        # keeps bridging off the flat ground -- see its docstring for the
+        # measurement.
         rectangles, extents = merge_cell_runs(
             keys, np.column_stack((base, top)), WORLD_COLUMN_SIZE_M
         )
@@ -1711,12 +1904,13 @@ class WorldSceneAssembler:
         )
         return vertices, np.ascontiguousarray(colours), indices
 
-    @staticmethod
     def _camera(
-        snapshot: PerceptionSnapshot,
+        self, snapshot: PerceptionSnapshot, alert: str
     ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
         """
-        Chase camera: swings round when reversing, pulls back with speed.
+        Chase camera: swings round when reversing, pulls back with speed, tilts
+        toward top-down at a standstill, leans into a bend, and stands off on a
+        full brake so the threat and the ego are framed together.
 
         Reversing is read from the SIGNED forward speed, not from the plan.
         `plan` is None whenever self-driving is off -- which is exactly when a
@@ -1724,32 +1918,75 @@ class WorldSceneAssembler:
         `plan.command.mode == "REVERSING"` meant the camera only ever turned
         round for the autonomous reverse recovery, and never for a driver
         selecting reverse themselves.
+
+        Everything is DAMPED toward its target. Nothing was, which is why the
+        reverse swing teleported, and why any of the states above would have
+        snapped in and out. The first frame still lands exactly on its target,
+        so the pose is never a blend of a real scene and an initial guess.
+
+        The alert gate is `_alert`'s own string, so the framing move and the
+        overlay agree by construction about what an event is: it is non-empty
+        only while a pedal is actually down.
         """
-        plan = snapshot.plan
+        dt = 0.0
+        if self._camera_at is not None:
+            dt = max(0.0, float(snapshot.timestamp) - self._camera_at)
+        self._camera_at = float(snapshot.timestamp)
+
+        target = camera_target(
+            snapshot, self._camera_parked(snapshot, dt), bool(alert)
+        )
+        if self._camera_pose is None:
+            pose = target
+        else:
+            current = self._camera_pose
+            pose = CameraPose(
+                height_m=damp(
+                    current.height_m, target.height_m, dt, WORLD_CAM_TAU_S
+                ),
+                distance_m=damp(
+                    current.distance_m, target.distance_m, dt, WORLD_CAM_TAU_S
+                ),
+                pitch_deg=damp(
+                    current.pitch_deg, target.pitch_deg, dt, WORLD_CAM_TAU_S
+                ),
+                yaw_deg=damp(
+                    current.yaw_deg, target.yaw_deg, dt, WORLD_CAM_YAW_TAU_S
+                ),
+            )
+        self._camera_pose = pose
+
+        # The position is DERIVED from the orbit angle, which is what turns the
+        # reverse flip into a sweep round the side of the car rather than a jump
+        # through it. At yaw 0 this is (0, h, +d) and at 180 it is (0, h, -d),
+        # exactly the two poses the fixed version had.
+        yaw = math.radians(pose.yaw_deg)
+        return (
+            (
+                pose.distance_m * math.sin(yaw),
+                pose.height_m,
+                pose.distance_m * math.cos(yaw),
+            ),
+            (pose.pitch_deg, pose.yaw_deg, 0.0),
+        )
+
+    def _camera_parked(self, snapshot: PerceptionSnapshot, dt: float) -> bool:
+        """
+        Whether the car has been stopped long enough to tilt the view down.
+
+        Hysteresis AND a dwell. Parking happens at 0.3-1 m/s, so a single
+        threshold nods the camera every time the car creeps; between the two
+        speeds the current state simply holds.
+        """
         speed = abs(snapshot.speed_mps)
-        curvature = abs(plan.arc.next_curvature) if plan is not None else 0.0
-        reversing = snapshot.forward_speed_mps < -WORLD_CAM_REVERSE_SPEED_MPS or (
-            plan is not None and plan.command.mode == "REVERSING"
-        )
-        height = float(
-            np.clip(
-                WORLD_CAM_HEIGHT_BASE_M
-                + speed * WORLD_CAM_HEIGHT_PER_MPS
-                + curvature * WORLD_CAM_CORNER_LIFT_M,
-                WORLD_CAM_HEIGHT_BASE_M,
-                WORLD_CAM_HEIGHT_MAX_M,
-            )
-        )
-        distance = float(
-            np.clip(
-                WORLD_CAM_DISTANCE_BASE_M + speed * WORLD_CAM_DISTANCE_PER_MPS,
-                WORLD_CAM_DISTANCE_BASE_M,
-                WORLD_CAM_DISTANCE_MAX_M,
-            )
-        )
-        if reversing:
-            return (0.0, height, -distance), (-21.0, 180.0, 0.0)
-        return (0.0, height, distance), (-21.0, 0.0, 0.0)
+        if speed >= WORLD_CAM_DRIVE_SPEED_MPS:
+            self._parked_for = 0.0
+            self._parked = False
+        elif speed <= WORLD_CAM_PARK_SPEED_MPS:
+            self._parked_for += dt
+            if self._parked_for >= WORLD_CAM_PARK_DWELL_S:
+                self._parked = True
+        return self._parked
 
     @staticmethod
     def _alert(aeb: AebState | None, rear_aeb: AebState | None) -> str:

@@ -63,7 +63,7 @@ LIDAR_FRONT_DENSITY = 12.5
 # WORLD_CELL_SIZE_M -- the road arrives as concentric arcs with empty bands
 # between them, and NO amount of extra rays closes them, because the extra rays
 # go to azimuth. Only two things do: ego motion sweeping the rings through the
-# world (see WORLD_CELL_TTL_S), and mount height.
+# world (see WORLD_CELL_MEMORY_M), and mount height.
 #
 # The fix is a narrow aperture aimed DOWN, pinned to a ground annulus in metres
 # rather than to an angle, and derived per vehicle in derive_vehicle_geometry:
@@ -204,12 +204,37 @@ OBSTACLE_RGBA = (255, 68, 78, 255)
 # is 0.24 m at 20 m (LIDAR_ROOF_NEAR_M/FAR_M above), so a quarter-metre cell is
 # still sub-ring out to about 20 m and accumulation covers the rest.
 WORLD_CELL_SIZE_M = 0.25
-WORLD_CELL_TTL_S = 1.2
-# Vehicle returns get their own, much shorter window. Everything else in the
-# store is static scenery that only improves with more looks, but a car MOVES:
-# accumulating it over WORLD_COLUMN_TTL_S smears one car into a four-second
-# streak of itself. 0.15 s is a handful of ticks -- enough to ride out a missed
-# scan, short enough that a car at 30 m/s smears under half its own length.
+# How much DRIVING the road surface is remembered for, in metres travelled --
+# not in seconds. The detail on screen is ego motion sweeping the ground rings
+# through the world, and a wall clock was only ever a proxy for how much of that
+# sweep sat in the window. Stop the car and the sweep stops while the clock does
+# not, so the window drained and the view collapsed to what one stationary frame
+# resolves: concentric arcs with empty bands between them.
+#
+# This is safe here in a way it is not for a real vehicle: ego pose comes from
+# the simulator and is GROUND TRUTH, so there is no odometry drift to decay
+# against, and anything that MOVES is class-separated and keeps a wall clock (see
+# WORLD_VEHICLE_TTL_S). Static geometry seen a minute ago is exactly as valid as
+# geometry from this frame.
+#
+# 25 m reproduces today's feel at cruising speed -- the old 1.2 s was 13 m at the
+# 40 km/h self-driving cap, 17 m at 50 km/h and 33 m at 100 -- and holds
+# everything at a standstill, which is the entire point.
+WORLD_CELL_MEMORY_M = 25.0
+# Output bound on the road store, applied after accumulation. The store used to
+# need neither this nor a radius cull because the 1.2 s TTL bounded it by itself;
+# with distance-stamped expiry it has to be bounded explicitly, exactly as the
+# voxel store is by WORLD_MAX_COLUMNS. Generous: the radius cull at
+# WORLD_ROAD_RADIUS_M is what does the real work, and a quarter-metre grid over
+# the whole 70 m disc would only reach this if every cell in it were road.
+WORLD_MAX_ROAD_CELLS = 120_000
+# Vehicle returns get their own, much shorter window, and it is the one that
+# stays on the WALL CLOCK. Everything else in the store is static scenery that
+# only improves with more looks, but a car MOVES: accumulating it over
+# WORLD_COLUMN_MEMORY_M smears one car into a streak of itself, and a car
+# crossing in front of a STOPPED ego has to fade even though the odometer is not
+# advancing. 0.15 s is a handful of ticks -- enough to ride out a missed scan,
+# short enough that a car at 30 m/s smears under half its own length.
 WORLD_VEHICLE_TTL_S = 0.15
 # How many empty road cells may be bridged between two observed ones when
 # MESHING (never in the store). The finer grid resolves the near field properly
@@ -287,10 +312,15 @@ WORLD_COLUMN_SIZE_M = 0.25
 # denser than azimuth -- and coarser starts merging a kerb into the pavement
 # behind it.
 WORLD_COLUMN_HEIGHT_M = 0.25
-# Longer than WORLD_CELL_TTL_S because a wall is static scenery that only
-# improves with more looks, and because the stripe sweep needs seconds of
-# travel to cover the gaps at range.
-WORLD_COLUMN_TTL_S = 4.0
+# Further than WORLD_CELL_MEMORY_M, and measured the same way -- in metres
+# driven, not in seconds. A wall is static scenery that only improves with more
+# looks, and the azimuth stripe sweep needs tens of metres of travel to cover the
+# gaps at range, which is a distance rather than a duration.
+#
+# 90 m sits inside what the old 4 s window bought at speed (44 m at the 40 km/h
+# cap, 56 m at 50 km/h, 111 m at 100) and well inside WORLD_RADIUS_M, so the
+# radius cull in _expire_boundary_columns still bounds the store on every side.
+WORLD_COLUMN_MEMORY_M = 90.0
 # Output bound, applied after accumulation. Slabs are merged runs, so this is
 # generous: a facade costs a handful of boxes, not one per voxel.
 WORLD_MAX_COLUMNS = 90_000
@@ -519,6 +549,53 @@ WORLD_CAM_CORNER_LIFT_M = 22.0
 # because the sign of the forward speed is what is being read, and a car
 # crossing zero is momentarily stationary either way.
 WORLD_CAM_REVERSE_SPEED_MPS = 0.35
+# The chase pitch. Deliberately shallower than "look at the ego" (which at the
+# parked height and distance would be about -33 deg): the car sits low in frame
+# and the road ahead fills it, which is what the view is for at speed.
+WORLD_CAM_PITCH_DEG = -21.0
+
+# --- ...and how it MOVES ------------------------------------------------------
+#
+# Every quantity above is damped toward its target rather than jumping to it.
+# Nothing was, which is why the reverse swing teleported: continuity came only
+# from speed being continuous, so anything keyed on a threshold changed
+# instantly. Exponential, with the step computed as 1 - exp(-dt/tau) so the
+# result does not depend on the frame rate the scene thread happens to achieve.
+WORLD_CAM_TAU_S = 0.35
+# The swing round to reverse gets its own, quicker constant: it is a deliberate
+# 180-degree move rather than a drift, and at the shared constant it would take
+# well over a second to arrive. ~0.16 s puts it there in about half of one.
+WORLD_CAM_YAW_TAU_S = 0.16
+
+# Stopped: tilt toward a near-vertical view that shows what is around the car
+# rather than what is far in front of it, and pull in close enough to park by.
+#
+# Both a HYSTERESIS and a DWELL, because one alone is not enough. Parking
+# manoeuvres live at 0.3-1 m/s, so a single threshold would nod the camera every
+# time the car crept; the dwell means a give-way line or a moment of shuffling
+# never triggers it, and the higher release speed means pulling away restores
+# the driving view at once rather than lagging behind the car.
+WORLD_CAM_PARK_SPEED_MPS = 0.5
+WORLD_CAM_DRIVE_SPEED_MPS = 2.0
+WORLD_CAM_PARK_DWELL_S = 1.0
+WORLD_CAM_PARK_HEIGHT_M = 12.0
+WORLD_CAM_PARK_DISTANCE_M = 4.0
+WORLD_CAM_PARK_PITCH_DEG = -72.0
+# Never steeper than this. At exactly -90 the euler yaw becomes degenerate --
+# pitch and yaw rotate about the same axis and the view spins on its own -- and
+# -80 already reads as top-down, so there is nothing to buy by going closer.
+WORLD_CAM_PITCH_LIMIT_DEG = -80.0
+# Yaw a few degrees into the bend, so the inside of the corner is not hidden
+# behind the ego. Bounded hard: the view is a chase camera, not a cinematic one,
+# and the palette and depth cues were designed around a stable frame.
+WORLD_CAM_CORNER_YAW_DEG = 12.0
+WORLD_CAM_CORNER_YAW_PER_CURVATURE = 260.0
+# ...and on a full brake, lift and pull back so the threat marker and the ego
+# are in frame together. Only ever while the pedal is DOWN: the colour change
+# already carries the armed and watching states, and a camera that moved for
+# those would be a nuisance rather than an alarm.
+WORLD_CAM_ALERT_LIFT_M = 6.0
+WORLD_CAM_ALERT_PULLBACK_M = 8.0
 
 ROAD_CLASSES = frozenset(
     {

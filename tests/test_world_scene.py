@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_lidar_bev import config
+from beamng_lidar_bev import config, world_scene
 from beamng_lidar_bev.models import (
     ARMED,
     BRAKING,
@@ -97,7 +97,35 @@ def test_path_ribbon_has_two_vertices_per_sample_and_triangle_indices() -> None:
     assert np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])[1] > 0
 
 
-def test_temporal_road_cells_expire_after_ttl() -> None:
+def _drive(
+    assembler: WorldSceneAssembler,
+    metres: float,
+    *,
+    timestamp: float = 0.0,
+    step_m: float = 20.0,
+) -> None:
+    """
+    Roll the ego forward past an empty scene.
+
+    In steps, because a single hop over WORLD_POSE_JUMP_RESET_M reads as a
+    teleport and clears the whole store -- which would make a distance-expiry
+    test pass for entirely the wrong reason.
+    """
+    covered = 0.0
+    while covered < metres:
+        covered = min(covered + step_m, metres)
+        assembler.update(
+            _snapshot(timestamp=timestamp, ego_pos_world=(0.0, covered, 0.0))
+        )
+
+
+def test_road_cells_are_forgotten_by_distance_driven_not_by_time() -> None:
+    """
+    The detail on screen is ego motion sweeping the ground rings through the
+    world, so the window that holds it is a DISTANCE. On a wall clock the sweep
+    stopped when the car did but the clock did not, and the surface drained to
+    what one stationary frame resolves: concentric arcs with bands between them.
+    """
     assembler = WorldSceneAssembler()
     road = _snapshot(
         ((0.0, 3.0, -0.5), (0.4, 3.0, -0.5), (0.0, 3.4, -0.5)),
@@ -105,7 +133,15 @@ def test_temporal_road_cells_expire_after_ttl() -> None:
     )
 
     assert assembler.update(road).road_indices.size
-    assert not assembler.update(_snapshot(timestamp=1.3)).road_indices.size
+    # Parked with the clock running on: the surface stays.
+    assert assembler.update(_snapshot(timestamp=60.0)).road_indices.size
+
+    driven_m = config.WORLD_CELL_MEMORY_M + 15.0
+    _drive(assembler, driven_m, timestamp=61.0)
+
+    assert not assembler.update(
+        _snapshot(timestamp=62.0, ego_pos_world=(0.0, driven_m, 0.0))
+    ).road_indices.size
 
 
 def test_road_mesh_is_bounded_by_radius_and_clears_after_pose_jump() -> None:
@@ -122,6 +158,48 @@ def test_road_mesh_is_bounded_by_radius_and_clears_after_pose_jump() -> None:
         )
     )
     assert not jumped.road_indices.size
+
+
+def test_the_road_store_is_bounded_by_count_as_well_as_by_radius(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The road store needed no bound of its own while a 1.2 s TTL emptied it for
+    free. Stamped by distance it keeps everything a parked car can see, so it
+    carries the same two bounds the voxel store always has.
+    """
+    monkeypatch.setattr(world_scene, "WORLD_MAX_ROAD_CELLS", 8)
+    assembler = WorldSceneAssembler()
+    step = float(config.WORLD_CELL_SIZE_M)
+    cells = tuple(
+        (0.0, 3.0 + index * step, -0.5) for index in range(40)
+    )
+
+    assembler.update(_snapshot(cells, (SCENE_ROAD,) * len(cells)))
+
+    assert len(assembler._road_keys) == 8
+
+
+def test_a_parked_ego_keeps_everything_it_has_seen() -> None:
+    """
+    The complaint this whole change answers: stop the car and the view used to
+    collapse to what one stationary frame resolves. Nothing static may be
+    forgotten while the odometer is not moving, however long the wait.
+    """
+    assembler = WorldSceneAssembler()
+    wall = _wall(-5.0, 5.0, 12.0, 0.0, 4.0)
+    road = np.asarray(
+        [(0.0, 3.0 + index * 0.25, -0.5) for index in range(12)],
+        dtype=np.float32,
+    )
+    points = np.concatenate((road, wall))
+    groups = (SCENE_ROAD,) * len(road) + (SCENE_BOUNDARY,) * len(wall)
+    seen = assembler.update(_snapshot(tuple(map(tuple, points)), groups))
+
+    parked = assembler.update(_snapshot(timestamp=60.0))
+
+    assert parked.road_indices.size == seen.road_indices.size
+    assert len(_boxes(parked)) == len(_boxes(seen))
 
 
 def test_the_road_is_one_continuous_surface_with_shared_corners() -> None:
@@ -405,14 +483,28 @@ def test_boundary_columns_accumulate_across_frames_and_then_expire() -> None:
     across a wall, and only a world-anchored store keeps what earlier frames
     saw. Nothing was accumulated at all before -- the mesh was rebuilt from the
     current snapshot every tick.
+
+    And the window is a distance, for the same reason the road's is: the sweep
+    that fills a wall in is measured in metres travelled, not in seconds.
     """
     assembler = WorldSceneAssembler()
     assembler.update(_boundary_snapshot(_wall(-5.0, 5.0, 12.0, 0.0, 4.0)))
 
     empty = np.empty((0, 3), dtype=np.float32)
-    assert len(_boxes(assembler.update(_boundary_snapshot(empty, timestamp=2.0))))
+    assert len(_boxes(assembler.update(_boundary_snapshot(empty, timestamp=9.0))))
+
+    _drive(assembler, config.WORLD_COLUMN_MEMORY_M + 20.0, timestamp=10.0)
+
     assert not len(
-        _boxes(assembler.update(_boundary_snapshot(empty, timestamp=9.0)))
+        _boxes(
+            assembler.update(
+                _boundary_snapshot(
+                    empty,
+                    timestamp=11.0,
+                    ego_pos_world=(0.0, config.WORLD_COLUMN_MEMORY_M + 20.0, 0.0),
+                )
+            )
+        )
     )
 
 
@@ -513,6 +605,30 @@ def test_a_bridge_deck_over_the_road_is_not_drawn_as_a_wall() -> None:
     boxes = _boxes(WorldSceneAssembler().update(_boundary_snapshot(deck)))
 
     assert not len(boxes)
+
+
+def test_flat_ground_produces_no_slabs_at_all() -> None:
+    """
+    Open ground whose surface is not road-classified is a boundary return like
+    any other, so the store fills with one flat run per column. Those are culled
+    in `_column_runs`, BEFORE bridging: bridging them cost 69 ms of a 40 ms tick
+    on a street scene, and interpolating between a flat ground column and a kerb
+    invents a ramp nobody observed.
+    """
+    xs = np.arange(-20.0, 20.0, 0.25)
+    ys = np.arange(4.0, 40.0, 0.25)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    ground = np.column_stack(
+        (
+            grid_x.ravel(),
+            grid_y.ravel(),
+            np.full(grid_x.size, -0.5, dtype=np.float32),
+        )
+    ).astype(np.float32)
+
+    frame = WorldSceneAssembler().update(_boundary_snapshot(ground))
+
+    assert not len(_boxes(frame))
 
 
 def test_a_wall_is_not_culled_just_for_being_tall() -> None:
@@ -617,8 +733,14 @@ def test_traffic_expires_far_sooner_than_scenery_so_a_car_does_not_smear(
 ) -> None:
     """
     Everything else in the store is static scenery that only improves with more
-    looks. A car MOVES: on the scenery TTL one car is drawn as a four-second
-    streak of itself.
+    looks. A car MOVES: on the scenery window one car is drawn as a streak of
+    itself.
+
+    Note the ego never moves here, which is the strong form of the claim: the
+    two classes are on different CLOCKS, not merely on different thresholds of
+    one. Scenery is forgotten by the metre, so a parked ego keeps all of it;
+    traffic is forgotten by the second, so a car crossing in front of that same
+    parked ego still fades.
     """
     assembler = WorldSceneAssembler()
     car = _wall(-0.9, 0.9, 14.0, -0.45, 1.4, step=0.1)
@@ -875,3 +997,186 @@ def test_a_clear_corridor_gets_rails_but_no_wash() -> None:
     # the average down.
     assert clear.aeb_colors[:, 3].min() > 0.2, "a wash crept into a clear corridor"
     assert blocked.aeb_colors[:, 3].min() < 0.1
+
+
+# --- the camera moves, rather than cutting ------------------------------------
+
+
+def _roll(
+    assembler: WorldSceneAssembler,
+    seconds: float,
+    *,
+    start: float = 0.0,
+    step: float = 0.04,
+    **kwargs: object,
+) -> list[object]:
+    """Feed the assembler a run of snapshots and keep every frame."""
+    frames = []
+    elapsed = 0.0
+    while elapsed < seconds - 1e-9:
+        elapsed += step
+        frames.append(
+            assembler.update(
+                _snapshot(timestamp=start + elapsed, **kwargs)  # type: ignore[arg-type]
+            )
+        )
+    return frames
+
+
+def test_the_reverse_swing_sweeps_round_instead_of_teleporting() -> None:
+    """
+    Nothing in the camera was smoothed, so the 180-degree flip cut straight
+    through the car: continuity came only from speed being continuous, and the
+    swing is keyed on a threshold. It has to travel.
+    """
+    assembler = WorldSceneAssembler()
+    assembler.update(_snapshot(speed_mps=4.0, forward_speed_mps=4.0))
+
+    frames = _roll(assembler, 1.2, speed_mps=4.0, forward_speed_mps=-4.0)
+    yaws = [frame.camera_euler[1] for frame in frames]
+
+    assert yaws == sorted(yaws), "the swing reversed direction mid-move"
+    assert any(30.0 < yaw < 150.0 for yaw in yaws), "it jumped rather than swept"
+    assert yaws[-1] == pytest.approx(180.0, abs=2.0)
+    # ...and it goes round the SIDE, which is what an orbit means: the camera
+    # leaves the centre line entirely on the way past.
+    assert max(abs(frame.camera_position[0]) for frame in frames) > 5.0
+
+
+def test_the_camera_tilts_down_once_the_car_has_been_stopped_a_while() -> None:
+    """
+    The standstill ask. Stopped, the useful view is what is AROUND the car
+    rather than far in front of it.
+    """
+    assembler = WorldSceneAssembler()
+    assembler.update(_snapshot(speed_mps=8.0, forward_speed_mps=8.0))
+
+    stopped = _roll(assembler, 4.0, speed_mps=0.0, forward_speed_mps=0.0)
+
+    assert stopped[-1].camera_euler[0] < -60.0
+    # Closer in than the driving view ever gets, and higher than it would be at
+    # this speed -- which is what "look at what is around the car" means.
+    assert stopped[-1].camera_position[2] < config.WORLD_CAM_DISTANCE_BASE_M
+    assert stopped[-1].camera_position[1] > config.WORLD_CAM_HEIGHT_BASE_M
+    assert stopped[-1].camera_position[2] < stopped[0].camera_position[2]
+
+
+def test_a_give_way_stop_does_not_nod_the_camera() -> None:
+    """
+    Hysteresis alone is not enough: parking manoeuvres live at 0.3-1 m/s, so a
+    bare speed threshold tilts the view at every junction. The dwell is what
+    distinguishes stopping from being stopped.
+    """
+    assembler = WorldSceneAssembler()
+    assembler.update(_snapshot(speed_mps=8.0, forward_speed_mps=8.0))
+
+    paused = _roll(
+        assembler,
+        config.WORLD_CAM_PARK_DWELL_S * 0.6,
+        speed_mps=0.0,
+        forward_speed_mps=0.0,
+    )
+
+    assert paused[-1].camera_euler[0] == pytest.approx(
+        config.WORLD_CAM_PITCH_DEG, abs=1.0
+    )
+
+
+def test_pulling_away_brings_the_driving_view_straight_back() -> None:
+    assembler = WorldSceneAssembler()
+    assembler.update(_snapshot(speed_mps=0.0, forward_speed_mps=0.0))
+    _roll(assembler, 4.0, speed_mps=0.0, forward_speed_mps=0.0)
+
+    driving = _roll(assembler, 2.0, start=4.0, speed_mps=6.0, forward_speed_mps=6.0)
+
+    assert driving[-1].camera_euler[0] == pytest.approx(
+        config.WORLD_CAM_PITCH_DEG, abs=1.5
+    )
+
+
+def test_the_camera_never_reaches_the_euler_gimbal() -> None:
+    """
+    At exactly -90 degrees of pitch the yaw rotates about the same axis and the
+    view spins on its own. -80 already reads as top-down, so the limit costs
+    nothing.
+    """
+    assembler = WorldSceneAssembler()
+    frames = _roll(assembler, 6.0, speed_mps=0.0, forward_speed_mps=0.0)
+    frames += _roll(
+        assembler, 3.0, start=6.0, speed_mps=0.2, forward_speed_mps=-0.2
+    )
+
+    assert all(
+        frame.camera_euler[0] > config.WORLD_CAM_PITCH_LIMIT_DEG - 1e-6
+        for frame in frames
+    )
+
+
+def test_a_full_brake_stands_the_camera_off_and_an_armed_one_does_not() -> None:
+    """
+    The framing move is gated on `_alert`, which is the overlay's own definition
+    of an event -- non-empty only while a pedal is down. Moving the view for the
+    armed state would be a nuisance rather than an alarm.
+    """
+    assembler = WorldSceneAssembler()
+    watching = _roll(
+        assembler,
+        1.5,
+        speed_mps=15.0,
+        forward_speed_mps=15.0,
+        aeb=_aeb_state(ARMED, threat_m=None),
+    )
+    braking = _roll(
+        assembler,
+        1.5,
+        start=1.5,
+        speed_mps=15.0,
+        forward_speed_mps=15.0,
+        aeb=_aeb_state(BRAKING, threat_m=12.0),
+    )
+
+    assert watching[-1].camera_position[1] == pytest.approx(
+        watching[len(watching) // 2].camera_position[1], abs=0.5
+    )
+    assert braking[-1].camera_position[1] > watching[-1].camera_position[1] + 3.0
+    assert braking[-1].camera_position[2] > watching[-1].camera_position[2] + 3.0
+
+
+def test_the_camera_leans_into_the_bend() -> None:
+    """
+    The corner lift shows more of the corner; the other half is not hiding the
+    inside of it behind the ego. Positive curvature turns left, so the camera
+    orbits toward the outside -- the right -- to see past the car.
+    """
+    left = WorldSceneAssembler()
+    right = WorldSceneAssembler()
+    turning_left = _aeb_state(ARMED, threat_m=None, curvature=0.05)
+    turning_right = _aeb_state(ARMED, threat_m=None, curvature=-0.05)
+
+    left_frames = _roll(
+        left, 1.5, speed_mps=12.0, forward_speed_mps=12.0, aeb=turning_left
+    )
+    right_frames = _roll(
+        right, 1.5, speed_mps=12.0, forward_speed_mps=12.0, aeb=turning_right
+    )
+
+    assert left_frames[-1].camera_euler[1] < -1.0
+    assert right_frames[-1].camera_euler[1] > 1.0
+    assert abs(left_frames[-1].camera_euler[1]) <= config.WORLD_CAM_CORNER_YAW_DEG
+
+
+def test_the_first_frame_lands_on_its_target_rather_than_easing_in() -> None:
+    """
+    Otherwise every pose would be a blend of the real scene and an initial
+    guess, and the existing camera tests -- each of which builds a fresh
+    assembler -- would be measuring the guess.
+    """
+    fresh = WorldSceneAssembler().update(
+        _snapshot(speed_mps=20.0, forward_speed_mps=20.0)
+    )
+    settled = WorldSceneAssembler()
+    _roll(settled, 3.0, speed_mps=20.0, forward_speed_mps=20.0)
+
+    assert fresh.camera_position[1] == pytest.approx(
+        settled._camera_pose.height_m, abs=0.2
+    )
