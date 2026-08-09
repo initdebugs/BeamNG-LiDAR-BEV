@@ -8,6 +8,7 @@ import pytest
 from beamng_lidar_bev.aeb import (
     FORWARD,
     REVERSE,
+    BrakeEvent,
     EmergencyBraking,
     corridor_cross_section,
     mirror_points,
@@ -798,3 +799,108 @@ def test_the_rear_system_is_awake_at_parking_speed() -> None:
     state = rear(brake, cloud, 1.2)
 
     assert state.status == BRAKING
+
+
+# --- Plant measurement --------------------------------------------------------
+#
+# Diagnostics: `BrakeEvent` measures what the car actually delivered, and nothing
+# reads the answer. It exists because every braking figure in config is a
+# property of ONE vehicle and applying them to a heavier one is a question that
+# needs a number rather than an opinion.
+
+
+def _constant_decel_trace(
+    event: BrakeEvent, from_speed: float, decel: float, dt: float = DT
+) -> None:
+    """Brake from `from_speed` to rest at exactly `decel`, one tick at a time."""
+    speed = from_speed
+    event.start(speed, 0.0, "MANUAL")
+    while speed > 0.0:
+        speed = max(0.0, speed - decel * dt)
+        event.sample(speed, dt)
+
+
+def test_a_brake_event_recovers_the_deceleration_the_car_delivered() -> None:
+    """
+    The whole instrument in one assertion. Fed a stop at a known rate it must
+    report that rate, or it cannot be trusted to report an unknown one.
+    """
+    event = BrakeEvent(FORWARD)
+
+    _constant_decel_trace(event, 25.0, 7.4)
+    measurement = event.finish()
+
+    assert measurement is not None
+    assert measurement.mean_decel_mps2 == pytest.approx(7.4, rel=0.02)
+    assert measurement.peak_decel_mps2 == pytest.approx(7.4, rel=0.02)
+    assert measurement.distance_m == pytest.approx(25.0**2 / (2 * 7.4), rel=0.02)
+    assert measurement.to_speed_mps == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_brake_event_reports_what_the_model_promised_alongside_it() -> None:
+    """
+    The comparison is the point: a car that brakes worse than the configured
+    plant takes further to stop than AEB assumed when it chose its trigger
+    distance, and `optimism` is that ratio.
+
+    The modelled distance is the PURE braking distance the config tables are
+    made of, without `stopping_distance`'s latency term -- the two are different
+    quantities and comparing a measured stop against the wrong one would read as
+    a plant error that is not there.
+    """
+    event = BrakeEvent(FORWARD)
+
+    # Half the configured deceleration: twice the distance, optimism 2.
+    _constant_decel_trace(event, 20.0, AEB_BRAKING_DECEL_MPS2 / 2.0)
+    measurement = event.finish()
+
+    assert measurement is not None
+    assert measurement.modelled_decel_mps2 == AEB_BRAKING_DECEL_MPS2
+    assert measurement.modelled_distance_m == pytest.approx(
+        20.0**2 / (2 * AEB_BRAKING_DECEL_MPS2)
+    )
+    assert measurement.optimism == pytest.approx(2.0, rel=0.02)
+    assert measurement.modelled_distance_m < measurement.distance_m
+
+
+def test_the_reverse_plant_is_measured_against_the_reverse_model() -> None:
+    """Reversing loads the smaller brakes, so it has its own figure."""
+    event = BrakeEvent(REVERSE)
+
+    # Speed arrives signed from the worker; a stop is a stop either way.
+    event.start(-8.0, 0.0, "MANUAL")
+    for speed in (-6.0, -4.0, -2.0, 0.0):
+        event.sample(speed, DT)
+    measurement = event.finish()
+
+    assert measurement is not None
+    assert measurement.from_speed_mps == pytest.approx(8.0)
+    assert measurement.modelled_decel_mps2 == REVERSE.braking_decel_mps2
+    assert measurement.mean_decel_mps2 > 0.0
+
+
+def test_an_event_with_nothing_to_measure_reports_nothing() -> None:
+    """
+    Rather than a deceleration divided by no elapsed time. A single tick has no
+    trace, and a car that never lost any speed did not brake.
+    """
+    empty = BrakeEvent(FORWARD)
+    empty.start(20.0, 0.0, "AEB")
+    assert empty.finish() is None
+
+    coasting = BrakeEvent(FORWARD)
+    coasting.start(20.0, 0.0, "AEB")
+    coasting.sample(20.0, DT)
+    assert coasting.finish() is None
+
+    assert BrakeEvent(FORWARD).finish() is None
+
+
+def test_a_finished_event_goes_inactive_so_one_stop_is_reported_once() -> None:
+    event = BrakeEvent(FORWARD)
+    _constant_decel_trace(event, 15.0, 9.0)
+
+    assert event.active
+    assert event.finish() is not None
+    assert not event.active
+    assert event.finish() is None

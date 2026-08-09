@@ -942,8 +942,8 @@ AEB_CLEARANCE_MARGIN_M = 0.15
 #
 # AEB fires a full-authority brake, so the cost of a false positive here is far
 # higher than anywhere else in the app and the evidence bar is set accordingly.
-# All three of these exist to answer the same question -- is this a real thing
-# the car is about to hit, or is it the road?
+# All five of these exist to answer the same question -- is this a real thing
+# the car is about to hit, or is it the road, or a bush?
 
 # 1. HEIGHT. AEB's obstacle floor is its own, and it is much higher than the
 # planner's OBSTACLE_MIN_HEIGHT_M (0.12). The two are answering different
@@ -961,7 +961,75 @@ AEB_CLEARANCE_MARGIN_M = 0.15
 # is a latch -- brake, dive, see more road, brake harder -- exactly the one
 # gravity-referenced heights were introduced to kill for the planner. 0.30 m
 # clears every bit of it while staying far below any car, wall, post or person.
+#
+# The height test alone is NOT enough, and cannot be made enough by tuning: on a
+# grade the road itself climbs through any fixed floor. See the two shape tests
+# below, which is where that is actually answered.
 AEB_OBSTACLE_MIN_HEIGHT_M = 0.30
+# 1b. VERTICAL EXTENT -- how tall is the thing standing in this cell, rather
+# than how high above an estimated ground plane this return is.
+#
+# This is what makes AEB grade-proof, and the height floor above cannot be. The
+# local ground estimate is clamped into a 1.5% cone (SLOPE_ALLOWANCE_PER_M) to
+# protect the planner's kerb detection, so the system refuses to believe any
+# steeper grade -- and none at all inside SLOPE_ALLOWANCE_START_M. Measured on a
+# 5% climb at 25 m: the estimator saw 1.20 m of rise, the clamp allowed 0.225 m,
+# and the whole hillside entered the obstacle band as a dense, persistent
+# surface that sails through every other filter. At 40-70 km/h the horizon is
+# 30-60 m, so a mild hill far ahead was a full stop.
+#
+# Vertical extent is immune to all of it. A 0.4 m cell on a 20% slope holds
+# 0.08 m of spread; a wall holds metres (measured: 5% grade 0.10 m, wall 2.95 m).
+# Being differential it is also immune to brake dive and to suspension heave,
+# which is the near-field case the cone could never reach -- including the whole
+# of the REVERSE system, which lives inside 10 m where the cone is exactly zero.
+#
+# Measured over every return in the cell, INCLUDING the ones the height floor
+# rejects: a 0.35 m rock puts only 0.05 m above the floor but is 0.35 m tall, and
+# measuring the spread on the survivors alone would delete every short solid
+# object in the world.
+AEB_MIN_VERTICAL_EXTENT_M = 0.25
+# 1c. POROSITY. A bush is see-through -- rays pass between the leaves and return
+# from the ground behind it -- and a wall is not. That is the physical difference
+# between the two, and it is measurable without ever asking what class a return
+# belongs to, which matters because community maps may not annotate at all.
+#
+# The window it is measured in is not a guess: an object of height `a` at range
+# `r` seen from a sensor at height `h` hides the ground behind it for
+# r*a/(h - a). Ground returns INSIDE that shadow mean the rays got through.
+#
+#     0.6 m bush at 20 m   solid twin would hide 12.2 m; ground seen at 21-32 m
+#     0.6 m post at 20 m   ground genuinely hidden; no evidence; stays an obstacle
+#     >= h  (wall, car)    shadow is infinite, the window is EMPTY, never vetoed
+#
+# That last line is the safety property and it is derived rather than imposed:
+# anything as tall as the roof unit cannot be dismissed by this test at all, so
+# no parallax between the five mount positions can talk AEB out of braking for a
+# wall. Only short things are testable, and for them "no evidence" means solid.
+#
+# The gap keeps the object's own returns out of its own window; the hit count
+# means one stray return cannot clear a real obstacle.
+AEB_POROSITY_GAP_M = 1.0
+AEB_POROSITY_MIN_HITS = 4
+# The RESOLUTION of the evidence grid, and emphatically not the width of the
+# window -- that is each candidate's own angular width, OBSTACLE_CELL_M / r, and
+# is derived rather than configured for the same reason the shadow length is.
+#
+# It was 2.0 and read as the window itself, which is a fixed ANGLE against
+# objects of fixed WIDTH, so it outgrew them with range: a 1.8 m car spans a
+# 2 deg bin only inside ~52 m, and covers one outright only inside ~26 m. Past
+# that the bin caught the road BESIDE the car, which no part of the car ever
+# stood in front of, and the "evidence" vetoed it. Measured on a ring-sampled
+# scene, AEB went blind to a stopped car through the whole 30-60 m band -- the
+# band it must fire in at 60-100 km/h.
+#
+# Only bins lying ENTIRELY inside a candidate's wedge are consulted, so this
+# wants to be fine enough that a candidate still covers one at the ranges the
+# test is for. 0.5 deg is two of the front unit's 0.26 deg columns, and a
+# 0.4 m cell covers a whole bin out to ~46 m; past that the test simply finds no
+# evidence and reports solid, which is the correct direction for a filter whose
+# whole job is dismissing roadside scrub in the near field.
+AEB_POROSITY_AZIMUTH_DEG = 0.5
 # 2. SUPPORT. The corridor scan is a nearest-return measurement, so one stray
 # point ends it -- the same failure that made planner.despeckle necessary, but
 # with a full brake application on the end of it instead of a cost term. The
@@ -978,6 +1046,18 @@ AEB_MIN_HITS = 4
 # the braking envelope, and it is applied uniformly: a genuine obstacle that
 # appears inside 0.12 s was never avoidable anyway.
 AEB_CONFIRM_S = 0.12
+
+# --- Whose car all of this was measured on ------------------------------------
+#
+# Documentation only: nothing reads this to make a decision. It exists because
+# the braking tables below, AEB_OBSTACLE_MIN_HEIGHT_M and the whole plant are
+# properties of ONE vehicle, and until now the repo did not record which one --
+# so "it phantom-brakes on the pickup but not on this" had no baseline to be
+# measured against. `worker` logs it beside the model actually attached, and a
+# mismatch between the two lines is the first thing to check on any report of
+# braking too early or too late.
+PLANT_REFERENCE_VEHICLE = "vivace"
+
 # The trigger is the LAST POINT TO BRAKE, not a deceleration threshold, and
 # that distinction is the whole character of the feature.
 #

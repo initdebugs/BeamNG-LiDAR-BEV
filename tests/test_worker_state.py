@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from beamng_lidar_bev import worker as worker_module
+from beamng_lidar_bev.aeb import FORWARD, REVERSE, BrakeEvent
 from beamng_lidar_bev.config import (
     AEB_CONFIRM_S,
     DISPLAY_INTERVAL_MS,
@@ -629,7 +630,9 @@ def _stub_obstacles(monkeypatch, obstacles: np.ndarray | None) -> None:
     monkeypatch.setattr(
         worker_module,
         "geometric_obstacle_sets",
-        lambda bev, heights, ground_z, floors: [cloud for _ in floors],
+        lambda bev, heights, ground_z, bands, **kwargs: [
+            cloud for _ in bands
+        ],
     )
 
 
@@ -938,3 +941,159 @@ def test_teardown_disarms_both(monkeypatch) -> None:
 
     assert worker._aeb_enabled is False
     assert worker._rear_aeb_enabled is False
+
+
+# --- plant diagnostics -------------------------------------------------------
+#
+# These measure the attached car and change nothing about what it does. Every
+# braking figure in config is a property of ONE vehicle, and applying them to a
+# heavier one is a question that needs a number.
+
+
+def _brake_trace(
+    worker: BeamNgWorker,
+    from_speed: float,
+    decel: float,
+    dt: float = 0.04,
+) -> None:
+    """Feed the manual watcher a stop at a constant rate, one tick at a time."""
+    now = 0.0
+    speed = from_speed
+    worker._last_forward_speed = speed
+    worker._watch_manual_braking(now)
+    while abs(speed) > 0.0:
+        speed = (
+            max(0.0, speed - decel * dt)
+            if speed > 0.0
+            else min(0.0, speed + decel * dt)
+        )
+        now += dt
+        worker._last_forward_speed = speed
+        worker._watch_manual_braking(now)
+
+
+def _measurements(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Brake measure:")
+    ]
+
+
+def test_a_hard_manual_stop_is_measured_without_aeb_ever_firing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    How a vehicle other than the one in the config tables gets measured at all:
+    drive it, brake hard, read the line. It must not depend on AEB being armed,
+    because switching AEB off is the first thing anyone does when it brakes for
+    nothing -- which is exactly when the plant needs measuring.
+    """
+    worker = BeamNgWorker()
+    worker._vehicle_model = "pickup"
+
+    with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+        _brake_trace(worker, 20.0, 7.0)
+
+    lines = _measurements(caplog)
+    assert len(lines) == 1
+    assert lines[0].startswith("Brake measure: MANUAL stop on 'pickup'")
+    # The rate the car achieved, beside the one the config assumed.
+    assert "achieved 6.9" in lines[0]
+    assert f"{FORWARD.braking_decel_mps2:.1f} m/s^2" in lines[0]
+    assert worker._manual_event is None
+
+
+def test_an_aeb_stop_is_not_also_filed_as_a_manual_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The two watchers see the same speed trace. The manual one starts on
+    deceleration alone, which does not cross its threshold until a tick or two
+    AFTER the pedal goes down -- so checking only where an AEB event begins let
+    the same stop be reported twice, once each way.
+    """
+    worker = BeamNgWorker()
+    worker._aeb_events["AEB"] = BrakeEvent(FORWARD)
+    worker._aeb_events["AEB"].start(20.0, 0.0, "AEB")
+
+    with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+        _brake_trace(worker, 20.0, 10.0)
+
+    assert _measurements(caplog) == []
+    assert worker._manual_event is None
+
+
+def test_lifting_off_is_not_a_braking_measurement(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Engine drag and a trailing throttle are nowhere near the threshold."""
+    worker = BeamNgWorker()
+
+    with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+        _brake_trace(worker, 20.0, 1.0)
+
+    assert _measurements(caplog) == []
+
+
+def test_a_dab_at_the_pedal_is_not_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Hard, but over in a couple of ticks and worth 1 km/h. Nothing to learn."""
+    worker = BeamNgWorker()
+
+    now = 0.0
+    for speed in (20.0, 19.6, 19.4, 19.4, 19.4):
+        worker._last_forward_speed = speed
+        with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+            worker._watch_manual_braking(now)
+        now += 0.04
+
+    assert _measurements(caplog) == []
+
+
+def test_a_reverse_stop_is_measured_against_the_reverse_plant(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Reversing throws the load onto the rear axle and its smaller brakes, so the
+    two directions are different plants -- and a measurement filed against the
+    wrong one would read as a fault that is not there.
+    """
+    worker = BeamNgWorker()
+
+    with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+        _brake_trace(worker, -8.0, 6.5)
+
+    lines = _measurements(caplog)
+    assert len(lines) == 1
+    assert lines[0].startswith("Brake measure: MANUAL REVERSE stop")
+    assert f"{REVERSE.braking_decel_mps2:.1f} m/s^2" in lines[0]
+    assert f"{FORWARD.braking_decel_mps2:.1f} m/s^2" not in lines[0]
+
+
+def test_a_firing_explains_itself_once(
+    monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    `AEB: BRAKING` names a distance, and a distance cannot say whether what
+    blocked the corridor was a wall or the road surface arriving in the height
+    band. One evidence line per firing does -- and only per firing, because it
+    costs a ground estimate over the whole cloud.
+    """
+    worker, frames, _ = _aeb_worker(_wall(10.0), monkeypatch)
+
+    with caplog.at_level("INFO", logger=worker_module.LOGGER.name):
+        _confirm(worker)
+        # ...and keep braking. The line must not repeat every tick.
+        _confirm(worker)
+
+    evidence = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("AEB evidence:")
+    ]
+    assert frames[-1].aeb.status == "BRAKING"
+    assert len(evidence) == 1
+    assert "AEB at 10.0 m" in evidence[0]
+    assert not worker._pending_evidence

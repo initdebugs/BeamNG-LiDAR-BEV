@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 from .aeb import (
     FORWARD,
     REVERSE,
+    BrakeEvent,
+    BrakeMeasurement,
     BrakingProfile,
     EmergencyBraking,
     mirror_points,
@@ -29,6 +31,7 @@ from .config import (
     AEB_CONFIRM_S,
     AEB_MAX_HORIZON_M,
     AEB_MIN_HITS,
+    AEB_MIN_VERTICAL_EXTENT_M,
     AEB_OBSTACLE_MIN_HEIGHT_M,
     AEB_TRIGGER_MARGIN,
     BEAMNG_EXE,
@@ -49,6 +52,7 @@ from .config import (
     NAV_POLL_INTERVAL_MS,
     OBSTACLE_MIN_HEIGHT_M,
     PLANNER_HORIZON_M,
+    PLANT_REFERENCE_VEHICLE,
     STEERING_SIGN,
     TRANSITION_DISTANCES_M,
     WORLD_ACTOR_FADE_S,
@@ -73,6 +77,7 @@ from .launcher import (
     start_beamng_process,
 )
 from .models import (
+    BRAKING,
     ActorObservation,
     AebState,
     ArcPlan,
@@ -84,7 +89,13 @@ from .models import (
     VehicleGeometry,
 )
 from .navigation import fetch_route, route_heading
-from .planner import geometric_obstacle_sets, plan_arc, rear_free_distance
+from .planner import (
+    ObstacleBand,
+    corridor_return_profile,
+    geometric_obstacle_sets,
+    plan_arc,
+    rear_free_distance,
+)
 from .semantics import (
     SCENE_ROAD,
     SemanticPalette,
@@ -124,6 +135,24 @@ _POLL_FAILURE_GRACE_S = 2.0
 # Cadence of the driving telemetry line. Well below the display tick: it exists
 # to explain a run after the fact, not to trace every frame.
 _TELEMETRY_INTERVAL_S = 1.0
+
+# --- What counts as a hard stop worth measuring -------------------------------
+#
+# Purely a diagnostic trigger: nothing downstream reads these, and no braking
+# behaviour depends on them. The point is to catch a human standing on the brake
+# so the vehicle's real plant can be read off a normal drive, which is how a car
+# other than the one in the config tables gets measured at all.
+#
+# 6.0 m/s^2 is far past engine braking, a lift-off or a trailing-throttle
+# corner, and comfortably under the ~10 the reference car achieves -- so a
+# vehicle that brakes considerably worse still registers. The release threshold
+# is lower so a stop that eases off near rest is one event rather than several.
+_MANUAL_BRAKE_DECEL_MPS2 = 6.0
+_MANUAL_BRAKE_RELEASE_MPS2 = 2.0
+# ...and it is only reported if it lasted and actually took speed off, so a dab
+# at the pedal is not filed as a braking measurement.
+_MANUAL_BRAKE_MIN_S = 0.3
+_MANUAL_BRAKE_MIN_DROP_MPS = 3.0
 
 
 class BeamNgWorker(QObject):
@@ -194,6 +223,28 @@ class BeamNgWorker(QObject):
         # One-shot per-sensor reach diagnostic, emitted from the first tick that
         # actually carries returns.
         self._logged_reach = False
+
+        # --- Plant diagnostics, which change nothing ------------------------
+        #
+        # Every braking figure in config is a property of ONE vehicle and the
+        # repo did not record which, so a report of braking too early or too
+        # late had no baseline to be measured against. These three watch; they
+        # never feed back into a trigger or a threshold.
+        self._vehicle_model = ""
+        # One recorder per AEB system, plus one for stops a human made. The
+        # manual one is what measures a new vehicle's plant WITHOUT having to
+        # provoke an AEB event first -- and it runs whether or not either system
+        # is armed, because switching AEB off is exactly what someone does when
+        # it brakes for nothing.
+        self._aeb_events: dict[str, BrakeEvent] = {}
+        self._manual_event: BrakeEvent | None = None
+        self._manual_prev_speed = 0.0
+        self._last_tick_at: float | None = None
+        self._last_pitch_deg = 0.0
+        # ARMED -> BRAKING transitions seen this tick, awaiting the evidence
+        # line. Collected rather than logged in place because the cloud it
+        # describes lives in `_poll_once`.
+        self._pending_evidence: list[AebState] = []
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -305,9 +356,11 @@ class BeamNgWorker(QObject):
 
             vehicle.connect(self._bng)
             self._vehicle = vehicle
+            self._vehicle_model = str(getattr(vehicle, "model", "") or "")
             self._attach_electrics(vehicle)
             state = self._get_vehicle_state()
             geometry = derive_vehicle_geometry(state, vehicle.get_bbox())
+            self._log_vehicle_check(geometry)
             palette = SemanticPalette.from_annotations(self._load_annotations())
 
             sensor_prefix = f"bev_{os.getpid()}_{int(time.monotonic() * 1000)}"
@@ -513,12 +566,13 @@ class BeamNgWorker(QObject):
         self._last_aeb_at.pop(system.profile.label, None)
         self._last_logged_aeb.pop(system.profile.label, None)
         LOGGER.info(
-            "%s check: armed above %.1f km/h, stopping %.2f m clear of the "
-            "%s, fires at the last point a %.1f m/s^2 stop still works and "
+            "%s check: on %r, armed above %.1f km/h, stopping %.2f m clear of "
+            "the %s, fires at the last point a %.1f m/s^2 stop still works and "
             "then brakes FULL, corridor %.2f m wide, obstacle floor %.2f m "
             "with %d hits over %.2f s required, path predicted from measured "
             "yaw (brake only). Brake-now distances: %s",
             system.profile.label,
+            self._vehicle_model or "unknown",
             system.profile.min_speed_mps * 3.6,
             system.profile.standoff_m,
             "rear bumper" if rearward else "front bumper",
@@ -531,6 +585,76 @@ class BeamNgWorker(QObject):
         )
         changed.emit(True)
         self.status_changed.emit("STREAMING", f"{label} armed")
+
+    @staticmethod
+    def _porosity_sensor_height(geometry: VehicleGeometry) -> float:
+        """
+        The eye height AEB's porosity test reasons from: the ROOF unit.
+
+        It has to be the roof unit and not one of the 0.20 m mounts, because
+        those sit BELOW anything worth testing -- a 0.6 m bush hides the ground
+        behind it completely from 0.20 m, so from down there a bush and a wall
+        are indistinguishable by construction. Only the unit above the bodywork
+        can see over a short object at all.
+
+        Zero when there is no roof mount, which disables the veto entirely --
+        the conservative direction, since the test can only ever remove
+        obstacles.
+        """
+        roof = geometry.mounts.get("roof")
+        return float(roof.position_vehicle[2]) if roof is not None else 0.0
+
+    def _log_vehicle_check(self, geometry: VehicleGeometry) -> None:
+        """
+        Which car this is, and every dimension the two features derive from it.
+
+        Diagnostics, and the baseline the plant figures never had. The braking
+        tables, AEB_OBSTACLE_MIN_HEIGHT_M and the standoffs were all measured on
+        one vehicle, and until this line existed nothing recorded which -- so
+        "it brakes for nothing on the pickup" had no way of being compared
+        against the car that behaves.
+
+        The WIDTH is the number to read first. It is the full oriented bounding
+        box, so anything bolted to the bodywork is inside it, and the corridor
+        both AEB systems scan is that width plus AEB_CLEARANCE_MARGIN_M. If it
+        reads well over the real body width, the corridor is sweeping a band no
+        collision could happen in and kerbs beside the path fall inside it.
+        """
+        mount_heights = ", ".join(
+            f"{name} {mount.position_vehicle[2]:.2f}"
+            for name, mount in geometry.mounts.items()
+        )
+        LOGGER.info(
+            "Vehicle check: model %r (plant measured on %r) | bbox %.2f wide x "
+            "%.2f long x %.2f tall | overhang front %.2f rear %.2f | ground "
+            "plane %+.3f m from the reference node | mount z: %s",
+            self._vehicle_model or "unknown",
+            PLANT_REFERENCE_VEHICLE,
+            geometry.width_m,
+            geometry.length_m,
+            geometry.height_m,
+            geometry.front_m,
+            geometry.rear_m,
+            geometry.ground_z_vehicle,
+            mount_heights,
+        )
+        if (
+            self._vehicle_model
+            and self._vehicle_model != PLANT_REFERENCE_VEHICLE
+        ):
+            # Not a warning about safety-critical behaviour -- nothing here
+            # changes what AEB does -- but the one line that says the numbers
+            # being applied were measured on a different car.
+            LOGGER.warning(
+                "Vehicle check: %r is not the vehicle the braking plant was "
+                "measured on (%r). AEB is using %.1f m/s^2 forward and "
+                "%.1f m/s^2 reverse regardless; drive a full stop and compare "
+                "the 'Brake measure:' line before trusting the fire distances.",
+                self._vehicle_model,
+                PLANT_REFERENCE_VEHICLE,
+                FORWARD.braking_decel_mps2,
+                REVERSE.braking_decel_mps2,
+            )
 
     def _brake_now_table(
         self, profile: BrakingProfile, rearward: bool = False
@@ -678,7 +802,15 @@ class BeamNgWorker(QObject):
             # because the scene needs it on every tick: the block that already
             # derives `forward_speed` only runs when self-driving or AEB is on,
             # and reversing under a human driver is precisely when neither is.
-            self._last_forward_speed = float(velocity @ vehicle_axes(state)[1])
+            forward_axis = vehicle_axes(state)[1]
+            self._last_forward_speed = float(velocity @ forward_axis)
+            # Body pitch, positive nose-up: a stop down a grade flatters the
+            # plant and a stop up one slanders it, so every brake measurement
+            # carries the number rather than pretending to correct for it.
+            self._last_pitch_deg = float(
+                np.degrees(np.arcsin(np.clip(forward_axis[2], -1.0, 1.0)))
+            )
+            self._watch_manual_braking(started)
             point_chunks: list[np.ndarray] = []
             colour_chunks: list[np.ndarray] = []
 
@@ -828,8 +960,13 @@ class BeamNgWorker(QObject):
                             heights,
                             geometry.ground_z_vehicle,
                             (
-                                (OBSTACLE_MIN_HEIGHT_M, PLANNER_HORIZON_M),
-                                (
+                                # The planner's band is unchanged, and the two
+                                # shape tests are deliberately off for it: it
+                                # SHOULD steer around a kerb and around a bush.
+                                ObstacleBand(
+                                    OBSTACLE_MIN_HEIGHT_M, PLANNER_HORIZON_M
+                                ),
+                                ObstacleBand(
                                     AEB_OBSTACLE_MIN_HEIGHT_M,
                                     max(
                                         self._aeb.horizon_for(
@@ -839,7 +976,14 @@ class BeamNgWorker(QObject):
                                             -forward_speed, mirror_geometry
                                         ),
                                     ),
+                                    min_vertical_extent_m=(
+                                        AEB_MIN_VERTICAL_EXTENT_M
+                                    ),
+                                    porosity=True,
                                 ),
+                            ),
+                            sensor_height_m=self._porosity_sensor_height(
+                                geometry
                             ),
                         )
                 except Exception:
@@ -901,6 +1045,18 @@ class BeamNgWorker(QObject):
                         self._disengage_aeb(
                             f"Reverse AEB stopped: {exc}", rearward=True
                         )
+
+                if self._pending_evidence:
+                    # Its own handler: a diagnostic must never disarm a brake,
+                    # and must never reach the outer handler either, where it
+                    # would be counted against the poll-failure budget and read
+                    # as a lost bridge. It costs a `ground_rise` pass over the
+                    # cloud and runs only on the tick a system fires.
+                    try:
+                        self._log_aeb_evidence(bev, heights, geometry)
+                    except Exception:
+                        LOGGER.exception("AEB evidence logging failed")
+                        self._pending_evidence = []
 
             frame = BevFrame(
                 road_points=road_points,
@@ -1105,8 +1261,190 @@ class BeamNgWorker(QObject):
             heading_rad=heading,
             has_returns=had_returns,
         )
+        if state.status == BRAKING and self._last_logged_aeb.get(label) != BRAKING:
+            # Before `_log_aeb`, which is what owns that dict.
+            self._pending_evidence.append(state)
+        self._watch_aeb_braking(system, state, forward_speed, dt)
         self._log_aeb(label, state, forward_speed)
         return state
+
+    # --- Plant diagnostics ---------------------------------------------------
+    #
+    # None of the four methods below influences anything. They measure the car
+    # that is actually attached, because every braking figure in `config` is a
+    # property of one particular vehicle and applying them to another is a
+    # question nobody could previously answer with a number.
+
+    def _watch_aeb_braking(
+        self,
+        system: EmergencyBraking,
+        state: AebState,
+        forward_speed: float,
+        dt: float,
+    ) -> None:
+        """Record what a firing actually achieved, against what it assumed."""
+        label = system.profile.label
+        event = self._aeb_events.get(label)
+        if event is None:
+            event = BrakeEvent(system.profile)
+            self._aeb_events[label] = event
+        if state.engaged:
+            if not event.active:
+                # AEB owns the pedal now, so whatever the human was doing stops
+                # being a measurement of the human.
+                self._manual_event = None
+                event.start(forward_speed, self._last_pitch_deg, label)
+            else:
+                event.sample(forward_speed, dt)
+        elif event.active:
+            event.sample(forward_speed, dt)
+            self._log_brake_measurement(event.finish())
+
+    def _watch_manual_braking(self, now: float) -> None:
+        """
+        Catch a human standing on the brake, and measure that stop.
+
+        This is how a vehicle other than the one in the config tables gets
+        measured: drive it, brake hard, read the line. It runs on every tick
+        regardless of which features are armed, because switching AEB off is the
+        first thing anyone does when it brakes for nothing -- and that is
+        precisely when the plant needs measuring.
+
+        Deceleration comes from the speed trace alone. Reading the pedal would
+        mean polling `electrics` on every tick in the plain viewer, which is a
+        round trip this loop deliberately does not make.
+        """
+        previous = self._manual_prev_speed
+        speed = abs(self._last_forward_speed)
+        last_tick = self._last_tick_at
+        self._last_tick_at = now
+        self._manual_prev_speed = speed
+        if last_tick is None:
+            return
+        dt = max(now - last_tick, 1e-3)
+        if dt > _ACQUISITION_STALE_S:
+            # A gap in the ticks is not a deceleration.
+            self._manual_event = None
+            return
+        if any(event.active for event in self._aeb_events.values()):
+            # AEB is holding the pedal, and its own recorder has this stop. The
+            # check has to be here rather than only where an AEB event STARTS:
+            # the deceleration does not cross this threshold until a tick or two
+            # after the brake goes on, by which point that branch has been and
+            # gone -- and the same stop was then filed twice, once each way.
+            self._manual_event = None
+            return
+        decel = (previous - speed) / dt
+        event = self._manual_event
+        if event is None:
+            if decel < _MANUAL_BRAKE_DECEL_MPS2:
+                return
+            reversing = self._last_forward_speed < 0.0
+            event = BrakeEvent(REVERSE if reversing else FORWARD)
+            # From the speed BEFORE this tick's drop: that is where the stop
+            # started, and the trace has to include the metres already covered.
+            event.start(
+                previous,
+                self._last_pitch_deg,
+                "MANUAL REVERSE" if reversing else "MANUAL",
+            )
+            self._manual_event = event
+        event.sample(speed, dt)
+        if decel >= _MANUAL_BRAKE_RELEASE_MPS2 and speed > 0.0:
+            return
+        self._manual_event = None
+        self._log_brake_measurement(event.finish())
+
+    def _log_brake_measurement(
+        self, measurement: BrakeMeasurement | None
+    ) -> None:
+        if measurement is None:
+            return
+        if (
+            measurement.duration_s < _MANUAL_BRAKE_MIN_S
+            or measurement.from_speed_mps - measurement.to_speed_mps
+            < _MANUAL_BRAKE_MIN_DROP_MPS
+        ):
+            # Too short or too gentle to say anything about the plant.
+            return
+        LOGGER.info(
+            "Brake measure: %s stop on %r | %.1f -> %.1f km/h in %.2f s over "
+            "%.1f m | achieved %.2f m/s^2 mean, %.2f peak | model says %.1f m "
+            "at %.1f m/s^2 (%.2fx) | pitch %+.1f deg",
+            measurement.cause,
+            self._vehicle_model or "unknown",
+            measurement.from_speed_mps * 3.6,
+            measurement.to_speed_mps * 3.6,
+            measurement.duration_s,
+            measurement.distance_m,
+            measurement.mean_decel_mps2,
+            measurement.peak_decel_mps2,
+            measurement.modelled_distance_m,
+            measurement.modelled_decel_mps2,
+            measurement.optimism,
+            measurement.pitch_deg,
+        )
+
+    def _log_aeb_evidence(
+        self,
+        bev: np.ndarray,
+        heights: np.ndarray,
+        geometry: VehicleGeometry,
+    ) -> None:
+        """
+        Say WHAT the brake fired at, once per firing.
+
+        `AEB: BRAKING` names a distance, and a distance cannot distinguish a
+        wall from the road surface arriving in the height band -- which is the
+        entire difference between a correct firing and a phantom. The vertical
+        extent can, so it is measured and reported. See
+        `planner.corridor_return_profile` for how to read it.
+        """
+        pending, self._pending_evidence = self._pending_evidence, []
+        if not len(bev):
+            return
+        for state in pending:
+            if state.threat_m is None:
+                # The trigger fired with nothing detected at all, which is a bug
+                # in the trigger rather than anything the cloud can explain.
+                LOGGER.warning(
+                    "AEB evidence: %s fired with no threat recorded",
+                    "REAR AEB" if state.rearward else "AEB",
+                )
+                continue
+            # The rear system reasons in a 180-degree-rotated frame, so the
+            # cloud has to be handed over the same way it was scanned.
+            points = mirror_points(bev) if state.rearward else bev
+            profile = corridor_return_profile(
+                points,
+                heights,
+                geometry.ground_z_vehicle,
+                state.curvature,
+                state.corridor_half_width_m,
+                state.threat_m,
+            )
+            LOGGER.info(
+                "AEB evidence: %s at %.1f m | %d returns spanning %.2f m of "
+                "height over %.2f m of range (min %.2f, median %.2f, max %.2f "
+                "above the ego plane, floor %.2f) | measured ground rise "
+                "%.2f m, clamped to %.2f | corridor %.2f m half-width",
+                "REAR AEB" if state.rearward else "AEB",
+                state.threat_m,
+                int(profile["count"]),
+                profile["spread_m"],
+                profile["range_span_m"],
+                profile["height_min_m"],
+                profile["height_median_m"],
+                profile["height_max_m"],
+                AEB_OBSTACLE_MIN_HEIGHT_M,
+                profile["ground_rise_m"],
+                # The clamp geometric_obstacle_sets applies: the cone bounds the
+                # measured rise rather than replacing it, so a wide gap between
+                # these two numbers means the estimate saw a grade the floor was
+                # not allowed to believe.
+                max(0.0, min(profile["ground_rise_m"], profile["cone_bound_m"])),
+                state.corridor_half_width_m,
+            )
 
     def _log_aeb(self, label: str, state: AebState, speed: float) -> None:
         """
@@ -1537,6 +1875,14 @@ class BeamNgWorker(QObject):
         self._mirrored_geometry = None
         self._logged_reach = False
         self._palette = None
+        # A stop in progress when the sensors go is not a stop that was
+        # measured, and the next attach may well be a different car.
+        self._aeb_events.clear()
+        self._manual_event = None
+        self._manual_prev_speed = 0.0
+        self._last_tick_at = None
+        self._pending_evidence = []
+        self._vehicle_model = ""
         self._clear_actor_cache()
 
         if self._vehicle is not None:

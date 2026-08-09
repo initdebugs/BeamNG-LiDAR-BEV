@@ -1,22 +1,30 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
 from beamng_lidar_bev.config import (
+    AEB_MIN_VERTICAL_EXTENT_M,
+    AEB_OBSTACLE_MIN_HEIGHT_M,
     CLEARANCE_MARGIN_M,
     KEEP_RIGHT_MARGIN_M,
     MIN_TURN_RADIUS_M,
     OBSTACLE_CELL_M,
     OBSTACLE_MAX_HEIGHT_M,
+    OBSTACLE_MIN_HEIGHT_M,
     PLANNER_HORIZON_M,
     PLANNER_MAX_OBSTACLE_POINTS,
 )
 from beamng_lidar_bev.models import VehicleGeometry
 from beamng_lidar_bev.planner import (
+    ObstacleBand,
     arc_polyline,
     corridor_edges,
+    corridor_return_profile,
     despeckle,
+    geometric_obstacle_sets,
     geometric_obstacles,
     path_polyline,
     plan_arc,
@@ -519,3 +527,512 @@ def test_arc_polyline_length_matches_the_requested_arc_length() -> None:
 
     segments = np.linalg.norm(np.diff(points, axis=0), axis=1)
     assert float(segments.sum()) == pytest.approx(12.0, rel=1e-3)
+
+
+# --- Diagnostics --------------------------------------------------------------
+
+
+def _graded_road(grade: float, ground_z: float) -> tuple[np.ndarray, np.ndarray]:
+    """A road surface climbing at `grade`, sampled the way ground rings arrive."""
+    xs = np.arange(-4.0, 4.0, 0.25, dtype=np.float32)
+    ys = np.arange(4.0, 40.0, 0.25, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    bev = np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float32)
+    heights = (ground_z + grade * bev[:, 1]).astype(np.float32)
+    return bev, heights
+
+
+def test_the_corridor_profile_separates_a_graded_road_from_a_wall() -> None:
+    """
+    "AEB braked and there was nothing there" cannot be answered from the
+    trigger's own numbers: the corridor scan reduces a surface to one distance,
+    and a distance cannot say whether that surface was a wall or the road
+    arriving in the height band because the slope allowance refused to believe
+    the grade. The VERTICAL EXTENT can, and it is invariant to both.
+    """
+    ground_z = -0.5
+    road, road_heights = _graded_road(0.05, ground_z)
+
+    # A wall standing on that same road, at the same range.
+    wall_xs = np.arange(-1.5, 1.5, 0.1, dtype=np.float32)
+    wall_zs = np.arange(0.0, 3.0, 0.1, dtype=np.float32)
+    grid_x, grid_z = np.meshgrid(wall_xs, wall_zs)
+    wall = np.column_stack(
+        (grid_x.ravel(), np.full(grid_x.size, 25.0, dtype=np.float32))
+    ).astype(np.float32)
+    wall_heights = (ground_z + 0.05 * 25.0 + grid_z.ravel()).astype(np.float32)
+
+    open_road = corridor_return_profile(
+        road, road_heights, ground_z, 0.0, 1.05, 25.0
+    )
+    with_wall = corridor_return_profile(
+        np.concatenate((road, wall)),
+        np.concatenate((road_heights, wall_heights)),
+        ground_z,
+        0.0,
+        1.05,
+        25.0,
+    )
+
+    # The hillside is well into AEB's obstacle band -- 1.25 m above the ego
+    # plane at 25 m -- so the height test alone cannot tell it from the wall.
+    assert open_road["height_median_m"] > 1.0
+    assert open_road["spread_m"] < 0.15
+    # ...and it climbs at the grade, over metres of range rather than none.
+    assert open_road["range_span_m"] > 1.0
+    assert open_road["spread_m"] / open_road["range_span_m"] == pytest.approx(
+        0.05, abs=0.02
+    )
+
+    assert with_wall["spread_m"] > 2.0
+    assert with_wall["spread_m"] > 10.0 * open_road["spread_m"]
+
+
+def test_the_corridor_profile_reports_the_rise_the_slope_cone_threw_away() -> None:
+    """
+    The other half of the answer. `geometric_obstacle_sets` clamps the measured
+    ground rise into a 1.5% cone, so on any real grade the estimate and the
+    figure actually used part company -- and that gap is the difference between
+    an obstacle and a hill.
+    """
+    ground_z = -0.5
+    road, heights = _graded_road(0.05, ground_z)
+
+    profile = corridor_return_profile(road, heights, ground_z, 0.0, 1.05, 25.0)
+
+    assert profile["ground_rise_m"] > 1.0
+    assert profile["cone_bound_m"] < 0.3
+    assert profile["cone_bound_m"] < profile["ground_rise_m"]
+
+
+def test_the_corridor_profile_is_empty_when_nothing_is_in_the_corridor() -> None:
+    beside = np.asarray(((8.0, 25.0), (8.2, 25.1)), dtype=np.float32)
+    heights = np.asarray((0.4, 0.4), dtype=np.float32)
+
+    profile = corridor_return_profile(beside, heights, -0.5, 0.0, 1.05, 25.0)
+
+    assert profile["count"] == 0.0
+    assert profile["spread_m"] == 0.0
+
+
+# --- AEB's two shape tests ----------------------------------------------------
+#
+# The height floor answers "how high above the estimated ground is this return",
+# and on a grade the road itself climbs through any fixed value of it. These two
+# answer "what SHAPE is the thing standing here" instead, which neither a
+# gradient, a brake dive nor suspension travel can fake.
+
+ROOF_H = 1.58
+AEB_BAND = ObstacleBand(
+    AEB_OBSTACLE_MIN_HEIGHT_M,
+    60.0,
+    min_vertical_extent_m=AEB_MIN_VERTICAL_EXTENT_M,
+    porosity=True,
+)
+PLANNER_BAND = ObstacleBand(OBSTACLE_MIN_HEIGHT_M, PLANNER_HORIZON_M)
+
+
+def _ground(
+    grade: float, ground_z: float, to_m: float = 60.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """A surface climbing at `grade`, sampled densely enough to be meshable."""
+    xs = np.arange(-6.0, 6.0, 0.25, dtype=np.float32)
+    ys = np.arange(3.0, to_m, 0.25, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    bev = np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float32)
+    heights = (ground_z + grade * bev[:, 1]).astype(np.float32)
+    return bev, heights
+
+
+def _standing(
+    at_m: float, height_m: float, ground_z: float, grade: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """A solid vertical face: one range, returns all the way up it."""
+    xs = np.arange(-1.2, 1.2, 0.08, dtype=np.float32)
+    zs = np.arange(0.0, height_m, 0.05, dtype=np.float32)
+    grid_x, grid_z = np.meshgrid(xs, zs)
+    bev = np.column_stack(
+        (grid_x.ravel(), np.full(grid_x.size, at_m, dtype=np.float32))
+    ).astype(np.float32)
+    heights = (ground_z + grade * at_m + grid_z.ravel()).astype(np.float32)
+    return bev, heights
+
+
+def _bush(
+    at_m: float, height_m: float, ground_z: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Foliage: the same vertical extent as a post, but rays go through it."""
+    xs = np.arange(-0.5, 0.5, 0.05, dtype=np.float32)
+    zs = np.arange(0.0, height_m, 0.04, dtype=np.float32)
+    grid_x, grid_z = np.meshgrid(xs, zs)
+    bev = np.column_stack(
+        (grid_x.ravel(), np.full(grid_x.size, at_m, dtype=np.float32))
+    ).astype(np.float32)
+    return bev, (ground_z + grid_z.ravel()).astype(np.float32)
+
+
+def _occlude(
+    bev: np.ndarray,
+    heights: np.ndarray,
+    at_m: float,
+    height_m: float,
+    half_width_m: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Delete the ground a SOLID object of this height would have hidden.
+
+    The simulator's LiDAR is a real ray cast, so an opaque object genuinely
+    shadows the ground behind it for r*a/(h - a). A synthetic scene that draws
+    the surface straight through that shadow is describing something the rays
+    could see past -- which is a bush, and the porosity test is right to say so.
+    """
+    shadow = at_m * height_m / max(ROOF_H - height_m, 1e-6)
+    hidden = (
+        (bev[:, 1] > at_m)
+        & (bev[:, 1] < at_m + shadow)
+        & (np.abs(bev[:, 0]) < half_width_m)
+    )
+    return bev[~hidden], heights[~hidden]
+
+
+def _aeb_obstacles(
+    bev: np.ndarray, heights: np.ndarray, ground_z: float
+) -> np.ndarray:
+    return geometric_obstacle_sets(
+        bev, heights, ground_z, (AEB_BAND,), sensor_height_m=ROOF_H
+    )[0]
+
+
+@pytest.mark.parametrize("grade", (0.0, 0.05, 0.10, 0.20))
+def test_a_hill_is_never_an_obstacle_however_steep(grade: float) -> None:
+    """
+    The point-5 phantom, and it is structural rather than a tuning slip. The
+    local ground estimate is clamped into a 1.5% cone to protect the planner's
+    kerb detection, so on a 5% climb at 25 m the road sits 1.25 m above the ego
+    plane against 0.53 m of allowance -- a dense, persistent surface right in
+    AEB's obstacle band, which sails through the height, support and persistence
+    filters alike and reads as a wall across the road.
+    """
+    ground_z = -0.5
+    bev, heights = _ground(grade, ground_z)
+
+    assert not len(_aeb_obstacles(bev, heights, ground_z))
+
+
+@pytest.mark.parametrize("grade", (0.0, 0.05, 0.10, 0.20))
+def test_a_wall_on_that_same_hill_is_still_an_obstacle(grade: float) -> None:
+    """The other half, and the half that matters: AEB must still fire."""
+    ground_z = -0.5
+    road, road_h = _ground(grade, ground_z)
+    wall, wall_h = _standing(30.0, 3.0, ground_z, grade)
+
+    obstacles = _aeb_obstacles(
+        np.concatenate((road, wall)),
+        np.concatenate((road_h, wall_h)),
+        ground_z,
+    )
+
+    assert len(obstacles)
+    assert obstacles[:, 1].min() == pytest.approx(30.0, abs=0.5)
+
+
+def test_reversing_up_a_ramp_is_not_an_obstacle() -> None:
+    """
+    The case the slope cone can never reach. It is zero inside
+    SLOPE_ALLOWANCE_START_M and the whole rear system lives at 2-8 m, so every
+    driveway ramp was a phantom by construction.
+    """
+    ground_z = -0.5
+    xs = np.arange(-4.0, 4.0, 0.2, dtype=np.float32)
+    ys = np.arange(2.0, 9.0, 0.2, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    bev = np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float32)
+    heights = (ground_z + 0.08 * bev[:, 1]).astype(np.float32)
+
+    assert not len(_aeb_obstacles(bev, heights, ground_z))
+
+
+def test_a_short_solid_object_survives_because_extent_is_measured_whole() -> None:
+    """
+    A 0.35 m rock puts only 0.05 m of returns above the 0.30 m floor. Measuring
+    the spread over the SURVIVORS would call that 0.05 m tall and delete it --
+    and with it every kerbstone, bollard and low post there is. The extent is
+    measured over the whole cell, floor-rejected returns included.
+    """
+    ground_z = -0.5
+    road, road_h = _occlude(*_ground(0.0, ground_z), 20.0, 0.35)
+    rock, rock_h = _standing(20.0, 0.35, ground_z)
+
+    obstacles = _aeb_obstacles(
+        np.concatenate((road, rock)),
+        np.concatenate((road_h, rock_h)),
+        ground_z,
+    )
+
+    assert len(obstacles)
+    assert obstacles[:, 1].min() == pytest.approx(20.0, abs=0.5)
+
+
+def test_a_bush_is_seen_through_and_a_post_of_the_same_height_is_not() -> None:
+    """
+    The bush complaint, decided on geometry alone: the ground BEHIND a bush
+    comes back because rays pass between the leaves, and behind a solid object
+    of the same height it does not. The window is the shadow a solid twin would
+    cast, r*a/(h - a), so the two clouds below differ in exactly one thing --
+    whether ground returns exist inside that shadow -- and get opposite verdicts.
+    """
+    ground_z, at_m, height = -0.5, 12.0, 0.6
+    shadow = at_m * height / (ROOF_H - height)
+    assert shadow > 5.0, "the test is meaningless if the shadow is short"
+
+    foliage, foliage_h = _bush(at_m, height, ground_z)
+    open_ground, open_h = _ground(0.0, ground_z)
+    # The same scene with the shadow actually empty, as a solid object leaves it.
+    shaded, shaded_h = _occlude(open_ground, open_h, at_m, height)
+
+    porous = _aeb_obstacles(
+        np.concatenate((open_ground, foliage)),
+        np.concatenate((open_h, foliage_h)),
+        ground_z,
+    )
+    solid = _aeb_obstacles(
+        np.concatenate((shaded, foliage)),
+        np.concatenate((shaded_h, foliage_h)),
+        ground_z,
+    )
+
+    assert not len(porous), "a bush braked the car"
+    assert len(solid), "a solid post of the same height was ignored"
+
+
+def test_a_wall_can_never_be_vetoed_by_the_porosity_test() -> None:
+    """
+    The safety property, and it is derived rather than imposed: an object at or
+    above the sensor height shadows the ground for ever, so its evidence window
+    is EMPTY and no quantity of returns beyond it can clear it. Without that,
+    parallax between five mount positions could talk AEB out of braking for a
+    wall. Here the ground is drawn straight through the wall to force the issue.
+    """
+    ground_z = -0.5
+    through, through_h = _ground(0.0, ground_z)
+    wall, wall_h = _standing(15.0, 3.0, ground_z)
+
+    obstacles = _aeb_obstacles(
+        np.concatenate((through, wall)),
+        np.concatenate((through_h, wall_h)),
+        ground_z,
+    )
+
+    assert len(obstacles)
+    assert obstacles[:, 1].min() == pytest.approx(15.0, abs=0.5)
+
+
+def test_the_planner_still_steers_around_what_aeb_now_ignores() -> None:
+    """
+    The two bands answer different questions and only AEB's got pickier. The
+    planner has to keep seeing the bush: steering around one is free, and
+    braking for it is not.
+    """
+    ground_z = -0.5
+    road, road_h = _ground(0.0, ground_z)
+    foliage, foliage_h = _bush(12.0, 0.6, ground_z)
+
+    planner_set, aeb_set = geometric_obstacle_sets(
+        np.concatenate((road, foliage)),
+        np.concatenate((road_h, foliage_h)),
+        ground_z,
+        (PLANNER_BAND, AEB_BAND),
+        sensor_height_m=ROOF_H,
+    )
+
+    assert len(planner_set), "the planner went blind to the bush"
+    assert not len(aeb_set)
+
+
+def _rings(
+    horizon_m: float, ground_z: float, az_deg: float = 0.26
+) -> tuple[np.ndarray, np.ndarray]:
+    """Ground as the sensors lay it down -- concentric rings, not a grid.
+
+    Uniform noise is the wrong shape for any of the porosity arithmetic: the
+    evidence is ground returns at a RANGE beyond a candidate and at the same
+    BEARING, and rings and columns are what decide whether any exist.
+    """
+    parts = []
+    for height, near, far in ((ROOF_H, 6.0, 80.0), (0.20, 3.0, 11.6)):
+        for theta in np.linspace(
+            np.arctan(height / far), np.arctan(height / near), 256
+        ):
+            radius = height / np.tan(theta)
+            if radius < 2.0 or radius > horizon_m:
+                continue
+            bearings = np.arange(
+                np.radians(-25.0), np.radians(25.0), np.radians(az_deg)
+            )
+            parts.append(
+                np.column_stack(
+                    (radius * np.sin(bearings), radius * np.cos(bearings))
+                )
+            )
+    bev = np.concatenate(parts).astype(np.float32)
+    return bev, np.full(len(bev), ground_z, dtype=np.float32)
+
+
+def _shadow_wedge(
+    bev: np.ndarray,
+    heights: np.ndarray,
+    at_m: float,
+    height_m: float,
+    half_width_m: float,
+    offset_x: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Delete the ground a solid object of this size really hides.
+
+    The umbra of an object seen from a point sensor is the angular WEDGE it
+    subtends, which widens with range. `_occlude` uses a constant-width lateral
+    strip, which is narrower than the truth at range and so leaves ground
+    visible that a real ray cast would never have returned.
+    """
+    bearing = np.arctan2(bev[:, 0], bev[:, 1])
+    hidden = (
+        (bev[:, 1] > at_m)
+        & (bev[:, 1] < at_m + at_m * height_m / max(ROOF_H - height_m, 1e-6))
+        & (bearing > np.arctan2(offset_x - half_width_m, at_m))
+        & (bearing < np.arctan2(offset_x + half_width_m, at_m))
+    )
+    return bev[~hidden], heights[~hidden]
+
+
+def _car(
+    at_m: float, ground_z: float, offset_x: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """The back of a stopped car, sampled at the sensors' angular resolution.
+
+    A real target thins with range -- 0.118 deg between channels vertically and
+    0.26 deg between the front unit's columns -- which is the whole point: a
+    dense synthetic face hides every failure that only appears once an object
+    stops filling the structures that measure it.
+    """
+    zs = np.arange(0.25, 1.45, at_m * np.radians(0.118), dtype=np.float32)
+    xs = np.arange(
+        offset_x - 0.9, offset_x + 0.9, at_m * np.radians(0.26), dtype=np.float32
+    )
+    grid_x, grid_z = np.meshgrid(xs, zs)
+    bev = np.column_stack(
+        (grid_x.ravel(), np.full(grid_x.size, at_m, dtype=np.float32))
+    ).astype(np.float32)
+    return bev, (ground_z + grid_z.ravel()).astype(np.float32)
+
+
+@pytest.mark.parametrize("offset_x", (0.0, 0.35, 0.7))
+@pytest.mark.parametrize("at_m", (15.0, 20.0, 30.0, 40.0, 50.0, 60.0))
+def test_a_stopped_car_survives_both_shape_tests_at_every_firing_range(
+    at_m: float, offset_x: float
+) -> None:
+    """
+    The regression that made AEB brake late, and it is two defects at once.
+
+    Both live in the porosity window, and both come from treating a fixed ANGLE
+    as though it described an object of fixed WIDTH:
+
+    - the (bin, range) key was not clamped to its bin, so a shadow longer than
+      the key stride ran into the NEXT bin and counted the road in FRONT of the
+      car as proof of seeing through it. A car's shadow is over 3x its range, so
+      this fired for every car past ~15 m;
+    - the bin outgrew the car with range, so the road BESIDE it -- which no part
+      of it ever stood in front of -- became evidence against it.
+
+    Together they made AEB blind to a stopped car beyond about 10 m. The ranges
+    here are the ones the trigger actually fires from: 20 m at 60 km/h, 33 at
+    80, 49 at 100. The lateral offsets matter because a fixed bin grid makes the
+    verdict depend on where the car happens to sit against it, which is not a
+    property any of this may have.
+    """
+    ground_z = -0.5
+    horizon = at_m + 30.0
+    road, road_h = _shadow_wedge(
+        *_rings(horizon, ground_z), at_m, 1.45, 0.9, offset_x
+    )
+    car, car_h = _car(at_m, ground_z, offset_x)
+
+    obstacles = geometric_obstacle_sets(
+        np.concatenate((road, car)),
+        np.concatenate((road_h, car_h)),
+        ground_z,
+        (ObstacleBand(
+            AEB_OBSTACLE_MIN_HEIGHT_M,
+            horizon,
+            min_vertical_extent_m=AEB_MIN_VERTICAL_EXTENT_M,
+            porosity=True,
+        ),),
+        sensor_height_m=ROOF_H,
+    )[0]
+
+    assert len(obstacles), f"AEB went blind to a car at {at_m:.0f} m"
+    assert obstacles[:, 1].min() == pytest.approx(at_m, abs=0.5)
+
+
+def _sensor_cloud(horizon_m: float, ground_z: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    A street as the sensors actually lay it down, for the timing bound.
+
+    Ground arrives as RINGS whose spacing goes as r^2/h, not as uniform noise --
+    which matters, because the shape tests are per-cell and a cloud with one
+    return per cell is the worst case for them and nothing like a real scene.
+    """
+    parts = []
+    radius = 3.0
+    while radius < horizon_m:
+        count = max(24, int(2.0 * radius / 0.25))
+        bearing = np.linspace(-1.4, 1.4, count)
+        parts.append(
+            np.column_stack(
+                (
+                    radius * np.sin(bearing),
+                    radius * np.cos(bearing),
+                    np.full(count, ground_z),
+                )
+            )
+        )
+        radius += max(0.05, (radius * radius / 1.58) * np.radians(0.118))
+    for side in (-6.0, 6.0):
+        ys = np.arange(5.0, horizon_m, 0.6)
+        zs = np.arange(ground_z, ground_z + 4.5, 0.05)
+        grid_y, grid_z = np.meshgrid(ys, zs)
+        parts.append(
+            np.column_stack(
+                (
+                    np.full(grid_y.size, side),
+                    grid_y.ravel(),
+                    grid_z.ravel(),
+                )
+            )
+        )
+    cloud = np.concatenate(parts)
+    return cloud[:, :2].astype(np.float32), cloud[:, 2].astype(np.float32)
+
+
+def test_the_shape_tests_stay_inside_the_tick() -> None:
+    """
+    Both are O(cloud) and ride the 40 ms display loop, next to a blocking
+    `poll_sensors` round trip that already costs most of it.
+    """
+    ground_z = -0.5
+    horizon = 90.0  # ~125 km/h, the furthest AEB ever scans in practice
+    bev, heights = _sensor_cloud(horizon, ground_z)
+    band = ObstacleBand(
+        AEB_OBSTACLE_MIN_HEIGHT_M,
+        horizon,
+        min_vertical_extent_m=AEB_MIN_VERTICAL_EXTENT_M,
+        porosity=True,
+    )
+
+    started = time.perf_counter()
+    for _ in range(5):
+        geometric_obstacle_sets(
+            bev, heights, ground_z, (PLANNER_BAND, band), sensor_height_m=ROOF_H
+        )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0 / 5
+
+    assert len(bev) > 40_000, "the timing scene stopped being a worst case"
+    assert elapsed_ms < 18.0, f"both bands cost {elapsed_ms:.1f} ms of a 40 ms tick"

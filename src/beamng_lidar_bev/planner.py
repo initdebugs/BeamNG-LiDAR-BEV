@@ -19,10 +19,14 @@ the whole obstacle cloud as one ``(obstacles x arcs)`` matrix.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 from .config import (
+    AEB_POROSITY_AZIMUTH_DEG,
+    AEB_POROSITY_GAP_M,
+    AEB_POROSITY_MIN_HITS,
     CLEARANCE_MARGIN_M,
     CORRIDOR_BAND_M,
     COST_CLEARANCE,
@@ -72,6 +76,31 @@ CANDIDATE_CURVATURES = MAX_CURVATURE * _FAN_POSITIONS * np.abs(_FAN_POSITIONS)
 _MIN_CURVATURE = 1e-4
 _EMPTY_BEV = np.empty((0, 2), dtype=np.float32)
 _TWO_PI = 2.0 * np.pi
+
+
+@dataclass(frozen=True)
+class ObstacleBand:
+    """
+    One consumer's definition of "solid", for `geometric_obstacle_sets`.
+
+    The bands differ because the consumers ask different questions -- the
+    planner steers around a 0.12 m kerb inside 35 m, AEB brakes only for what
+    would be a crash and has to see far enough to stop from motorway speed --
+    but the ground underneath them is one measurement, so they are built
+    together.
+
+    The two shape tests default OFF, so a band that names only a floor and a
+    horizon behaves exactly as it did before they existed. That is the planner's
+    band: it *should* steer around bushes and kerbs. Only the full-authority
+    brake gets pickier.
+    """
+
+    min_height_m: float
+    horizon_m: float
+    min_vertical_extent_m: float = 0.0
+    """How tall the thing standing in a cell must be. 0 disables the test."""
+    porosity: bool = False
+    """Whether see-through candidates are vetoed. See `_porous`."""
 
 
 def _as_bev(points: np.ndarray) -> np.ndarray:
@@ -194,19 +223,231 @@ def geometric_obstacles(
     band should use `geometric_obstacle_sets` rather than calling this twice.
     """
     return geometric_obstacle_sets(
-        bev, heights, ground_z_vehicle, ((min_height_m, horizon_m),)
+        bev,
+        heights,
+        ground_z_vehicle,
+        (ObstacleBand(min_height_m, horizon_m),),
     )[0]
+
+
+def _group_starts(sorted_keys: np.ndarray) -> np.ndarray:
+    """Index of the first element of each run of equal keys.
+
+    Duplicated from `world_scene` rather than shared: that module sits far above
+    this one (world_scene -> aeb -> planner), so importing it here would close a
+    cycle, and this is three lines.
+    """
+    if not len(sorted_keys):
+        return np.empty(0, dtype=np.intp)
+    breaks = np.empty(len(sorted_keys), dtype=bool)
+    breaks[0] = True
+    breaks[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    return np.flatnonzero(breaks)
+
+
+# A cell key is two 21-bit fields; the height packed under it in `_cell_profile`
+# takes a third. 21 bits of millimetres covers +/- 1000 m of height, and 21 bits
+# of cell index covers +/- 400 km at this cell size.
+_CELL_FIELD = 1 << 21
+_HEIGHT_FIELD = 1 << 21
+_HEIGHT_BIAS_M = 1000.0
+
+# How many evidence bins one porosity candidate may consult. A cell's wedge is
+# cell_m/r, so this only ever binds in the near field -- 16 bins of 0.5 deg is
+# the whole wedge beyond 2.9 m at OBSTACLE_CELL_M. Under-counting evidence means
+# fewer vetoes, so the bound errs toward braking.
+_POROSITY_MAX_BINS = 16
+
+
+def _cell_keys(points: np.ndarray, cell_m: float) -> np.ndarray:
+    """Pack XY cell indices into one int64 so grouping stays a 1-D sort."""
+    ix = np.floor(points[:, 0] / cell_m).astype(np.int64)
+    iy = np.floor(points[:, 1] / cell_m).astype(np.int64)
+    return (ix + (_CELL_FIELD >> 1)) * _CELL_FIELD + (iy + (_CELL_FIELD >> 1))
+
+
+def _cell_profile(
+    points: np.ndarray, above_ego: np.ndarray, cell_m: float = OBSTACLE_CELL_M
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per point, the base and the height of whatever occupies its XY cell.
+
+    The answer to "is this an obstacle or a hill", and the reason it works where
+    a height floor cannot: a 0.4 m cell on a 20% slope holds 0.08 m of spread
+    while a wall holds metres. Being a difference it is equally immune to brake
+    dive and to suspension heave, so it fixes the near field the slope cone
+    never reached -- which is the entire operating range of the rear system.
+
+    The BASE matters as much as the spread, because it is the local ground
+    reference the whole point of this is to get right. Measuring height from it
+    makes both the floor and the ceiling grade-proof at once: on a 20% climb the
+    surface at 30 m is 6 m above the ego plane, so a wall standing on it starts
+    *above* OBSTACLE_MAX_HEIGHT_M and was discarded as overhead -- AEB went
+    blind to real walls on exactly the hills it used to brake at nothing for.
+
+    Computed over EVERY return in the cell, not just those above the obstacle
+    floor. A 0.35 m rock puts 0.05 m above a 0.30 m floor; it is still 0.35 m
+    tall, and measuring the survivors alone would delete every short solid thing
+    there is.
+
+    Returned in CELL space -- ``(index per point, base, extent, centre)`` -- not
+    broadcast back over the cloud. Everything downstream is a property of the
+    object rather than of the individual return, and a cloud has one or two
+    orders of magnitude more returns than occupied cells.
+    """
+    if len(points) == 0:
+        empty = np.empty(0)
+        return np.empty(0, dtype=np.intp), empty, empty, np.empty((0, 2))
+    keys = _cell_keys(points, cell_m)
+    # SORT, not argsort. Packing the height into the low bits of the same
+    # integer key makes the group minimum and maximum the first and last entry
+    # of each run, so the permutation itself is never needed -- and numpy sorts
+    # integers by radix. Measured on a 110k cloud, argsort was 5.9 ms of a
+    # 10.6 ms profile; this is a plain sort plus one searchsorted to map back.
+    #
+    # Heights are quantised to the millimetre and biased positive, which is far
+    # finer than the returns resolve and comfortably inside the 21 bits the
+    # packing leaves. Anything outside +/-1000 m is clipped rather than allowed
+    # to wrap into the cell field.
+    height_key = np.clip(
+        ((above_ego + _HEIGHT_BIAS_M) * 1000.0).astype(np.int64),
+        0,
+        _HEIGHT_FIELD - 1,
+    )
+    combined = np.sort(keys * _HEIGHT_FIELD + height_key)
+    cells = combined // _HEIGHT_FIELD
+    starts = _group_starts(cells)
+    unique_cells = cells[starts]
+    ends = np.append(starts[1:], len(combined)) - 1
+    lows = (combined[starts] % _HEIGHT_FIELD) / 1000.0 - _HEIGHT_BIAS_M
+    highs = (combined[ends] % _HEIGHT_FIELD) / 1000.0 - _HEIGHT_BIAS_M
+    index = np.searchsorted(unique_cells, keys)
+    counts = np.diff(np.append(starts, len(combined)))
+    centre = np.column_stack(
+        (
+            np.bincount(index, weights=points[:, 0], minlength=len(starts)),
+            np.bincount(index, weights=points[:, 1], minlength=len(starts)),
+        )
+    ) / counts[:, None]
+    return index, lows, highs - lows, centre
+
+
+def _porous(
+    centres: np.ndarray,
+    heights: np.ndarray,
+    ground_bev: np.ndarray,
+    sensor_height_m: float,
+    cell_m: float = OBSTACLE_CELL_M,
+) -> np.ndarray:
+    """
+    Which candidates have been SEEN THROUGH, and so are not solid.
+
+    A bush passes rays between its leaves and the ground behind it comes back; a
+    wall stops them. The window that separates the two is not a guess -- an
+    object of height ``a`` at range ``r``, seen from a sensor at height ``h``,
+    hides the ground behind it for exactly ``r * a / (h - a)``. Ground returns
+    inside that shadow mean the rays got through.
+
+    ``a >= h`` makes the shadow infinite and the window empty, so anything as
+    tall as the sensor can NEVER be vetoed here. That is the safety property,
+    and it falls out of the geometry rather than being imposed on top: no
+    parallax between the five mount positions can talk AEB out of braking for a
+    wall, a car or a person. For short things the failure direction is "no
+    evidence, so treat it as solid".
+
+    Answered per CANDIDATE CELL rather than per return: being see-through is a
+    property of the object, and a cloud holds far more returns than cells.
+    ``ground_bev`` is the evidence -- every return the height floor rejected,
+    which is a geometric test rather than a semantic one and so survives an
+    unannotated map.
+
+    **Evidence only counts if the candidate would have BLOCKED it**, which is
+    what makes the azimuth window the candidate's OWN angular width rather than
+    a fixed angle. A ray passing beside an object was never stopped by it, so it
+    says nothing about whether the object is porous. A fixed bin is a fixed
+    angle against an object of fixed width, so it outgrows the object with
+    range: at a 2 deg bin a 1.8 m car stops covering one at all past ~52 m, and
+    stops reliably covering one past ~26 m, whereupon the ground BESIDE it vetoes
+    it. Measured on a ring-sampled scene, that made AEB blind to a stopped car
+    through the whole 30-60 m band -- which is exactly where it must fire at
+    60-100 km/h, so the brake came on late.
+    """
+    if not len(centres) or not len(ground_bev) or sensor_height_m <= 0.0:
+        return np.zeros(len(centres), dtype=bool)
+
+    # One sort over a composite key, so a window lookup is two vectorised
+    # searchsorted calls rather than a scan. The key is an INTEGER -- range
+    # quantised to the centimetre, far finer than anything here resolves --
+    # because numpy sorts integers by radix and floats by comparison, and the
+    # evidence side of this is most of the cloud.
+    ground_ranges = np.hypot(ground_bev[:, 0], ground_bev[:, 1])
+    ranges = np.hypot(centres[:, 0], centres[:, 1])
+    span = int(max(ground_ranges.max(), ranges.max()) * 100.0) + 200
+
+    bin_rad = np.radians(AEB_POROSITY_AZIMUTH_DEG)
+    evidence = (
+        np.floor(
+            np.arctan2(ground_bev[:, 0], ground_bev[:, 1]) / bin_rad
+        ).astype(np.int64)
+        * span
+        + (ground_ranges * 100.0).astype(np.int64)
+    )
+    evidence.sort(kind="stable")
+
+    # Anything at or above the sensor shadows the ground for ever, so its window
+    # is empty and it can never be vetoed. Written as an explicit negative
+    # shadow rather than left to the arithmetic, so the guarantee is structural
+    # -- it must not depend on the cloud happening to contain no returns beyond
+    # a wall, which parallax between five mount positions could break.
+    shadow = np.where(
+        heights >= sensor_height_m,
+        -1.0,
+        ranges * heights / np.maximum(sensor_height_m - heights, 1e-6),
+    )
+
+    # The bins lying ENTIRELY inside this cell's own wedge. Partly-covered bins
+    # are discarded rather than shared, because a bin that pokes out past the
+    # cell holds rays the cell never stood in front of. None fully inside means
+    # no evidence at all, which reads as solid -- the conservative direction,
+    # and the one a candidate narrower than the grid should get.
+    bearing = np.arctan2(centres[:, 0], centres[:, 1])
+    half = 0.5 * cell_m / np.maximum(ranges, 1e-6)
+    first = np.ceil((bearing - half) / bin_rad).astype(np.int64)
+    covered = np.maximum(
+        np.floor((bearing + half) / bin_rad).astype(np.int64) - first, 0
+    )
+
+    # Offsets within a bin, and `far` is clamped to the END of that bin. The key
+    # packs (bin, range) into one integer, so an unclamped window runs straight
+    # off the end of its own bin and into the next one -- where it counts the
+    # ground in FRONT of the object as evidence of seeing through it. A car's
+    # shadow is over three times its range, so this overflowed for every car
+    # past ~15 m and vetoed the lot.
+    range_cm = (ranges * 100.0).astype(np.int64)
+    near_offset = range_cm + int(AEB_POROSITY_GAP_M * 100.0)
+    far_offset = np.minimum(
+        range_cm + (shadow * 100.0).astype(np.int64), span - 1
+    )
+
+    hits = np.zeros(len(centres), dtype=np.int64)
+    for step in range(min(int(covered.max()), _POROSITY_MAX_BINS)):
+        active = covered > step
+        base = (first[active] + step) * span
+        hits[active] += np.searchsorted(
+            evidence, base + far_offset[active], side="right"
+        ) - np.searchsorted(evidence, base + near_offset[active], side="left")
+    return hits >= AEB_POROSITY_MIN_HITS
 
 
 def geometric_obstacle_sets(
     bev: np.ndarray,
     heights: np.ndarray,
     ground_z_vehicle: float,
-    bands: Sequence[tuple[float, float]],
+    bands: Sequence[ObstacleBand],
+    sensor_height_m: float = 0.0,
 ) -> list[np.ndarray]:
     """
-    One obstacle set per ``(min_height_m, horizon_m)`` band, sharing a single
-    local ground estimate.
+    One obstacle set per `ObstacleBand`, sharing a single local ground estimate.
 
     The bands differ per consumer but the ground underneath them is one
     measurement, and it is the expensive part of this function: measured on a
@@ -214,9 +455,14 @@ def geometric_obstacle_sets(
     against 0.7 ms for the mask and despeckle that a second band adds. Calling
     the whole thing twice put the both-features-on tick at 7.8 ms against 4.0.
 
+    ``sensor_height_m`` is the ROOF mount height above the vehicle's ground
+    plane, and only the porosity test uses it -- that is the ``h`` in the shadow
+    length ``r*a/(h - a)``. Left at 0 no candidate is ever vetoed, which is the
+    conservative direction and what a band without porosity gets anyway.
+
     Returned in the order the bands were given.
     """
-    bands = [(float(floor), float(horizon)) for floor, horizon in bands]
+    bands = list(bands)
     points = np.asarray(bev, dtype=np.float32).reshape((-1, 2))
     if len(points) == 0:
         return [_EMPTY_BEV for _ in bands]
@@ -230,7 +476,7 @@ def geometric_obstacle_sets(
     # measured on a 110k cloud, the full-radius version cost 24.5 ms of the
     # 40 ms tick against 5.5 ms once the ground estimate only sees the points
     # some band will actually use.
-    furthest = max(horizon for _, horizon in bands)
+    furthest = max(band.horizon_m for band in bands)
     if furthest < float(ranges.max()):
         inside = ranges <= furthest
         points = points[inside]
@@ -249,11 +495,65 @@ def geometric_obstacle_sets(
     rise = np.clip(ground_rise(ranges, above), 0.0, cone)
     below_ceiling = above <= OBSTACLE_MAX_HEIGHT_M + rise
 
+    # Shared by both shape tests, and computed at most once. The cell BASE is
+    # the local ground the shape bands measure everything from, which is what
+    # makes them independent of the slope clamp in both directions -- see
+    # `_cell_profile`.
+    cell = None
+    if any(band.min_vertical_extent_m > 0.0 for band in bands):
+        cell = _cell_profile(points, above)
+
     sets: list[np.ndarray] = []
-    for floor, horizon in bands:
-        selected = (
-            (ranges <= horizon) & below_ceiling & (above >= floor + rise)
-        )
+    for band in bands:
+        if band.min_vertical_extent_m > 0.0 and cell is not None:
+            index, cell_base, cell_extent, cell_centre = cell
+            # Heights measured from the CELL's own base rather than from the
+            # clamped ground estimate, so a gradient moves the floor and the
+            # ceiling together and neither can be fooled by one.
+            local = above - cell_base[index]
+            tall_enough = cell_extent >= band.min_vertical_extent_m
+            selected = (
+                (ranges <= band.horizon_m)
+                & tall_enough[index]
+                & (local >= band.min_height_m)
+                & (local <= OBSTACLE_MAX_HEIGHT_M)
+            )
+            # Both shape tests only ever REMOVE candidates, so neither can
+            # invent an obstacle. That is what makes them safe to add under a
+            # full-authority brake, and why the live checklist only has to
+            # re-prove that it still fires.
+            if band.porosity and selected.any():
+                # Decided per CELL, because being see-through is a property of
+                # the object. The shadow is likewise cast by the whole object,
+                # so its length comes from the cell's extent and not from an
+                # individual return's height up it -- which would both shorten
+                # every window and make a wall's lower half testable when the
+                # wall as a whole must never be.
+                #
+                # Only cells SHORTER than the sensor are even asked: taller ones
+                # shadow the ground for ever and are immune by construction, so
+                # filtering them here changes no verdict and skips building the
+                # evidence set entirely in the common case where everything
+                # AEB can see is a wall, a car or a person.
+                suspect = np.unique(index[selected])
+                suspect = suspect[cell_extent[suspect] < sensor_height_m]
+                if len(suspect):
+                    seen_through = _porous(
+                        cell_centre[suspect],
+                        cell_extent[suspect],
+                        points[local < band.min_height_m],
+                        sensor_height_m,
+                    )
+                    if seen_through.any():
+                        vetoed = np.zeros(len(cell_extent), dtype=bool)
+                        vetoed[suspect[seen_through]] = True
+                        selected &= ~vetoed[index]
+        else:
+            selected = (
+                (ranges <= band.horizon_m)
+                & below_ceiling
+                & (above >= band.min_height_m + rise)
+            )
         # Despeckled before decimation: decimating first would thin real
         # surfaces toward the support threshold and make the filter's verdict
         # depend on the cloud size.
@@ -268,6 +568,94 @@ def geometric_obstacle_sets(
             obstacles = obstacles[index]
         sets.append(obstacles)
     return sets
+
+
+def corridor_return_profile(
+    bev: np.ndarray,
+    heights: np.ndarray,
+    ground_z_vehicle: float,
+    curvature: float,
+    half_width_m: float,
+    threat_m: float,
+    window_m: float = 1.0,
+) -> dict[str, float]:
+    """
+    Describe what is standing in the corridor around a threat. Diagnostics only.
+
+    Nothing acts on this. It exists because "AEB braked and there was nothing
+    there" cannot be answered from the trigger's own numbers: the corridor scan
+    reduces a surface to one distance, and a distance cannot say whether that
+    surface was a wall, a kerb face, or the road itself arriving in the height
+    band. The VERTICAL EXTENT can, and it is the one measurement that is
+    invariant to both grade and ride height:
+
+        spread < ~0.10 m   a surface lying along the ground -- flat road under a
+                           brake dive, or a hillside crossing the floor because
+                           `ground_rise` is clamped into the slope cone
+        ~0.10-0.20 m       a kerb or low lip: real, but not a crash
+        tens of cm         genuinely solid, and the brake was right
+
+    Read the spread against ``range_span_m``, because that ratio is the local
+    SLOPE and it separates the first case from the others outright: ground rises
+    a few centimetres per metre of range however steep the hill, while a wall
+    puts metres of height into a range span of nearly nothing.
+
+    Reports the local ground estimate and the cone that bounds it at the same
+    range, because "the ground under it" is the other half of the answer.
+
+    Costs a full `ground_rise` pass over the cloud, so call it on the ARMED to
+    BRAKING transition and nowhere else.
+    """
+    points = np.asarray(bev, dtype=np.float32).reshape((-1, 2))
+    above = np.asarray(heights, dtype=np.float32).reshape(-1) - float(
+        ground_z_vehicle
+    )
+    empty = {
+        "count": 0.0,
+        "height_min_m": 0.0,
+        "height_median_m": 0.0,
+        "height_max_m": 0.0,
+        "spread_m": 0.0,
+        "range_span_m": 0.0,
+        "ground_rise_m": 0.0,
+        "cone_bound_m": 0.0,
+    }
+    if len(points) == 0 or len(points) != len(above):
+        return empty
+
+    ranges = np.hypot(points[:, 0], points[:, 1])
+    near_threat = np.abs(ranges - float(threat_m)) <= float(window_m)
+    if not near_threat.any():
+        return empty
+
+    # The same corridor the scan used, so this describes what actually blocked
+    # it rather than a differently-shaped guess at it.
+    k = float(curvature)
+    safe = k if abs(k) >= _MIN_CURVATURE else _MIN_CURVATURE
+    radius = abs(1.0 / safe)
+    offset_x = points[:, 0] + 1.0 / safe
+    inside = (
+        np.abs(np.hypot(offset_x, points[:, 1]) - radius) < float(half_width_m)
+    ) & near_threat & (points[:, 1] > 0.0)
+    if not inside.any():
+        return empty
+
+    selected = above[inside]
+    spanned = ranges[inside]
+    rise = ground_rise(ranges, above)[inside]
+    cone = SLOPE_ALLOWANCE_PER_M * np.maximum(
+        spanned - SLOPE_ALLOWANCE_START_M, 0.0
+    )
+    return {
+        "count": float(len(selected)),
+        "height_min_m": float(np.min(selected)),
+        "height_median_m": float(np.median(selected)),
+        "height_max_m": float(np.max(selected)),
+        "spread_m": float(np.max(selected) - np.min(selected)),
+        "range_span_m": float(np.max(spanned) - np.min(spanned)),
+        "ground_rise_m": float(np.median(rise)),
+        "cone_bound_m": float(np.median(cone)),
+    }
 
 
 def arc_polyline(

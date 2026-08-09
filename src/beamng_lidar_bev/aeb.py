@@ -94,6 +94,144 @@ REVERSE = BrakingProfile(
 )
 
 
+@dataclass(frozen=True)
+class BrakeMeasurement:
+    """What one full-authority stop actually achieved, as opposed to modelled."""
+
+    cause: str
+    """
+    Who braked, and which way the car was going: AEB, REAR AEB, MANUAL,
+    MANUAL REVERSE. The caller names it, because only the caller knows.
+    """
+    from_speed_mps: float
+    to_speed_mps: float
+    duration_s: float
+    distance_m: float
+    mean_decel_mps2: float
+    """The headline. Directly comparable to `profile.braking_decel_mps2`, and
+    the number a new row of the config tables is made of."""
+    peak_decel_mps2: float
+    modelled_decel_mps2: float
+    """What the configured plant claimed, so the two sit side by side."""
+    modelled_distance_m: float
+    """
+    What the configured plant says a stop from this speed takes.
+
+    The PURE braking distance, ``v^2 / (2 a)``, deliberately without
+    `stopping_distance`'s latency term: the tables in config are pure braking
+    distances with no reaction time folded in, and this number exists to be
+    compared against them. AEB's own trigger uses the full `stopping_distance`
+    and is unaffected by anything here.
+    """
+    pitch_deg: float
+    """Body pitch at the start, positive nose-up. A stop down a grade flatters
+    the plant and a stop up one slanders it, so the number is logged rather than
+    corrected for."""
+
+    @property
+    def optimism(self) -> float:
+        """
+        How much further the car really took than the model promised.
+
+        Above 1.0 the model UNDER-predicts the real stop, which is the dangerous
+        direction: AEB fires at the last point the model says works, so a plant
+        measured on a lighter car would have it fire after the last point that
+        actually does. Expect a little over 1.0 on an AEB stop even with a
+        correct plant, because that trace starts when the pedal is COMMANDED and
+        so carries the actuation delay the modelled figure leaves out.
+        """
+        if self.modelled_distance_m <= 0.0:
+            return 0.0
+        return self.distance_m / self.modelled_distance_m
+
+
+class BrakeEvent:
+    """
+    Records a stop and reports the deceleration the car actually delivered.
+
+    Pure measurement: nothing here feeds back into the trigger, and it is
+    deliberately not wired into `EmergencyBraking`. Every braking figure in
+    `config` is a property of ONE vehicle that nothing in the repo recorded, so
+    this is the instrument that says what the attached car does -- validate it
+    against the car the published tables came from before trusting it on
+    another.
+
+    Wall-clock-free like the rest of the module: ``dt`` arrives from the caller.
+    """
+
+    def __init__(self, profile: BrakingProfile = FORWARD) -> None:
+        self.profile = profile
+        self._active = False
+        self._cause = ""
+        self._from_speed = 0.0
+        self._last_speed = 0.0
+        self._pitch_deg = 0.0
+        self._duration = 0.0
+        self._distance = 0.0
+        self._peak_decel = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self, speed_mps: float, pitch_deg: float, cause: str) -> None:
+        speed = abs(float(speed_mps))
+        self._active = True
+        self._cause = cause
+        self._from_speed = speed
+        self._last_speed = speed
+        self._pitch_deg = float(pitch_deg)
+        self._duration = 0.0
+        self._distance = 0.0
+        self._peak_decel = 0.0
+
+    def sample(self, speed_mps: float, dt: float) -> None:
+        """One tick of the trace. Speed is unsigned here: reverse stops too."""
+        if not self._active:
+            return
+        step = max(float(dt), 1e-3)
+        speed = abs(float(speed_mps))
+        # Trapezoidal, because a tick is 40 ms and the speed is falling fast
+        # enough through it that either endpoint alone biases the distance.
+        self._distance += 0.5 * (self._last_speed + speed) * step
+        self._duration += step
+        self._peak_decel = max(
+            self._peak_decel, (self._last_speed - speed) / step
+        )
+        self._last_speed = speed
+
+    def finish(self) -> BrakeMeasurement | None:
+        """
+        Close the event and report, or None if there is nothing to report.
+
+        A single-tick event has no trace to measure and a stop that never lost
+        any speed is not a stop, so both come back as None rather than as a
+        deceleration divided by nothing.
+        """
+        if not self._active:
+            return None
+        self._active = False
+        lost = self._from_speed - self._last_speed
+        if self._duration <= 0.0 or lost <= 0.0:
+            return None
+        return BrakeMeasurement(
+            cause=self._cause,
+            from_speed_mps=self._from_speed,
+            to_speed_mps=self._last_speed,
+            duration_s=self._duration,
+            distance_m=self._distance,
+            mean_decel_mps2=lost / self._duration,
+            peak_decel_mps2=self._peak_decel,
+            modelled_decel_mps2=self.profile.braking_decel_mps2,
+            modelled_distance_m=(
+                self._from_speed
+                * self._from_speed
+                / (2.0 * self.profile.braking_decel_mps2)
+            ),
+            pitch_deg=self._pitch_deg,
+        )
+
+
 def stopping_distance(
     speed_mps: float, profile: BrakingProfile = FORWARD
 ) -> float:
