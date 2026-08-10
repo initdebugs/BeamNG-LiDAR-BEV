@@ -7,21 +7,24 @@ import numpy as np
 from PyQt6.QtCore import (
     QAbstractListModel,
     QByteArray,
+    QEvent,
     QModelIndex,
     QObject,
+    QPointF,
     Qt,
     QUrl,
     pyqtProperty,
     pyqtSignal,
     pyqtSlot,
 )
-from PyQt6.QtGui import QCloseEvent, QColor, QVector3D
+from PyQt6.QtGui import QCloseEvent, QColor, QMouseEvent, QVector3D, QWheelEvent
 from PyQt6.QtQml import QQmlEngine
 from PyQt6.QtQuick3D import QQuick3DGeometry
 from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from .models import WorldActor, WorldFrame
+from .world_scene import apply_view_orbit
 
 _POSITION_BYTES = 12
 _COLOUR_BYTES = 16
@@ -220,8 +223,15 @@ class SceneBridge(QObject):
         self._autonomy_mode = "OFF"
         self._alert_text = ""
         self._perception_available = False
-        self._camera_position = (0.0, 12.0, 20.0)
-        self._camera_euler = (-21.0, 0.0, 0.0)
+        # The chase pose as the assembler computed it, kept beside the displayed
+        # pose so the user orbit can be re-applied to the latest frame at any
+        # time -- including between frames, when the mouse moves but no new
+        # snapshot arrives.
+        self._chase_position = (0.0, 12.0, 20.0)
+        self._chase_euler = (-21.0, 0.0, 0.0)
+        self._orbit = (0.0, 0.0, 1.0)  # yaw offset, pitch offset, zoom
+        self._camera_position = self._chase_position
+        self._camera_euler = self._chase_euler
 
     @pyqtProperty(QObject, constant=True)
     def actorModel(self) -> QObject:
@@ -346,9 +356,22 @@ class SceneBridge(QObject):
         self._autonomy_mode = frame.autonomy_mode
         self._alert_text = frame.alert
         self._perception_available = frame.perception_available
-        self._camera_position = frame.camera_position
-        self._camera_euler = frame.camera_euler
+        self._chase_position = frame.camera_position
+        self._chase_euler = frame.camera_euler
+        self._camera_position, self._camera_euler = apply_view_orbit(
+            self._chase_position, self._chase_euler, *self._orbit
+        )
         self.geometry_changed.emit()
+        self.state_changed.emit()
+
+    def set_view_orbit(
+        self, yaw_offset_deg: float, pitch_offset_deg: float, zoom: float
+    ) -> None:
+        """Re-aim the displayed camera without waiting for the next frame."""
+        self._orbit = (yaw_offset_deg, pitch_offset_deg, zoom)
+        self._camera_position, self._camera_euler = apply_view_orbit(
+            self._chase_position, self._chase_euler, *self._orbit
+        )
         self.state_changed.emit()
 
     @pyqtSlot()
@@ -373,6 +396,16 @@ class SceneBridge(QObject):
         self.state_changed.emit()
 
 
+# Mouse-orbit feel. Degrees of orbit per pixel of right-drag, the wheel's
+# magnification per notch, and the zoom range -- 0.5x pulls back to twice the
+# chase distance, 4x closes to a quarter of it.
+_ORBIT_DEG_PER_PX = 0.35
+_ZOOM_PER_WHEEL_NOTCH = 1.18
+_ZOOM_MIN = 0.5
+_ZOOM_MAX = 4.0
+_ORBIT_PITCH_LIMIT_DEG = 88.0
+
+
 class WorldView(QWidget):
     rendering_failed = pyqtSignal(str)
 
@@ -384,6 +417,12 @@ class WorldView(QWidget):
         self._ready = False
         self._failure_emitted = False
         self._failure_message = ""
+        # Right-drag orbits, the wheel zooms, a right double-click resets.
+        # Offsets on the chase camera, not a free camera: no panning by design.
+        self._orbit_yaw_deg = 0.0
+        self._orbit_pitch_deg = 0.0
+        self._orbit_zoom = 1.0
+        self._drag_from: QPointF | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -395,6 +434,9 @@ class WorldView(QWidget):
         qml_path = Path(__file__).with_name("qml") / "WorldScene.qml"
         self._quick.setSource(QUrl.fromLocalFile(str(qml_path)))
         layout.addWidget(self._quick)
+        # The QQuickWidget receives the mouse; the filter takes the right
+        # button and the wheel for the orbit and leaves everything else to QML.
+        self._quick.installEventFilter(self)
         self._on_status_changed(self._quick.status())
 
     @property
@@ -404,6 +446,71 @@ class WorldView(QWidget):
     @property
     def failure_message(self) -> str:
         return self._failure_message
+
+    def eventFilter(self, watched: QObject | None, event: QEvent | None) -> bool:
+        if watched is self._quick and event is not None:
+            if self._handle_view_event(event):
+                return True
+        return super().eventFilter(watched, event)
+
+    def _handle_view_event(self, event: QEvent) -> bool:
+        kind = event.type()
+        if kind == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+            notches = event.angleDelta().y() / 120.0
+            self._orbit_zoom = min(
+                max(
+                    self._orbit_zoom * (_ZOOM_PER_WHEEL_NOTCH ** notches),
+                    _ZOOM_MIN,
+                ),
+                _ZOOM_MAX,
+            )
+            self._push_orbit()
+            return True
+        if not isinstance(event, QMouseEvent):
+            # Swallow the context menu too: the right button is the orbit
+            # control here, so a menu popping up mid-drag would be noise.
+            return kind == QEvent.Type.ContextMenu
+        if event.button() == Qt.MouseButton.RightButton:
+            if kind == QEvent.Type.MouseButtonDblClick:
+                self._orbit_yaw_deg = 0.0
+                self._orbit_pitch_deg = 0.0
+                self._orbit_zoom = 1.0
+                self._drag_from = None
+                self._push_orbit()
+                return True
+            if kind == QEvent.Type.MouseButtonPress:
+                self._drag_from = event.position()
+                return True
+            if kind == QEvent.Type.MouseButtonRelease:
+                self._drag_from = None
+                return True
+        if (
+            kind == QEvent.Type.MouseMove
+            and self._drag_from is not None
+            and event.buttons() & Qt.MouseButton.RightButton
+        ):
+            delta = event.position() - self._drag_from
+            self._drag_from = event.position()
+            # Drag right orbits round the car's right; drag up climbs toward
+            # top-down. The absolute elevation clamp lives in apply_view_orbit;
+            # this one only stops the OFFSET winding up past it, which would
+            # put dead travel on the way back down.
+            self._orbit_yaw_deg += delta.x() * _ORBIT_DEG_PER_PX
+            self._orbit_pitch_deg = min(
+                max(
+                    self._orbit_pitch_deg - delta.y() * _ORBIT_DEG_PER_PX,
+                    -_ORBIT_PITCH_LIMIT_DEG,
+                ),
+                _ORBIT_PITCH_LIMIT_DEG,
+            )
+            self._push_orbit()
+            return True
+        return False
+
+    def _push_orbit(self) -> None:
+        self.bridge.set_view_orbit(
+            self._orbit_yaw_deg, self._orbit_pitch_deg, self._orbit_zoom
+        )
 
     @pyqtSlot(object)
     def set_frame(self, frame: WorldFrame) -> None:

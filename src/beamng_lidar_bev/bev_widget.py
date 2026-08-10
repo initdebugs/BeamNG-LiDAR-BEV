@@ -9,15 +9,18 @@ from PyQt6.QtGui import (
     QFont,
     QImage,
     QPainter,
+    QPainterPath,
     QPaintEvent,
     QPen,
     QPolygonF,
     QResizeEvent,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from .aeb import corridor_cross_section, predicted_corridor
 from .config import DISPLAY_RADIUS_M
+from .geometry import sensor_coverage
 from .models import BRAKING, STANDBY, AebState, BevFrame, DrivingPlan, VehicleGeometry
 from .planner import arc_polyline, path_polyline
 from .raster import rasterize_points
@@ -40,16 +43,42 @@ _AEB_ARMED_RGB = (178, 140, 255)
 # would simply be off-canvas.
 _RING_RADII_M = (25.0, 50.0, 75.0, 100.0)
 _AEB_BRAKING_RGB = (255, 96, 86)
+# One hue per unit for the coverage overlay, none of them doing another job in
+# this view: returns are grey, the obstacle set red, the ego and plan teal,
+# keep-right amber, the nav hint blue and the AEB corridor violet.
+_SENSOR_DEBUG_COLOURS = {
+    "front": "#ffb347",
+    "left": "#4d9fff",
+    "right": "#ff6fd8",
+    "rear": "#9bd356",
+    "roof": "#34d5d0",
+}
+# Wheel zoom bounds: 1.0 is the classic full plot, 8x closes to a 13 m radius
+# for reading kerb-height detail around the car.
+_ZOOM_MIN = 1.0
+_ZOOM_MAX = 8.0
+_ZOOM_PER_WHEEL_NOTCH = 1.25
 
 
-def bev_to_screen(rect: QRectF, right_m: float, forward_m: float) -> QPointF:
+def bev_to_screen(
+    rect: QRectF,
+    right_m: float,
+    forward_m: float,
+    radius_m: float = DISPLAY_RADIUS_M,
+) -> QPointF:
     """Map BEV (right, forward) metres onto the plot. +forward is up."""
     centre = rect.center()
-    scale = rect.width() / (2.0 * DISPLAY_RADIUS_M)
+    scale = rect.width() / (2.0 * radius_m)
     return QPointF(centre.x() + right_m * scale, centre.y() - forward_m * scale)
 
 
-def _aeb_to_screen(rect: QRectF, aeb: AebState, x: float, y: float) -> QPointF:
+def _aeb_to_screen(
+    rect: QRectF,
+    aeb: AebState,
+    x: float,
+    y: float,
+    radius_m: float = DISPLAY_RADIUS_M,
+) -> QPointF:
     """
     Map a point from one AEB system's own travel frame onto the plot.
 
@@ -58,9 +87,9 @@ def _aeb_to_screen(rect: QRectF, aeb: AebState, x: float, y: float) -> QPointF:
     what drawing it backwards takes. See aeb.mirrored.
     """
     return (
-        bev_to_screen(rect, -x, -y)
+        bev_to_screen(rect, -x, -y, radius_m)
         if aeb.rearward
-        else bev_to_screen(rect, x, y)
+        else bev_to_screen(rect, x, y, radius_m)
     )
 
 
@@ -75,6 +104,12 @@ class BevWidget(QWidget):
         self._frame: Optional[BevFrame] = None
         self._point_image: Optional[QImage] = None
         self._image_side = 0
+        self._zoom = 1.0
+        self._debug_sensors: set[str] = set()
+
+    @property
+    def _radius_m(self) -> float:
+        return DISPLAY_RADIUS_M / self._zoom
 
     def set_frame(self, frame: BevFrame) -> None:
         self._frame = frame
@@ -85,6 +120,30 @@ class BevWidget(QWidget):
         self._frame = None
         self._point_image = None
         self.update()
+
+    def set_sensor_debug(self, name: str, enabled: bool) -> None:
+        """Show or hide one LiDAR unit's coverage wedge. GUI-only."""
+        if enabled:
+            self._debug_sensors.add(name)
+        else:
+            self._debug_sensors.discard(name)
+        self.update()
+
+    def wheelEvent(self, event: QWheelEvent | None) -> None:
+        if event is None:
+            return
+        notches = event.angleDelta().y() / 120.0
+        zoom = min(
+            max(self._zoom * (_ZOOM_PER_WHEEL_NOTCH ** notches), _ZOOM_MIN),
+            _ZOOM_MAX,
+        )
+        if zoom != self._zoom:
+            self._zoom = zoom
+            # The points are rasterized at the display radius, so a zoom is a
+            # re-rasterize, not a blow-up of the cached image.
+            self._point_image = None
+            self.update()
+        event.accept()
 
     def resizeEvent(self, event: QResizeEvent | None) -> None:
         self._point_image = None
@@ -103,6 +162,10 @@ class BevWidget(QWidget):
             image = self._get_point_image(int(plot_rect.width()))
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
             painter.drawImage(plot_rect.topLeft(), image)
+            if self._debug_sensors:
+                self._draw_sensor_coverage(
+                    painter, plot_rect, self._frame.vehicle_geometry
+                )
             if self._frame.plan is not None:
                 self._draw_plan(painter, plot_rect, self._frame.plan)
             # After the plan, so the emergency corridor is never buried under
@@ -142,6 +205,7 @@ class BevWidget(QWidget):
             self._frame.obstacle_points,
             side,
             side,
+            radius_m=self._radius_m,
         )
         image = QImage(
             pixels.data,
@@ -156,7 +220,7 @@ class BevWidget(QWidget):
 
     def _draw_grid(self, painter: QPainter, rect: QRectF) -> None:
         centre = rect.center()
-        scale = rect.width() / (2.0 * DISPLAY_RADIUS_M)
+        scale = rect.width() / (2.0 * self._radius_m)
 
         painter.save()
         painter.setClipRect(rect)
@@ -195,6 +259,12 @@ class BevWidget(QWidget):
 
         painter.setPen(QPen(QColor("#2c3136"), 1.0))
         painter.drawRect(rect)
+        if self._zoom != 1.0:
+            painter.setPen(QColor("#8d959c"))
+            painter.drawText(
+                QPointF(rect.left() + 8.0, rect.bottom() - 8.0),
+                f"zoom x{self._zoom:.1f}  ·  {self._radius_m:.0f} m radius",
+            )
         painter.restore()
 
         direction_font = QFont(self.font())
@@ -222,7 +292,7 @@ class BevWidget(QWidget):
         self, painter: QPainter, rect: QRectF, geometry: VehicleGeometry
     ) -> None:
         centre = rect.center()
-        scale = rect.width() / (2.0 * DISPLAY_RADIUS_M)
+        scale = rect.width() / (2.0 * self._radius_m)
 
         def screen(right_m: float, forward_m: float) -> QPointF:
             return QPointF(
@@ -274,6 +344,89 @@ class BevWidget(QWidget):
             painter.drawEllipse(origin, 2.3, 2.3)
         painter.restore()
 
+    def _draw_sensor_coverage(
+        self, painter: QPainter, rect: QRectF, geometry: VehicleGeometry
+    ) -> None:
+        """
+        The wedge of ground each toggled unit sweeps, drawn from the same
+        SensorMount the sensor was built from -- so what is on screen is
+        provably the aperture that was requested, not a redrawing of it.
+
+        The roof unit is drawn as its ground annulus rather than its slant
+        range, because every ray it has points below the horizon; the annulus
+        is the road it was fitted to (see sensor_coverage).
+        """
+        scale = rect.width() / (2.0 * self._radius_m)
+        painter.save()
+        painter.setClipRect(rect)
+        label_font = QFont(self.font())
+        label_font.setPointSize(8)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        for name, mount in geometry.mounts.items():
+            if name not in self._debug_sensors:
+                continue
+            coverage = sensor_coverage(mount)
+            origin = bev_to_screen(
+                rect, coverage.right_m, coverage.forward_m, self._radius_m
+            )
+            colour = QColor(_SENSOR_DEBUG_COLOURS.get(name, "#e8ecef"))
+            start_deg = coverage.heading_deg - coverage.fov_deg * 0.5
+            outer_px = coverage.far_m * scale
+            outer_rect = QRectF(
+                origin.x() - outer_px,
+                origin.y() - outer_px,
+                outer_px * 2.0,
+                outer_px * 2.0,
+            )
+            path = QPainterPath()
+            if coverage.near_m <= 0.0:
+                path.moveTo(origin)
+                path.arcTo(outer_rect, start_deg, coverage.fov_deg)
+            else:
+                inner_px = coverage.near_m * scale
+                inner_rect = QRectF(
+                    origin.x() - inner_px,
+                    origin.y() - inner_px,
+                    inner_px * 2.0,
+                    inner_px * 2.0,
+                )
+                path.arcMoveTo(outer_rect, start_deg)
+                path.arcTo(outer_rect, start_deg, coverage.fov_deg)
+                path.arcTo(
+                    inner_rect, start_deg + coverage.fov_deg, -coverage.fov_deg
+                )
+            path.closeSubpath()
+
+            fill = QColor(colour)
+            fill.setAlpha(26)
+            edge = QColor(colour)
+            edge.setAlpha(160)
+            painter.setPen(QPen(edge, 1.2, Qt.PenStyle.DashLine))
+            painter.setBrush(fill)
+            painter.drawPath(path)
+
+            reach = (
+                f"{coverage.near_m:.0f}–{coverage.far_m:.0f} m"
+                if coverage.near_m > 0.0
+                else f"{coverage.far_m:.0f} m"
+            )
+            label_radius_m = min(coverage.far_m, self._radius_m) * 0.55
+            mid_rad = math.radians(coverage.heading_deg)
+            anchor = bev_to_screen(
+                rect,
+                coverage.right_m + math.cos(mid_rad) * label_radius_m,
+                coverage.forward_m + math.sin(mid_rad) * label_radius_m,
+                self._radius_m,
+            )
+            painter.setPen(colour)
+            painter.drawText(
+                QRectF(anchor.x() - 70.0, anchor.y() - 9.0, 140.0, 18.0),
+                Qt.AlignmentFlag.AlignCenter,
+                f"{name.upper()}  {reach} · {coverage.fov_deg:.0f}°",
+            )
+        painter.restore()
+
     def _draw_plan(
         self, painter: QPainter, rect: QRectF, plan: DrivingPlan
     ) -> None:
@@ -287,7 +440,10 @@ class BevWidget(QWidget):
         def polyline(curvature: float, length: float) -> QPolygonF:
             points = arc_polyline(curvature, length, samples=28)
             return QPolygonF(
-                [bev_to_screen(rect, float(x), float(y)) for x, y in points]
+                [
+                    bev_to_screen(rect, float(x), float(y), self._radius_m)
+                    for x, y in points
+                ]
             )
 
         # The whole considered fan, so a bad decision is visibly a bad decision
@@ -303,7 +459,7 @@ class BevWidget(QWidget):
 
         if arc.keep_right_target_m is not None:
             target = bev_to_screen(
-                rect, arc.keep_right_target_m, arc.lookahead_m
+                rect, arc.keep_right_target_m, arc.lookahead_m, self._radius_m
             )
             painter.setPen(QPen(QColor(255, 211, 106, 150), 1.0))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -320,7 +476,10 @@ class BevWidget(QWidget):
             samples=40,
         )
         chosen = QPolygonF(
-            [bev_to_screen(rect, float(x), float(y)) for x, y in chosen_points]
+            [
+                bev_to_screen(rect, float(x), float(y), self._radius_m)
+                for x, y in chosen_points
+            ]
         )
         painter.setPen(QPen(accent, 2.2))
         painter.drawPolyline(chosen)
@@ -333,16 +492,17 @@ class BevWidget(QWidget):
             self._draw_nav_hint(painter, rect, arc.nav_heading_rad)
         painter.restore()
 
-    @staticmethod
     def _draw_nav_hint(
-        painter: QPainter, rect: QRectF, heading_rad: float
+        self, painter: QPainter, rect: QRectF, heading_rad: float
     ) -> None:
         """The turn the in-game destination asks for, drawn as a bearing spoke."""
-        reach = DISPLAY_RADIUS_M * 0.82
+        reach = self._radius_m * 0.82
         right = -math.sin(heading_rad) * reach
         forward = math.cos(heading_rad) * reach
-        tip = bev_to_screen(rect, right, forward)
-        base = bev_to_screen(rect, right * 0.86, forward * 0.86)
+        tip = bev_to_screen(rect, right, forward, self._radius_m)
+        base = bev_to_screen(
+            rect, right * 0.86, forward * 0.86, self._radius_m
+        )
 
         painter.setPen(QPen(QColor(116, 191, 255, 190), 2.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -372,7 +532,7 @@ class BevWidget(QWidget):
         def polygon(length_m: float) -> QPolygonF:
             return QPolygonF(
                 [
-                    _aeb_to_screen(rect, aeb, float(x), float(y))
+                    _aeb_to_screen(rect, aeb, float(x), float(y), self._radius_m)
                     for x, y in predicted_corridor(
                         aeb.curvature, length_m, aeb.corridor_half_width_m
                     )
@@ -398,7 +558,7 @@ class BevWidget(QWidget):
         painter.drawPolyline(
             QPolygonF(
                 [
-                    _aeb_to_screen(rect, aeb, float(x), float(y))
+                    _aeb_to_screen(rect, aeb, float(x), float(y), self._radius_m)
                     for x, y in arc_polyline(aeb.curvature, aeb.horizon_m, 28)
                 ]
             )
@@ -440,8 +600,8 @@ class BevWidget(QWidget):
             )
         painter.restore()
 
-    @staticmethod
     def _draw_chord(
+        self,
         painter: QPainter,
         rect: QRectF,
         aeb: AebState,
@@ -455,8 +615,12 @@ class BevWidget(QWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(
-            _aeb_to_screen(rect, aeb, float(ends[0][0]), float(ends[0][1])),
-            _aeb_to_screen(rect, aeb, float(ends[1][0]), float(ends[1][1])),
+            _aeb_to_screen(
+                rect, aeb, float(ends[0][0]), float(ends[0][1]), self._radius_m
+            ),
+            _aeb_to_screen(
+                rect, aeb, float(ends[1][0]), float(ends[1][1]), self._radius_m
+            ),
         )
 
     def _draw_aeb_label(

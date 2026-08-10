@@ -495,6 +495,16 @@ Curvature for the corner lean comes from the plan when self-driving, and otherwi
 when the camera most needs it. Verified on the real D3D11 backend by rendering a synthetic drive
 through `WorldView.grab()`, per the pixel-questions-get-measured rule below.
 
+**The mouse orbit is an OFFSET on the chase pose, not a second camera.** Right-drag rotates,
+the wheel zooms, a right double-click resets, and there is deliberately no panning. `WorldView`
+holds the offsets and `world_scene.apply_view_orbit` (pure, pinned by `test_view_controls.py`)
+lays them over whatever pose the damped chase camera produced — so the view keeps following the
+car under a user orbit, the one-framing rule is untouched (nothing moves without the user's
+hand), and identity inputs return the pose bit-for-bit, leaving the default view byte-identical.
+`SceneBridge` keeps the raw chase pose beside the displayed one so a mouse move re-aims between
+frames, and the elevation clamp (3°–85°) stops the orbit at the same euler degeneracy
+`WORLD_CAM_PITCH_LIMIT_DEG` guards.
+
 ### WORLD renderer and RAW BEV toggle
 
 `WorldView` embeds `qml/WorldScene.qml` in a `QQuickWidget`. `SceneBridge` owns four
@@ -528,6 +538,15 @@ same time. The header toggle is GUI-only: it does not touch sensor or control
 state. WORLD hides the diagnostic metric band and point legend; RAW BEV
 restores them. A QML load error disables WORLD for the session, selects RAW
 BEV, and logs the exact error.
+
+The header also carries five per-unit coverage toggles (RAW BEV only, hidden in WORLD so they
+never promise something that view won't draw). Each draws its unit's wedge from
+`geometry.sensor_coverage` over the same `SensorMount` the sensor was built from, so the overlay
+is provably the requested aperture. The roof unit draws as its ground annulus
+(`LIDAR_ROOF_NEAR_M`–`FAR_M`) rather than its slant range, because every one of its rays points
+below the horizon and the annulus is the road it was fitted to. The BEV also wheel-zooms
+(1x–8x): the zoom re-rasterizes at the new radius rather than scaling the cached image, and
+every overlay takes the same `radius_m` so they cannot drift apart.
 
 **Two luminance steps, then hue — and a light air is what forces that.** Air is `#d7dadc`
 (relative luminance 0.698), so air-to-black is 14.96:1 in *total* and supports only two steps at
@@ -779,11 +798,51 @@ as `r²`, so `WORLD_SURFACE_RADIUS_M` is the constant to move in either directio
 starts logging. Note this runs on `SceneWorker`'s thread, so an overrun costs WORLD frames rather
 than control latency.
 
-**Corner averaging here uses `bincount` per channel and NOT the sort-once-and-`reduceat` idiom the
-two accumulators are built on.** That was tried and is *slower* — 43.4 ms against 37.4 on a 40k-cell
-disc — because reducing five channels together means materialising a `(4N, 5)` repeat and gathering
-it into sort order, and those two copies cost more than the sweeps they save. The accumulators win
-with it because there the sort is the thing being avoided; here `np.unique` has to sort anyway.
+**Corner averaging is a 2×2 BOX SUM over a dense lattice, and needs no sort at all.** Both sorted
+shapes were tried first and both lose: `reduceat` over a `(4N, 5)` repeat gathered into sort order
+(43.4 ms against 37.4 on a 40k-cell disc — the accumulators win with that idiom because there the
+sort is what is being avoided), and `bincount` per channel over `np.unique`d corner keys. The
+insight that beats both is that the answer is knowable by *arithmetic*: the cells occupy a dense
+rectangle of lattice, so scattering them into it and adding four shifted slices IS the grouping.
+Measured on 86k ground cells, **20.8 ms → 8.5**. Three things carry it:
+
+- **The cells must be unique in `(x, y)`**, or a plain scatter keeps whichever wrote last instead of
+  averaging. That is exactly the stacked case the layer field exists for — a bridge deck over a road
+  — so `_corner_means` falls back to `_keyed_corner_means`, which carries the layer and separates
+  them. `np.count_nonzero` on the occupancy plane counts the distinct `(x, y)` for free, since a
+  duplicate overwrites rather than accumulates, so the precondition is *checked* rather than assumed.
+- **The box filter also HEALS a defect the keyed path has.** Putting the layer in the corner identity
+  means two adjacent cells either side of a `_GROUND_LAYER_M` (0.75 m) contour got two coincident
+  corners rather than one, so the surface was topologically torn along every contour on any slope —
+  measured on a 5% ramp, 123 duplicated corners disagreeing by 15 mm. Small enough never to have been
+  noticed, but a seam is precisely what sharing corners exists to make impossible.
+- **`float32` end to end.** The vertex buffer is float32 anyway and a world Z of a few thousand
+  metres still resolves to well under a tenth of a millimetre, so promoting to float64 in between
+  just doubles the traffic: 15.8 ms against 8.5 for the same box filter. The same reasoning runs
+  back through `bridge_gaps` (which now preserves float32 rather than promoting) and forward through
+  `depth_tint` (4.1 ms → 2.8, worst-case channel error 1.2e-7 against an 8-bit output).
+
+Three smaller measured wins sit alongside it, all output-identical:
+
+- **`_scan_order` replaces `np.lexsort`** in `bridge_gaps` and `merge_cell_runs`. A lexsort is one
+  stable argsort per key — three passes — where packing the three fields into a single int64 in the
+  same precedence needs one: 2.98 ms → 2.11 on 86k cells.
+- **Corner keys are derived by ADDING to the packed cell key** rather than building a `(N, 4, 3)`
+  key block and packing it: `pack_cell_keys` puts x in the high bits and y next, so the corner at
+  `(dx, dy)` is the cell's key plus two constants. 9.17 ms → 0.83.
+- **`_newest` uses `argpartition`, not `argsort`.** Once a store sits at its cap it is culled on
+  every tick, so this ran a full sort of the whole store every frame to find the top-K; the order of
+  the survivors is never read, because both callers re-sort the indices they select. 5.0 ms → 1.2 on
+  90k voxels.
+
+Together these took the steady-state build from **~100 ms to ~60 ms** on an accumulated street drive
+(67k-point cloud, 15k road cells, the voxel store at its 90k cap, 88k ground vertices). The
+remaining cost is roughly half `_ground_mesh` (bridging 10 ms, the box filter 8.5, the ego-relative
+tail 5) and half the voxel store (`_update_boundary_columns` 16 ms, expiry 6), and the largest
+untaken lever is that everything before the ego-relative tail is **world-anchored** — it depends on
+the stores, not on the pose — so it could be refreshed at a lower rate than the view tracks at.
+That trades freshness of newly-observed ground for frame rate, which is a judgement call rather than
+an optimisation.
 
 Qt's `offscreen` platform plugin is not QRhi/3D capable, so an offscreen smoke
 can validate QML loading, property binding, lifecycle and fallback but cannot

@@ -1358,6 +1358,83 @@ def test_each_material_paints_its_own_ground(
     )
 
 
+# --- How the shared corners are found ----------------------------------------
+#
+# The ground surface is meshed by averaging each cell into the four lattice
+# corners it touches. That grouping is done with a 2x2 box sum over a dense
+# lattice, which needs no sort -- but only where the cells are unique in (x, y).
+# Where two ground surfaces stack in one column it falls back to the keyed path,
+# which carries the layer and so keeps them apart.
+
+
+def _corner_case(
+    rows: int = 40, columns: int = 30
+) -> tuple[np.ndarray, np.ndarray]:
+    """A patch of cells with a distinct value in every channel of every cell."""
+    x, y = np.meshgrid(np.arange(columns), np.arange(rows), indexing="ij")
+    cells = np.column_stack(
+        (x.ravel(), y.ravel(), np.zeros(x.size, dtype=np.int64))
+    ).astype(np.int32)
+    ramp = np.arange(len(cells), dtype=np.float64)
+    values = np.column_stack([ramp * (channel + 1) for channel in range(5)])
+    return cells, values
+
+
+def test_the_box_filter_and_the_keyed_corner_pass_agree() -> None:
+    """
+    The fast path has to be a pure optimisation, so it is measured against the
+    fallback it replaces rather than against a hand-computed expectation.
+    """
+    cells, values = _corner_case()
+
+    lattice, inverse, means = world_scene._corner_means(cells, values)
+    keyed_lattice, keyed_inverse, keyed_means = world_scene._keyed_corner_means(
+        cells, values
+    )
+
+    np.testing.assert_array_equal(lattice, keyed_lattice)
+    np.testing.assert_array_equal(inverse, keyed_inverse)
+    np.testing.assert_allclose(means, keyed_means, rtol=1e-6)
+
+
+def test_every_cell_reaches_four_corners_and_shares_them() -> None:
+    """
+    The property the whole surface rests on: a corner holds ONE value, so two
+    cells meeting there cannot disagree about where the ground is.
+    """
+    cells, values = _corner_case(rows=4, columns=3)
+
+    lattice, inverse, means = world_scene._corner_means(cells, values)
+
+    assert len(inverse) == 4 * len(cells)
+    assert len(lattice) == len(means) == 4 * 5  # (3 + 1) x (4 + 1) lattice
+    # The interior corner of a 2x2 block of cells is the mean of all four.
+    quads = inverse.reshape(-1, 4)
+    shared = set(quads[0]) & set(quads[len(cells) // 3 + 1])
+    assert shared, "adjacent cells share no corner"
+
+
+def test_stacked_ground_keeps_its_two_surfaces_apart() -> None:
+    """
+    A bridge deck over a road is the case the layer field in the corner key
+    exists for, and the only one the box filter cannot answer -- a plain scatter
+    would keep whichever of the two wrote last. It must fall back, not average
+    the deck into the road.
+    """
+    cells, values = _corner_case(rows=6, columns=6)
+    deck = cells.copy()
+    deck[:, 2] = 8  # eight _GROUND_LAYER_M up, i.e. a separate surface
+    stacked = np.concatenate((cells, deck))
+    heights = np.concatenate(
+        (np.zeros((len(cells), 5)), np.full((len(cells), 5), 6.0))
+    )
+
+    lattice, inverse, means = world_scene._corner_means(stacked, heights)
+
+    assert len(lattice) == 2 * 7 * 7, "the two surfaces were merged into one"
+    assert set(np.unique(means[:, 0])) == {0.0, 6.0}, "a deck averaged into a road"
+
+
 def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
     """
     The road is a ribbon and the ground is a DISC, so surfacing everything is

@@ -244,14 +244,20 @@ def depth_mix(distance_m: np.ndarray) -> np.ndarray:
     gradient right after the cutoff and then asymptotes, so the band where two
     objects need telling apart keeps its separation and the rim still fades.
     """
-    distance = np.asarray(distance_m, dtype=np.float64)
+    distance = np.asarray(distance_m)
+    if distance.dtype != np.float32:
+        distance = distance.astype(np.float64, copy=False)
     beyond = np.maximum(distance - WORLD_DEPTH_NEAR_M, 0.0)
     return WORLD_DEPTH_HAZE * (
         1.0 - np.exp(-beyond / max(WORLD_DEPTH_SCALE_M, 1e-6))
     )
 
 
-def depth_tint(colour_linear: np.ndarray, vertices: np.ndarray) -> np.ndarray:
+def depth_tint(
+    colour_linear: np.ndarray,
+    vertices: np.ndarray,
+    edge_radius_m: np.ndarray | float | None = None,
+) -> np.ndarray:
     """
     Bake aerial perspective into per-vertex RGBA for a render-space mesh.
 
@@ -262,37 +268,46 @@ def depth_tint(colour_linear: np.ndarray, vertices: np.ndarray) -> np.ndarray:
     This is a BAKED fade rather than the SceneEnvironment Fog the QML used to
     declare, because that fog was measured to do nothing at all: it is a no-op
     on NoLighting materials, and every large surface in this scene is one.
+
+    `edge_radius_m` additionally dissolves the outer `WORLD_EDGE_FADE_M` of the
+    mesh into the air, per vertex or for the whole mesh. It is the same blend
+    toward the same colour over the same distance, so it is folded in here
+    rather than run as a second pass: on the ground surface that was two
+    `hypot` sweeps and two float64 round-trips over 87k vertices where one
+    does, 6.5 ms against 3.5. The ground stops at its own radius while
+    everything else runs on to WORLD_RADIUS_M, and without the dissolve the
+    surface ends on a hard rim that reads as a cliff edge -- a drawn boundary
+    where there is only the end of what was measured.
     """
-    points = np.asarray(vertices, dtype=np.float64)
+    # float32 end to end where the caller already supplies it. Every input here
+    # arrives as float32 (render vertices) and the result is a float32 vertex
+    # buffer, so promoting to float64 in between doubled the traffic through
+    # `exp` and three blends over 87k ground corners for a colour that has 8
+    # bits of dynamic range: measured 5.3 ms against 2.6.
+    points = np.asarray(vertices)
+    if points.dtype != np.float32:
+        points = points.astype(np.float64, copy=False)
     if not len(points):
         return _EMPTY_COLOURS.copy()
-    colour = np.asarray(colour_linear, dtype=np.float64)
+    colour = np.asarray(colour_linear, dtype=points.dtype)
     if colour.ndim == 1:
         colour = np.broadcast_to(colour, (len(points), 3))
 
     distance = np.hypot(points[:, 0], points[:, 2])
     mix = depth_mix(distance)[:, None]
-    blended = colour + mix * (_AIR_LINEAR - colour)
-    return np.ascontiguousarray(
-        np.column_stack((blended, np.ones(len(points)))), dtype=np.float32
-    )
-
-
-def _fade_to_air(
-    colours: np.ndarray, vertices: np.ndarray, radius_m: float
-) -> np.ndarray:
-    """Blend the outer `WORLD_EDGE_FADE_M` of a mesh into the air colour."""
-    if not len(colours) or WORLD_EDGE_FADE_M <= 0.0:
-        return colours
-    distance = np.hypot(
-        vertices[:, 0].astype(np.float64), vertices[:, 2].astype(np.float64)
-    )
-    edge = np.clip(
-        (distance - (radius_m - WORLD_EDGE_FADE_M)) / WORLD_EDGE_FADE_M, 0.0, 1.0
-    )[:, None]
-    faded = colours.astype(np.float64)
-    faded[:, :3] += edge * (_AIR_LINEAR - faded[:, :3])
-    return np.ascontiguousarray(faded, dtype=np.float32)
+    blended = colour + mix * (_AIR_LINEAR.astype(points.dtype) - colour)
+    if edge_radius_m is not None and WORLD_EDGE_FADE_M > 0.0:
+        radius = np.asarray(edge_radius_m, dtype=points.dtype)
+        edge = np.clip(
+            (distance - (radius - WORLD_EDGE_FADE_M)) / WORLD_EDGE_FADE_M, 0.0, 1.0
+        )[:, None]
+        blended += edge * (_AIR_LINEAR.astype(points.dtype) - blended)
+    # Written straight into the output rather than column_stacked and then made
+    # contiguous, which allocated the whole (N, 4) block twice.
+    rgba = np.empty((len(points), 4), dtype=np.float32)
+    rgba[:, :3] = blended
+    rgba[:, 3] = 1.0
+    return rgba
 
 
 def orientation_step() -> float:
@@ -843,6 +858,29 @@ def pack_cell_keys(keys: np.ndarray) -> np.ndarray:
     return packed
 
 
+def _scan_order(keys: np.ndarray, axis: int) -> np.ndarray:
+    """
+    Order `(N, 3)` cell keys by layer, then the axis across, then `axis` along.
+
+    Identical to `np.lexsort((keys[:, axis], keys[:, other], keys[:, 2]))` and
+    measurably cheaper: a lexsort is one stable argsort per key, so three passes
+    over the array, where packing the three fields into a single int64 in the
+    same precedence needs one. Measured on 86k ground cells, 2.98 ms -> 2.11.
+    The 21-bit fields are `pack_cell_keys`'s, only permuted, so the same
+    +/- 524 km of cell index is covered.
+    """
+    other = 1 - axis
+    return np.argsort(
+        (
+            (keys[:, 2].astype(np.int64) + _CELL_FIELD_OFFSET)
+            << (2 * _CELL_FIELD_BITS)
+        )
+        | ((keys[:, other].astype(np.int64) + _CELL_FIELD_OFFSET) << _CELL_FIELD_BITS)
+        | (keys[:, axis].astype(np.int64) + _CELL_FIELD_OFFSET),
+        kind="stable",
+    )
+
+
 def bridge_gaps(
     keys: np.ndarray, values: np.ndarray, axis: int, max_gap: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -866,14 +904,19 @@ def bridge_gaps(
     right there -- a return either side means the ray reached both, so the
     surface between them was there to be hit.
     """
-    values = np.asarray(values, dtype=np.float64)
+    # float32 is preserved rather than promoted: every value gathered here is
+    # gathered again by the caller, and the ground surface pushes five channels
+    # over 86k cells through two passes of it.
+    values = np.asarray(values)
+    if values.dtype != np.float32:
+        values = values.astype(np.float64, copy=False)
     if values.ndim == 1:
         values = values[:, None]
     if max_gap < 1 or len(keys) < 2:
         return keys, values
 
     other = 1 - axis
-    order = np.lexsort((keys[:, axis], keys[:, other], keys[:, 2]))
+    order = _scan_order(keys, axis)
     sorted_keys = keys[order]
     step = np.diff(sorted_keys[:, axis])
     same_line = (np.diff(sorted_keys[:, other]) == 0) & (
@@ -906,6 +949,144 @@ def bridge_gaps(
     return np.concatenate((keys, filled)), np.concatenate((values, blended))
 
 
+def _newest(stamps: np.ndarray, keep: int) -> np.ndarray:
+    """
+    Indices of the `keep` largest stamps, in no particular order.
+
+    `argpartition` rather than `argsort` because the ORDER of the survivors is
+    never read -- both callers re-sort the indices they select. Once a store
+    sits at its cap it is culled on every single tick, so this runs every frame
+    over the whole store: measured on 90k voxels, 5.0 ms of sorting became 1.2.
+    Ties at the cut are resolved arbitrarily either way.
+    """
+    return np.argpartition(stamps, len(stamps) - keep)[-keep:]
+
+
+_CORNER_OFFSETS = ((0, 0), (1, 0), (1, 1), (0, 1))
+
+
+def _corner_means(
+    cells: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Average each cell's values into the four lattice corners it touches.
+
+    `cells` is `(N, 3)` integer `(x, y, layer)` and `values` `(N, V)`. Returns
+    the corner lattice `(M, 2)`, the `(4N,)` corner index of each cell's four
+    corners in `_CORNER_OFFSETS` order, and the `(M, V)` means.
+
+    **A corner is a 2x2 BOX SUM over the cell lattice, which needs no sort at
+    all.** The obvious shape -- build 4N corner keys, `np.unique` them, and
+    `bincount` each channel into the groups -- spends its whole budget proving
+    which corner keys coincide, and on a ground surface that is knowable by
+    arithmetic: the cells occupy a dense rectangle of lattice, so scattering
+    them into it and adding four shifted slices IS the grouping. Measured on
+    86k ground cells, 20.8 ms -> 8.5.
+
+    Two things make the scatter legal, and both are checked rather than assumed:
+
+    - **The cells must be unique in (x, y)**, or the scatter silently keeps
+      whichever cell wrote last instead of averaging them. That is exactly the
+      stacked case the layer field exists for -- a bridge deck over the road --
+      so where it happens this falls back to the keyed path, which separates
+      them. `np.count_nonzero` on the occupancy plane counts the distinct
+      (x, y) for free, since a duplicate overwrites rather than accumulates.
+    - **The lattice must be dense enough to be worth materialising.** Both
+      stores are culled to a disc every tick, so in practice it is about twice
+      the cell count; a pathological spread falls back rather than allocating.
+
+    Where it applies, the box filter also HEALS a small defect: the keyed path
+    puts the layer in the corner identity, so two adjacent cells either side of
+    a `_GROUND_LAYER_M` contour got two coincident corners instead of one and
+    the surface was topologically torn along every contour. Measured on a 5%
+    ramp that was 123 duplicated corners disagreeing by 15 mm -- small enough
+    never to have been noticed, but it is a seam where the whole point of
+    sharing corners is that there cannot be one. Stacked surfaces still split,
+    because that is the case the fallback covers.
+    """
+    x = cells[:, 0].astype(np.intp)
+    y = cells[:, 1].astype(np.intp)
+    x0, y0 = int(x.min()), int(y.min())
+    nx = int(x.max()) - x0 + 1
+    ny = int(y.max()) - y0 + 1
+    channels = values.shape[1]
+
+    if (nx + 2) * (ny + 2) <= 8 * len(cells) + 65_536:
+        ix = x - x0
+        iy = y - y0
+        # float32 throughout: the vertex buffer is float32 anyway, and halving
+        # the traffic through a grid this size is most of the win (15.8 -> 8.5).
+        # Padded by one cell at the low edge so the box below spans the full
+        # (nx + 1, ny + 1) corner lattice.
+        grid = np.zeros((nx + 2, ny + 2, channels + 1), dtype=np.float32)
+        grid[ix + 1, iy + 1, :channels] = values
+        grid[ix + 1, iy + 1, channels] = 1.0
+        if np.count_nonzero(grid[:, :, channels]) == len(cells):
+            box = grid[:-1, :-1] + grid[1:, :-1]
+            box += grid[:-1, 1:]
+            box += grid[1:, 1:]
+            counts = box[:, :, channels].reshape(-1)
+            occupied = np.flatnonzero(counts)
+            means = (
+                box.reshape(-1, channels + 1)[occupied, :channels]
+                / counts[occupied, None]
+            )
+            lookup = np.empty(counts.size, dtype=np.int64)
+            lookup[occupied] = np.arange(len(occupied))
+            lookup = lookup.reshape(nx + 1, ny + 1)
+            corners = np.empty((len(cells), 4), dtype=np.int64)
+            for slot, (dx, dy) in enumerate(_CORNER_OFFSETS):
+                corners[:, slot] = lookup[ix + dx, iy + dy]
+            lattice = np.column_stack(
+                (occupied // (ny + 1) + x0, occupied % (ny + 1) + y0)
+            )
+            return lattice, corners.reshape(-1), means
+
+    return _keyed_corner_means(cells, values)
+
+
+def _keyed_corner_means(
+    cells: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    `_corner_means` by packed key: the general answer, and its own reference.
+
+    The corner identity carries the layer here, so two ground surfaces stacked
+    in one column stay separate -- a bridge deck does not average into the road
+    beneath it. Kept as its own function so the box filter can be tested
+    against it on the same cells rather than against a hand-computed
+    expectation.
+    """
+    channels = values.shape[1]
+    step_x = np.int64(1) << (2 * _CELL_FIELD_BITS)
+    step_y = np.int64(1) << _CELL_FIELD_BITS
+    base = pack_cell_keys(cells)
+    keys = np.empty((len(cells), 4), dtype=np.int64)
+    keys[:, 0] = base
+    keys[:, 1] = base + step_x
+    keys[:, 2] = base + step_x + step_y
+    keys[:, 3] = base + step_y
+
+    unique, first, inverse = np.unique(
+        keys.reshape(-1), return_index=True, return_inverse=True
+    )
+    counts = np.bincount(inverse, minlength=len(unique))
+    means = np.empty((len(unique), channels))
+    for channel in range(channels):
+        means[:, channel] = (
+            np.bincount(
+                inverse,
+                weights=np.repeat(values[:, channel], 4),
+                minlength=len(unique),
+            )
+            / counts
+        )
+    offsets = np.asarray(_CORNER_OFFSETS, dtype=np.int64)
+    corner_cell, corner_slot = np.divmod(first, 4)
+    lattice = cells[corner_cell][:, :2] + offsets[corner_slot]
+    return lattice, inverse, means
+
+
 def _group_starts(sorted_keys: np.ndarray) -> np.ndarray:
     """Index of the first element of each run of equal values."""
     if not len(sorted_keys):
@@ -934,7 +1115,7 @@ def _run_count(keys: np.ndarray, axis: int) -> int:
     lexsort and one comparison pass, no allocation of the runs themselves.
     """
     other = 1 - axis
-    order = np.lexsort((keys[:, axis], keys[:, other], keys[:, 2]))
+    order = _scan_order(keys, axis)
     sorted_keys = keys[order]
     breaks = (
         (sorted_keys[1:, 2] != sorted_keys[:-1, 2])
@@ -999,7 +1180,7 @@ def merge_cell_runs(
         )
         return flipped[:, (2, 3, 0, 1)], extents
 
-    order = np.lexsort((keys[:, 0], keys[:, 1], keys[:, 2]))
+    order = _scan_order(keys, 0)
     sorted_keys = keys[order]
     # A run breaks wherever the layer or row changes, or X stops being
     # contiguous. Everything up to here is one vectorised pass.
@@ -1117,6 +1298,73 @@ def damp(current: float, target: float, dt: float, tau: float) -> float:
         return target
     alpha = 1.0 - math.exp(-dt / tau)
     return current + (target - current) * alpha
+
+
+# User-orbit guards. The elevation clamp stops the view reaching the euler
+# degeneracy at straight-down (the same cliff WORLD_CAM_PITCH_LIMIT_DEG guards)
+# and from diving under the road; the range clamp keeps the camera inside the
+# QML clipFar with the full 150 m scene still in front of it.
+_ORBIT_ELEVATION_MIN_DEG = 3.0
+_ORBIT_ELEVATION_MAX_DEG = 85.0
+_ORBIT_RANGE_MIN_M = 6.0
+_ORBIT_RANGE_MAX_M = 240.0
+
+
+def apply_view_orbit(
+    position: tuple[float, float, float],
+    euler: tuple[float, float, float],
+    yaw_offset_deg: float,
+    pitch_offset_deg: float,
+    zoom: float,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """
+    Lay the user's mouse orbit over the chase camera's pose.
+
+    This is deliberately an OFFSET on the damped chase pose rather than a second
+    camera mode: the chase target math is untouched, the view keeps following
+    the car, and releasing the mouse leaves the offset standing until it is
+    reset. That keeps the one-framing rule intact -- nothing here can switch
+    framings on its own, because none of it moves without the user's hand.
+
+    The pose is treated as an orbit about the ego (which sits at the render
+    origin): yaw and pitch rotate the position on its sphere and turn the euler
+    angles with it, zoom divides the radius, so the camera keeps pointing at
+    the same place throughout. Identity inputs return the pose bit-for-bit.
+    """
+    if yaw_offset_deg == 0.0 and pitch_offset_deg == 0.0 and zoom == 1.0:
+        return position, euler
+    x, y, z = position
+    pitch_deg, yaw_deg, roll_deg = euler
+    horizontal = math.hypot(x, z)
+    radius = math.hypot(horizontal, y)
+    if radius < 1e-6:
+        return position, euler
+
+    azimuth = math.atan2(x, z) + math.radians(yaw_offset_deg)
+    elevation = math.atan2(y, horizontal)
+    clamped = min(
+        max(
+            elevation + math.radians(pitch_offset_deg),
+            math.radians(_ORBIT_ELEVATION_MIN_DEG),
+        ),
+        math.radians(_ORBIT_ELEVATION_MAX_DEG),
+    )
+    # The euler pitch moves by what the elevation actually moved, so hitting a
+    # clamp tilts the aim exactly as far as it tilted the position.
+    applied_pitch_deg = math.degrees(clamped - elevation)
+    radius = min(
+        max(radius / max(zoom, 1e-6), _ORBIT_RANGE_MIN_M), _ORBIT_RANGE_MAX_M
+    )
+
+    horizontal = radius * math.cos(clamped)
+    return (
+        (
+            horizontal * math.sin(azimuth),
+            radius * math.sin(clamped),
+            horizontal * math.cos(azimuth),
+        ),
+        (pitch_deg - applied_pitch_deg, yaw_deg + yaw_offset_deg, roll_deg),
+    )
 
 
 def camera_target(snapshot: PerceptionSnapshot, alerting: bool) -> CameraPose:
@@ -1437,7 +1685,7 @@ class WorldSceneAssembler:
         indices = np.flatnonzero(keep)
         if len(indices) > WORLD_MAX_ROAD_CELLS:
             # Drop what was seen longest ago, as the voxel store does.
-            freshest = np.argsort(self._road_seen[indices])[-WORLD_MAX_ROAD_CELLS:]
+            freshest = _newest(self._road_seen[indices], WORLD_MAX_ROAD_CELLS)
             indices = np.sort(indices[freshest])
         self._road_keys = self._road_keys[indices]
         self._road_height = self._road_height[indices]
@@ -1576,73 +1824,42 @@ class WorldSceneAssembler:
         # coarse grid it replaced. Bridging is applied to the MESH, never to the
         # store, so an inference is never accumulated as though it were an
         # observation.
-        values = np.column_stack((heights, colour, limits))
+        # float32 from here to the vertex buffer: a height is a world Z of at
+        # most a few thousand metres, so this resolves it to well under a
+        # tenth of a millimetre, and the buffer it ends up in is float32
+        # regardless. Everything downstream gathers these five channels at
+        # least twice more.
+        values = np.column_stack((heights, colour, limits)).astype(
+            np.float32, copy=False
+        )
         for axis in (0, 1):
             cells, values = bridge_gaps(
                 cells, values, axis, WORLD_ROAD_BRIDGE_CELLS
             )
-        heights, colour, limits = values[:, 0], values[:, 1:4], values[:, 4]
-
-        # Each cell contributes its height to its own four lattice corners; a
-        # corner's height is the mean of the cells touching it. The layer stays
-        # in the corner key so a bridge deck and the road under it keep separate
-        # surfaces instead of averaging into one ramp.
-        offsets_xy = np.asarray(((0, 0), (1, 0), (1, 1), (0, 1)), dtype=np.int32)
-        corner_keys = np.empty((len(cells), 4, 3), dtype=np.int32)
-        corner_keys[:, :, :2] = cells[:, None, :2] + offsets_xy[None, :, :]
-        corner_keys[:, :, 2] = cells[:, None, 2]
-        flat_keys = corner_keys.reshape(-1, 3)
-
-        # A corner holds ONE of each of these, which is the whole reason the
-        # surface is continuous: two cells meeting there cannot disagree about
-        # where it is, what it is made of, or how far away it fades. All five
-        # quantities average over exactly the same cells.
-        #
-        # `bincount` per channel, and NOT the sort-once-and-reduceat idiom the
-        # two accumulators use. That was tried here and is SLOWER -- 43.4 ms
-        # against 37.4 on a 40k-cell disc -- because reducing five channels
-        # together means materialising a (4N, 5) repeat and then gathering it
-        # into sort order, and those two copies cost more than the extra sweeps
-        # they save. The accumulators win with it because there the sort is the
-        # thing being avoided; here `np.unique` has to sort anyway.
+        # Each cell contributes its values to its own four lattice corners; a
+        # corner holds the mean of the cells touching it. A corner holds ONE of
+        # each, which is the whole reason the surface is continuous: two cells
+        # meeting there cannot disagree about where it is, what it is made of,
+        # or how far away it fades. All five quantities average over exactly the
+        # same cells.
         #
         # Averaging colour in LINEAR space is not incidental: the buffer is
         # linear and the GPU multiplies there, so blending sRGB triples would
         # darken every material boundary rather than crossfade it.
-        unique, first, inverse = np.unique(
-            pack_cell_keys(flat_keys), return_index=True, return_inverse=True
-        )
-        counts = np.bincount(inverse, minlength=len(unique))
-
-        def _corner_mean(values: np.ndarray) -> np.ndarray:
-            return (
-                np.bincount(
-                    inverse, weights=np.repeat(values, 4), minlength=len(unique)
-                )
-                / counts
-            )
-
-        corner_height = _corner_mean(heights)
-        corner_colour = np.stack(
-            [_corner_mean(colour[:, channel]) for channel in range(3)], axis=1
-        )
-        corner_limit = _corner_mean(limits)
-        corner_lattice = flat_keys[first]
+        lattice, inverse, corner_values = _corner_means(cells, values)
+        corner_height = corner_values[:, 0]
+        corner_colour = corner_values[:, 1:4]
+        corner_limit = corner_values[:, 4]
 
         world = np.column_stack(
             (
-                corner_lattice[:, 0] * WORLD_CELL_SIZE_M,
-                corner_lattice[:, 1] * WORLD_CELL_SIZE_M,
+                lattice[:, 0] * WORLD_CELL_SIZE_M,
+                lattice[:, 1] * WORLD_CELL_SIZE_M,
                 corner_height,
             )
         )
         vertices = world_to_render(world, snapshot)
-        colours = depth_tint(corner_colour, vertices)
-        # Dissolve the last few metres into the air. The road stops at its own
-        # radius while everything else runs on to WORLD_RADIUS_M, so without
-        # this the surface ends on a hard rim that reads as a cliff edge --
-        # a drawn boundary where there is only the end of what was measured.
-        colours = _fade_to_air(colours, vertices, corner_limit)
+        colours = depth_tint(corner_colour, vertices, corner_limit)
 
         quad = inverse.reshape(-1, 4).astype(np.uint32)
         indices = np.column_stack(
@@ -1780,7 +1997,7 @@ class WorldSceneAssembler:
         if len(indices) > WORLD_MAX_COLUMNS:
             # Drop the oldest first, so what survives is what was seen most
             # recently rather than an arbitrary slice of the map.
-            freshest = np.argsort(self._voxel_seen[indices])[-WORLD_MAX_COLUMNS:]
+            freshest = _newest(self._voxel_seen[indices], WORLD_MAX_COLUMNS)
             indices = np.sort(indices[freshest])
         self._voxel_keys = self._voxel_keys[indices]
         self._voxel_material = self._voxel_material[indices]

@@ -34,6 +34,8 @@ from .config import (
     LIDAR_FRONT_MAX_DISTANCE_M,
     LIDAR_HORIZONTAL_FOV_DEG,
     LIDAR_MAX_DISTANCE_M,
+    LIDAR_ROOF_FAR_M,
+    LIDAR_ROOF_NEAR_M,
     LIDAR_UPDATE_HZ,
     MAX_SPEED_MPS,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
@@ -239,7 +241,9 @@ class MainWindow(QMainWindow):
         sensor_title.setObjectName("sectionTitle")
         sidebar_layout.addWidget(sensor_title)
 
-        self._add_spec_row(sidebar_layout, "Units", "Front / Left / Right / Rear")
+        self._add_spec_row(
+            sidebar_layout, "Units", "Front / Left / Right / Rear / Roof"
+        )
         self._add_spec_row(
             sidebar_layout,
             "Range",
@@ -393,6 +397,42 @@ class MainWindow(QMainWindow):
         title_column.addWidget(self.vehicle_label)
         header.addLayout(title_column)
         header.addStretch(1)
+
+        # Per-unit coverage overlays for the RAW BEV plot. GUI-only, exactly
+        # like the view toggle: they never touch sensor or control state.
+        self.lidar_debug_widget = QFrame()
+        self.lidar_debug_widget.setObjectName("lidarDebugToggle")
+        lidar_debug_layout = QHBoxLayout(self.lidar_debug_widget)
+        lidar_debug_layout.setContentsMargins(3, 3, 3, 3)
+        lidar_debug_layout.setSpacing(2)
+        self.lidar_debug_buttons: dict[str, QPushButton] = {}
+        for sensor_name, reach_text in (
+            ("front", f"{LIDAR_FRONT_MAX_DISTANCE_M:.0f} m · "
+                      f"{LIDAR_FRONT_HORIZONTAL_FOV_DEG:.0f}°"),
+            ("left", f"{LIDAR_MAX_DISTANCE_M:.0f} m · "
+                     f"{LIDAR_HORIZONTAL_FOV_DEG:.0f}°"),
+            ("right", f"{LIDAR_MAX_DISTANCE_M:.0f} m · "
+                      f"{LIDAR_HORIZONTAL_FOV_DEG:.0f}°"),
+            ("rear", f"{LIDAR_MAX_DISTANCE_M:.0f} m · "
+                     f"{LIDAR_HORIZONTAL_FOV_DEG:.0f}°"),
+            ("roof", f"ground {LIDAR_ROOF_NEAR_M:.0f}–{LIDAR_ROOF_FAR_M:.0f} m"),
+        ):
+            button = QPushButton(sensor_name.upper())
+            button.setObjectName("lidarDebugButton")
+            button.setProperty("sensor", sensor_name)
+            button.setCheckable(True)
+            button.setToolTip(
+                f"Show the {sensor_name} LiDAR's field of view and range "
+                f"({reach_text}) on the RAW BEV plot"
+            )
+            button.clicked.connect(
+                lambda checked, name=sensor_name: self.bev.set_sensor_debug(
+                    name, checked
+                )
+            )
+            self.lidar_debug_buttons[sensor_name] = button
+            lidar_debug_layout.addWidget(button)
+        header.addWidget(self.lidar_debug_widget)
 
         view_toggle = QFrame()
         view_toggle.setObjectName("viewToggle")
@@ -698,6 +738,9 @@ class MainWindow(QMainWindow):
         self.legend_widget.setVisible(
             not world_selected and not self._dense_mode
         )
+        # The coverage overlay is drawn on the RAW BEV plot only, so the
+        # toggles hide with it rather than promising something WORLD won't do.
+        self.lidar_debug_widget.setVisible(not world_selected)
         self._settings.setValue("visualization", selected)
 
     def _on_world_rendering_failed(self, message: str) -> None:
@@ -951,6 +994,9 @@ class MainWindow(QMainWindow):
         self.legend_widget.setVisible(
             not dense and self._active_visualization == "RAW BEV"
         )
+        self.lidar_debug_widget.setVisible(
+            self._active_visualization == "RAW BEV"
+        )
         self.latency_container.setVisible(not dense)
         self.scene_container.setVisible(not dense)
         self.speed_container.setVisible(not dense)
@@ -1030,10 +1076,45 @@ class MainWindow(QMainWindow):
                 border: 1px solid #30353a;
                 border-radius: 5px;
             }
-            QFrame#viewToggle {
+            QFrame#viewToggle, QFrame#lidarDebugToggle {
                 background: #181c20;
                 border: 1px solid #343b42;
                 border-radius: 7px;
+            }
+            QPushButton#lidarDebugButton {
+                min-width: 38px;
+                min-height: 24px;
+                max-height: 24px;
+                padding: 0 7px;
+                border: none;
+                border-radius: 5px;
+                color: #818a92;
+                background: transparent;
+                font-size: 9px;
+                font-weight: 700;
+                text-align: center;
+            }
+            QPushButton#lidarDebugButton:hover {
+                color: #dfe4e8;
+                background: #252a2f;
+            }
+            QPushButton#lidarDebugButton:checked {
+                color: #14181b;
+            }
+            QPushButton#lidarDebugButton[sensor="front"]:checked {
+                background: #ffb347;
+            }
+            QPushButton#lidarDebugButton[sensor="left"]:checked {
+                background: #4d9fff;
+            }
+            QPushButton#lidarDebugButton[sensor="right"]:checked {
+                background: #ff6fd8;
+            }
+            QPushButton#lidarDebugButton[sensor="rear"]:checked {
+                background: #9bd356;
+            }
+            QPushButton#lidarDebugButton[sensor="roof"]:checked {
+                background: #34d5d0;
             }
             QPushButton#viewToggleButton {
                 min-width: 62px;

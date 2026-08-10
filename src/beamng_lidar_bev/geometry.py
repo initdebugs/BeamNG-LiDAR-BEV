@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -170,6 +172,54 @@ def derive_vehicle_geometry(
         rear_m=float(max_y),
         height_m=height,
         mounts=mounts,
+    )
+
+
+@dataclass(frozen=True)
+class SensorCoverage:
+    """One unit's horizontal footprint, in BEV (right, forward) metres."""
+
+    right_m: float
+    forward_m: float
+    heading_deg: float
+    """Boresight bearing, measured anticlockwise from +right (so ahead is 90)."""
+    fov_deg: float
+    near_m: float
+    far_m: float
+
+
+def sensor_coverage(mount: SensorMount) -> SensorCoverage:
+    """
+    What patch of ground a unit can put returns on, for the debug overlay.
+
+    The roof unit's reach is its ground ANNULUS rather than its slant range:
+    every one of its channels points below the horizon, so the slant figure
+    describes air it never samples, while LIDAR_ROOF_NEAR_M..FAR_M is the ring
+    of road the aperture was fitted to. The other four report a plain wedge
+    from the mount to their own max distance.
+    """
+    local_x, local_y, _ = mount.position_vehicle
+    dir_x, dir_y, _ = mount.direction_vehicle
+    # Vehicle frame is +X left, +Y rearward; BEV is (right, forward). The roof
+    # unit's direction has a downward component, so only the horizontal part
+    # defines the wedge's bearing.
+    boresight_right = -float(dir_x)
+    boresight_forward = -float(dir_y)
+    if math.hypot(boresight_right, boresight_forward) < 1e-9:
+        boresight_right, boresight_forward = 0.0, 1.0
+    if mount.name == "roof":
+        near_m, far_m = LIDAR_ROOF_NEAR_M, LIDAR_ROOF_FAR_M
+    else:
+        near_m, far_m = 0.0, float(mount.max_distance_m)
+    return SensorCoverage(
+        right_m=-float(local_x),
+        forward_m=-float(local_y),
+        heading_deg=math.degrees(
+            math.atan2(boresight_forward, boresight_right)
+        ),
+        fov_deg=float(mount.horizontal_fov_deg),
+        near_m=float(near_m),
+        far_m=float(far_m),
     )
 
 
