@@ -763,12 +763,16 @@ its own rotated frame. Measured on a 20 m wall: **one to three boxes instead of 
 3.75° of the truth and within 0.04 m of the true line.** Six things carry it:
 
 - **The direction cannot be measured inside one column.** A 0.25 m cell holds less evidence than the
-  azimuth stripe spacing the returns arrive with (1.24 m at 20 m), so it comes from a
-  `WORLD_ORIENT_CELL_M` neighbourhood — and from a **sliding 3×3** of those, because a fixed tile is
-  a world-aligned box whose corner a surface can clip, leaving too few cells to fit anything to.
-  That showed up as stray untilted cubes along an otherwise clean wall. Every statistic is a plain
-  sum, so widening the window is just adding neighbours' sums: nine `searchsorted` lookups over the
-  tile keys, which are far fewer than the cells.
+  azimuth stripe spacing the returns arrive with (a metre and more at range), so it comes from a
+  `WORLD_ORIENT_CELL_M` neighbourhood — a **sliding 7×7** of those tiles, because a fixed tile is
+  a world-aligned box whose corner a surface can clip, and because a small window starves on
+  exactly the sparse sampling walls at range get: with a 3 m window a 30° wall sampled every
+  0.8 m drew as **38 world-aligned boxes wandering 0.28 m off its line** — the live "staircases
+  for straight walls" complaint — where 7 m draws it as one box dead on it. The curve cost is the
+  chord sagitta 49/(8R) (0.10 m at R = 60 m); tighter curves fail the anisotropy guard and stay
+  world-aligned as before. Every statistic is a plain sum, so widening the window is just adding
+  neighbours' sums over the tile keys, which are far fewer than the cells. Pinned by
+  `test_a_sparsely_sampled_wall_still_lies_along_its_line`.
 - **The angle is a key field**, exactly like the altitude and height buckets — runs only merge with
   runs that agree on a frame. Unlike those it cannot simply be folded into `layers`, because the
   cells have to be *re-gridded* in the bucket's frame before `merge_cell_runs` can find runs along
@@ -1489,13 +1493,15 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   It has to exceed the vertical sampling gap on a wall (0.10 m at 50 m) so walls stay solid, and
   stay far under the clear air beneath a canopy or a bridge deck so those still split. Raising it
   to swallow noise would re-merge the tree with the grass under it.
-- `WORLD_ORIENT_CELL_M` (1.0) is a STRIDE, not the window: the window is a sliding 3x3 of tiles,
-  so it is 3 m. Long enough to hold a clear line through a wall, short enough that a curved one is
-  followed rather than averaged into a chord. `WORLD_ORIENT_BUCKETS` (12) is the angular
-  resolution — see the slab section for why finer is cheaper — and the two guards
-  (`WORLD_ORIENT_MIN_CELLS`, `WORLD_ORIENT_MIN_ANISOTROPY`) are what stop a bush being handed a
-  direction it does not have. Relax those and the failure is silent and everywhere: every clump of
-  foliage acquires a confident, wrong angle.
+- `WORLD_ORIENT_CELL_M` (1.0) is a STRIDE, not the window: the window is a sliding 7x7 of tiles,
+  so it is 7 m — sized to hold enough azimuth-stripe samples of a wall at range to fit a line to
+  (see the slab section; 3 m starved on sparse walls and they shattered into world-aligned
+  confetti). `WORLD_ORIENT_BUCKETS` (24) is the angular resolution — finer is cheaper as well as
+  better — and the two guards (`WORLD_ORIENT_MIN_CELLS` 4, `WORLD_ORIENT_MIN_ANISOTROPY`) are
+  what stop a bush being handed a direction it does not have. The count guard dropped 6 → 4 with
+  the bigger window because four collinear stripe samples ARE a direction; the anisotropy guard
+  is what rejects four clumped ones, and relaxing THAT one is the silent-failure dial: every
+  clump of foliage acquires a confident, wrong angle.
 - `WORLD_COLLISION_CEILING_M` (2.6) is a question about the VEHICLE, not the scene. Raise it for
   anything tall enough to hit a branch a car passes under.
 - `WORLD_CELL_MEMORY_M` (25) and `WORLD_COLUMN_MEMORY_M` (90) are **metres travelled, not

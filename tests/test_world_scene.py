@@ -1550,6 +1550,33 @@ def test_a_diagonal_wall_is_a_tilted_slab_not_a_staircase(angle: float) -> None:
     assert _off_the_line(frame, angle) < 0.1
 
 
+@pytest.mark.parametrize("spacing_m", (0.8, 1.5))
+def test_a_sparsely_sampled_wall_still_lies_along_its_line(
+    spacing_m: float,
+) -> None:
+    """
+    The staircase seen live along road-edge barriers. A wall at range arrives
+    as azimuth-stripe samples a metre or more apart, and with a 3 m
+    orientation window those held too few cells to fit a direction: the wall
+    fell back to world-aligned confetti -- 38 boxes wandering 0.28 m off a
+    30-degree line at 0.8 m samples. The 7 m window plus the stripe-reaching
+    column bridge is what this pins.
+    """
+    angle = np.radians(30.0)
+    points = tuple(
+        (float(t * np.sin(angle)), float(16.0 + t * np.cos(angle)), float(z))
+        for t in np.arange(-15.0, 15.0, spacing_m)
+        for z in np.arange(0.0, 1.0, 0.1)
+    )
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, (SCENE_BOUNDARY,) * len(points))
+    )
+
+    assert len(_boxes(frame)) <= 8, "the sparse wall shattered into confetti"
+    assert _off_the_line(frame, 30.0, at_m=16.0) < 0.15
+
+
 def test_a_wall_between_two_buckets_still_lies_in_one_plane() -> None:
     """
     The worst case, and the reason the merge KEY and the drawn POSITION are

@@ -412,10 +412,16 @@ WORLD_MAX_BOUNDARY_POINTS = 60_000
 # separate rather than averaging into one waist-high wall.
 WORLD_SLAB_HEIGHT_BUCKET_M = 0.5
 # How many empty columns may be bridged between two observed ones. At 0.25 m
-# columns this spans the 1.24 m azimuth stripe gap measured at 20 m. It is an
-# inference, but a sound one: a return either side at the same height means the
-# ray passed through, so the surface between them was there to be hit.
-WORLD_COLUMN_BRIDGE_CELLS = 4
+# columns, 6 spans 1.5 m: azimuth stripes on a wall run past a metre apart at
+# range (and wider since the standard wedges went to density 35), and a bridge
+# that stops short of the stripe spacing leaves an oriented wall as a row of
+# posts -- measured, a 30-degree wall sampled every 1.5 m went from 19
+# fragments to one box when the bridge could reach the next stripe. It is an
+# inference, but a sound one: a return either side at the same height means
+# the ray passed through, so the surface between them was there to be hit.
+# Still under anything a car could drive through, and the 4 m doorway case is
+# pinned open by test_azimuth_stripe_gaps_are_bridged_but_a_real_opening_is_not.
+WORLD_COLUMN_BRIDGE_CELLS = 6
 # How many empty height bins may be bridged INSIDE a column before the run is
 # treated as two separate structures.
 #
@@ -443,13 +449,19 @@ WORLD_MIN_SLAB_HEIGHT_M = 0.10
 #
 # It cannot be measured inside one column. A 0.25 m cell holds at most 0.25 m of
 # evidence, which is smaller than the azimuth stripe spacing the returns arrive
-# with (1.24 m at 20 m), so the direction has to come from a NEIGHBOURHOOD. Two
-# metre tile, summed over a sliding 3x3 of them, gives a 3 m window: long
-# enough to hold a clear line through a wall and short enough that a curved one
-# is still followed rather than averaged into a chord. The window SLIDES because
-# a fixed tile is a world-aligned box whose corner a surface can clip, leaving
-# too few cells to fit a direction to -- which showed up as stray untilted cubes
-# along an otherwise clean wall.
+# with (about a metre and more at range), so the direction has to come from a
+# NEIGHBOURHOOD: metre tiles, summed over a sliding 7x7 of them -- a 7 m
+# window. It was a 3 m window first, and that is exactly what the staircase
+# complaint was: a wall at range arrives as stripe samples over a metre apart,
+# so 3 m often held two or three cells, the guards (correctly) refused to fit,
+# and the wall fell back to world-aligned confetti -- measured, a 30-degree
+# wall sampled every 0.8 m drew as 38 boxes wandering 0.28 m off its line, and
+# at 1.5 m samples even 5 m left 10-20 fragments where 7 m leaves 2-5. The
+# cost on a curve is the chord sagitta, 49/(8R): 0.10 m at a 60 m radius,
+# under the wander it removes; tighter curves fail the anisotropy guard and
+# stay world-aligned as before. The window SLIDES because a fixed tile is a
+# world-aligned box whose corner a surface can clip, leaving too few cells to
+# fit a direction to.
 WORLD_ORIENT_CELL_M = 1.0
 # Quantised, because merging only ever happens between cells that agree on a
 # frame -- the angle is a key field exactly like the altitude and height buckets
@@ -463,11 +475,13 @@ WORLD_ORIENT_CELL_M = 1.0
 #    12 buckets   drawn up to 3.75 deg out, 0.02-0.04 m -- flat, to the eye
 #
 # It is also CHEAPER, which is not the obvious direction: a frame that fits
-# merges into fewer, longer boxes, and on a street scene that was 22 slabs
-# against 33 and 31.3 ms against 33.2. Quality and cost agree here, so the
-# reason not to go further is the fixed cost of a group that holds almost
-# nothing, not the geometry.
-WORLD_ORIENT_BUCKETS = 12
+# merges into fewer, longer boxes, and on a street scene 12 buckets gave 22
+# slabs against 33 and 31.3 ms against 33.2 for 6. Quality and cost agree
+# here, so the reason not to go further is the fixed cost of a group that
+# holds almost nothing, not the geometry. 24 (1.9 deg worst case) went in with
+# the 5 m orientation window: the near-axis wander of a road-edge barrier a
+# few degrees off the world grid halves with it.
+WORLD_ORIENT_BUCKETS = 24
 # ...and it is only believed when the footprint actually supports it. Below
 # these it falls back to bucket 0, which IS the world-aligned frame, so the
 # fallback needs no separate code path.
@@ -477,7 +491,12 @@ WORLD_ORIENT_BUCKETS = 12
 # find; so is the inside corner of an L-shaped building, where the two walls
 # average to a 45-degree answer that fits neither -- both fall back, which is
 # the honest result rather than an invented rotation.
-WORLD_ORIENT_MIN_CELLS = 6
+#
+# MIN_CELLS is 4, down from 6 with the window at 5 m: a sparsely-sampled wall
+# is exactly the case the orientation exists for, and four collinear stripe
+# samples are a direction while four clumped ones fail the anisotropy guard
+# beside this one -- the two guards ask different questions.
+WORLD_ORIENT_MIN_CELLS = 4
 WORLD_ORIENT_MIN_ANISOTROPY = 0.6
 
 # --- What counts as something you could hit -----------------------------------

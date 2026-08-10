@@ -411,11 +411,22 @@ def orientation_frames(cells_xy: np.ndarray, cell_size_m: float) -> ColumnFrames
     # true line. Every statistic here is a plain SUM, so widening the window is
     # just adding the neighbours' sums: nine `searchsorted` lookups over the
     # tile keys, which are far fewer than the cells.
+    # 7x7 of 1 m tiles, not 3x3. A wall at range arrives as azimuth-stripe
+    # samples a metre or more apart, so a 3 m window often held two or three
+    # cells -- under any honest count guard -- and the whole wall fell back to
+    # world-aligned confetti: measured, a 30-degree wall sampled every 0.8 m
+    # drew as 38 boxes wandering 0.28 m off its line; at 1.5 m samples even a
+    # 5 m window left 10-20 fragments. Seven metres holds enough stripes to
+    # fit at the spacings the mid-field actually delivers (1 -> 2 boxes at
+    # 1.5 m samples, wander 0.26 -> 0.09 m on the shallow-angle case). The
+    # cost on a curve is chord error, bounded by the sagitta 49/(8R): 0.10 m
+    # at a 60 m radius, under the wander it removes, and tighter curves fail
+    # the anisotropy guard and stay world-aligned as before.
     tiles = tile[order][starts]
     keys = pack_cell_keys(tiles)
     window = np.zeros_like(tile_sums)
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
+    for dx in (-3, -2, -1, 0, 1, 2, 3):
+        for dy in (-3, -2, -1, 0, 1, 2, 3):
             wanted = pack_cell_keys(tiles + (dx, dy))
             slot = np.clip(np.searchsorted(keys, wanted), 0, len(keys) - 1)
             window += np.where(
