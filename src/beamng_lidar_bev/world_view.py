@@ -218,6 +218,7 @@ class SceneBridge(QObject):
         )
         self._actor_model = ActorListModel(self)
         self._ego_scale = (2.0, 1.5, 4.4)
+        self._ego_centre = (0.0, 0.0)
         self._speed_text = "0"
         self._target_speed_text = "—"
         self._autonomy_mode = "OFF"
@@ -279,6 +280,17 @@ class SceneBridge(QObject):
     @pyqtProperty(float, notify=state_changed)
     def egoLength(self) -> float:
         return self._ego_scale[2]
+
+    # Where the BODY centre sits in render space. The origin is the vehicle's
+    # reference node, which is off-centre in the bounding box, so an ego model
+    # left at the origin stands visibly beside the (correct) scene around it.
+    @pyqtProperty(float, notify=state_changed)
+    def egoCentreX(self) -> float:
+        return self._ego_centre[0]
+
+    @pyqtProperty(float, notify=state_changed)
+    def egoCentreZ(self) -> float:
+        return self._ego_centre[1]
 
     @pyqtProperty(str, notify=state_changed)
     def speedText(self) -> str:
@@ -347,6 +359,7 @@ class SceneBridge(QObject):
         )
         self._actor_model.set_actors(frame.actors)
         self._ego_scale = frame.ego_scale
+        self._ego_centre = frame.ego_centre
         self._speed_text = f"{frame.speed_kph:.0f}"
         self._target_speed_text = (
             f"{frame.target_speed_kph:.0f}"

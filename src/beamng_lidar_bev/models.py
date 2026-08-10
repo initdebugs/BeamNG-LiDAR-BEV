@@ -158,6 +158,20 @@ class AebState:
     """Deceleration needed to stop short of the standoff. 0 with no threat."""
     time_to_collision_s: float
     reason: str
+    lateral_offset_m: float = 0.0
+    """
+    Where the corridor's centreline sits, as a lateral offset from the origin
+    of this system's own travel frame.
+
+    The BEV origin is the vehicle's REFERENCE NODE, which is not the body
+    centre: the bounding box extends `left_m` one way and `right_m` the other,
+    and on a real vehicle the two differ. A corridor centred on the node sweeps
+    a band partly beside the body -- measured on the D-Series backing into a
+    centred garage doorway, the edge reached into the wall and fired the brake.
+    The scan shifts its cloud by this value, so the overlays must shift the
+    drawn corridor by it too, or what is on screen stops being what was
+    scanned.
+    """
 
     @property
     def engaged(self) -> bool:
@@ -325,3 +339,11 @@ class WorldFrame:
     camera_euler: tuple[float, float, float]
     timestamp: float
     perception_available: bool
+    ego_centre: tuple[float, float] = (0.0, 0.0)
+    """
+    Render-space (x, z) of the BODY centre. The render origin is the vehicle's
+    reference node, which sits off-centre in the bounding box; an ego model
+    drawn centred on the origin therefore stands beside where the scene says
+    the car is -- the whole width of the node offset, against walls that are
+    drawn correctly.
+    """

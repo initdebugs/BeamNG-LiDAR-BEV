@@ -648,8 +648,10 @@ class BeamNgWorker(QObject):
         )
         LOGGER.info(
             "Vehicle check: model %r (plant measured on %r) | bbox %.2f wide x "
-            "%.2f long x %.2f tall | overhang front %.2f rear %.2f | ground "
-            "plane %+.3f m from the reference node | mount z: %s",
+            "%.2f long x %.2f tall | overhang front %.2f rear %.2f | body "
+            "centre %+.2f m right of the reference node (the AEB corridor and "
+            "the WORLD ego are shifted by this) | ground plane %+.3f m from "
+            "the reference node | mount z: %s",
             self._vehicle_model or "unknown",
             PLANT_REFERENCE_VEHICLE,
             geometry.width_m,
@@ -657,6 +659,7 @@ class BeamNgWorker(QObject):
             geometry.height_m,
             geometry.front_m,
             geometry.rear_m,
+            (geometry.right_m - geometry.left_m) / 2.0,
             geometry.ground_z_vehicle,
             mount_heights,
         )

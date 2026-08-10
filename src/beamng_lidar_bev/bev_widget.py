@@ -85,7 +85,12 @@ def _aeb_to_screen(
     The rear system reasons in a 180-degree-rotated frame -- that is what lets
     it share every arc helper unchanged -- so un-rotating here is the whole of
     what drawing it backwards takes. See aeb.mirrored.
+
+    The lateral offset re-centres the drawn corridor on the BODY, exactly as
+    the scan re-centred its cloud -- applied before the un-rotation, because
+    the offset is defined in the system's own travel frame.
     """
+    x = x + aeb.lateral_offset_m
     return (
         bev_to_screen(rect, -x, -y, radius_m)
         if aeb.rearward

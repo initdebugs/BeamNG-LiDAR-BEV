@@ -487,7 +487,10 @@ def face_shades(right: np.ndarray, forward: np.ndarray) -> np.ndarray:
 
 
 def _aeb_bev_to_render(
-    points_bev: np.ndarray, height_m: np.ndarray | float, rearward: bool
+    points_bev: np.ndarray,
+    height_m: np.ndarray | float,
+    rearward: bool,
+    lateral_offset_m: float = 0.0,
 ) -> np.ndarray:
     """
     An AEB system's own travel frame to render coordinates.
@@ -496,9 +499,13 @@ def _aeb_bev_to_render(
     it share every arc helper in `planner` unchanged -- so un-rotating is the
     whole of what drawing it backwards takes. A rotation, not a reflection, so
     handedness survives and the curvature convention holds. Mirrors
-    `bev_widget._aeb_to_screen`.
+    `bev_widget._aeb_to_screen`, including the body-centring offset, which is
+    applied before the un-rotation because it is defined in the system's own
+    travel frame.
     """
     points = np.asarray(points_bev, dtype=np.float64).reshape(-1, 2)
+    if lateral_offset_m:
+        points = points + (float(lateral_offset_m), 0.0)
     sign = -1.0 if rearward else 1.0
     heights = np.broadcast_to(
         np.asarray(height_m, dtype=np.float64), (len(points),)
@@ -537,6 +544,7 @@ def _strip(
     colour: np.ndarray,
     alpha: np.ndarray,
     rearward: bool,
+    lateral_offset_m: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Triangulate a quad strip between two matched edges.
@@ -555,7 +563,9 @@ def _strip(
     heights[0::2] = heights_m[0]
     heights[1::2] = heights_m[1]
 
-    vertices = _aeb_bev_to_render(interleaved, heights, rearward)
+    vertices = _aeb_bev_to_render(
+        interleaved, heights, rearward, lateral_offset_m
+    )
     base = np.arange(count - 1, dtype=np.uint32) * 2
     indices = np.column_stack(
         (base, base + 1, base + 2, base + 1, base + 3, base + 2)
@@ -592,6 +602,7 @@ def _band(
         colour,
         np.full(2, alpha, dtype=np.float32),
         state.rearward,
+        state.lateral_offset_m,
     )
 
 
@@ -618,6 +629,7 @@ def _rail(
         colour,
         (WORLD_AEB_RAIL_ALPHA * fade).astype(np.float32),
         state.rearward,
+        state.lateral_offset_m,
     )
 
 
@@ -641,8 +653,15 @@ def _panel(
     )
     vertices = np.concatenate(
         (
-            _aeb_bev_to_render(chord, ground_m, state.rearward),
-            _aeb_bev_to_render(chord, ground_m + height_m, state.rearward),
+            _aeb_bev_to_render(
+                chord, ground_m, state.rearward, state.lateral_offset_m
+            ),
+            _aeb_bev_to_render(
+                chord,
+                ground_m + height_m,
+                state.rearward,
+                state.lateral_offset_m,
+            ),
         )
     )
     indices = np.asarray((0, 1, 3, 0, 3, 2), dtype=np.uint32)
@@ -674,8 +693,15 @@ def _post(
     chord = np.stack((outer[index], inner[index]))
     vertices = np.concatenate(
         (
-            _aeb_bev_to_render(chord, ground_m, state.rearward),
-            _aeb_bev_to_render(chord, ground_m + height_m, state.rearward),
+            _aeb_bev_to_render(
+                chord, ground_m, state.rearward, state.lateral_offset_m
+            ),
+            _aeb_bev_to_render(
+                chord,
+                ground_m + height_m,
+                state.rearward,
+                state.lateral_offset_m,
+            ),
         )
     )
     indices = np.asarray((0, 1, 3, 0, 3, 2), dtype=np.uint32)
@@ -701,11 +727,17 @@ def _lintel(
     )
     vertices = np.concatenate(
         (
-            _aeb_bev_to_render(chord, ground_m + height_m, state.rearward),
+            _aeb_bev_to_render(
+                chord,
+                ground_m + height_m,
+                state.rearward,
+                state.lateral_offset_m,
+            ),
             _aeb_bev_to_render(
                 chord,
                 ground_m + height_m - WORLD_AEB_FRAME_WIDTH_M,
                 state.rearward,
+                state.lateral_offset_m,
             ),
         )
     )
@@ -1637,6 +1669,22 @@ class WorldSceneAssembler:
                 snapshot.vehicle_geometry.height_m,
                 snapshot.vehicle_geometry.length_m,
             ),
+            # The render origin is the REFERENCE NODE and the box extents are
+            # asymmetric about it, so an ego drawn centred on the origin stands
+            # beside where the (correct) scene says the car is. Render x is
+            # BEV right; render z is -forward.
+            ego_centre=(
+                (
+                    snapshot.vehicle_geometry.right_m
+                    - snapshot.vehicle_geometry.left_m
+                )
+                / 2.0,
+                -(
+                    snapshot.vehicle_geometry.front_m
+                    - snapshot.vehicle_geometry.rear_m
+                )
+                / 2.0,
+            ),
             speed_kph=abs(snapshot.speed_mps) * 3.6,
             target_speed_kph=(
                 plan.command.target_speed_mps * 3.6 if plan is not None else 0.0
@@ -2514,6 +2562,7 @@ class WorldSceneAssembler:
                         colour,
                         wash.astype(np.float32),
                         state.rearward,
+                        state.lateral_offset_m,
                     )
                 )
 

@@ -288,7 +288,13 @@ Rectangle {
 
         Node {
             id: ego
+            // Centred on the BODY, not on the render origin: the origin is the
+            // vehicle's reference node, which sits off-centre in the bounding
+            // box, and a car drawn at the origin stands beside where the
+            // (correct) scene says it is.
+            x: sceneBridge.egoCentreX
             y: -0.5
+            z: sceneBridge.egoCentreZ
 
             // The ego casts a real shadow, but nothing can receive it: every
             // large surface is a NoLighting material, and those skip the

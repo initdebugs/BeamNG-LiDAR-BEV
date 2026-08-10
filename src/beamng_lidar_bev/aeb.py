@@ -408,6 +408,14 @@ class EmergencyBraking:
 
         standoff = geometry.front_m + self.profile.standoff_m
         half_width = geometry.width_m / 2.0 + AEB_CLEARANCE_MARGIN_M
+        # The corridor is centred on the BODY, not on the reference node the
+        # BEV frame is built around. The node sits off-centre in the bounding
+        # box, so a node-centred corridor sweeps a band partly beside the car:
+        # backing the D-Series into a garage doorway it was CENTRED in, one
+        # corridor edge reached into the wall and fired the brake. For the rear
+        # system the mirrored geometry swaps left and right, which is exactly
+        # the sign the 180-degree-rotated cloud needs.
+        centre_m = (geometry.right_m - geometry.left_m) / 2.0
         # The distance a full-authority stop actually needs from here. Every
         # threshold below is a multiple of it, which is what makes the feature
         # behave the same way at 30 km/h as at 100 -- and what lets one
@@ -449,6 +457,7 @@ class EmergencyBraking:
                     f"Standing by below "
                     f"{self.profile.min_speed_mps * 3.6:.0f} km/h"
                 ),
+                lateral_offset_m=centre_m,
             )
 
         curvature = self._curvature_at(
@@ -460,8 +469,17 @@ class EmergencyBraking:
         # measured threat is held, so an outage never releases the pedal into
         # whatever was in front of the car.
         if has_returns:
+            # Shift the cloud into the body-centred frame rather than bending
+            # the arc: the offset is centimetres against corridor radii of
+            # many metres, so the parallel-path error this ignores is far
+            # below the clearance margin.
+            scan = obstacles
+            if centre_m != 0.0 and len(scan):
+                scan = scan - np.asarray(
+                    (centre_m, 0.0), dtype=scan.dtype
+                )
             blocking = corridor_blocking_distances(
-                obstacles, curvature, half_width, horizon
+                scan, curvature, half_width, horizon
             )
             # The Nth nearest, not the nearest: a thing worth braking for is a
             # surface and puts many returns in a corridor this narrow, while a
@@ -576,6 +594,7 @@ class EmergencyBraking:
             required_decel_mps2=required,
             time_to_collision_s=ttc,
             reason=self._reason(threat, horizon, brake_now, available, ttc, speed),
+            lateral_offset_m=centre_m,
         )
 
     # --- helpers -------------------------------------------------------------

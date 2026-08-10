@@ -253,6 +253,22 @@ Three frames are in play and mixing them up is the easiest bug to introduce here
 negates mount coordinates (`screen(-local_x, -local_y)`) when drawing the sensor markers —
 it is converting vehicle space to right/forward, not correcting a sign error.
 
+**The BEV origin is the REFERENCE NODE, and the node is not the body centre — anything centred
+on the origin is centred on the wrong thing.** The extents above are asymmetric on a real
+vehicle, and two consumers ignored that: the WORLD ego model was drawn centred on the render
+origin (so the car stood beside walls the scene drew correctly — `WorldFrame.ego_centre` now
+carries the body centre and the QML ego node binds to it), and **the AEB corridor was centred on
+the node's path** (`half_width` either side of x = 0), so it swept a band partly beside the body —
+measured on the D-Series backing into a garage doorway it was centred in, one corridor edge
+reached the wall and fired the reverse brake at 0.7–0.9 m. `aeb.step` now shifts its scan cloud
+by `(right_m − left_m)/2` into the body-centred frame, reports the shift as
+`AebState.lateral_offset_m`, and both overlays (`_aeb_to_screen`, `_aeb_bev_to_render`) apply it
+before the rear un-rotation — so the drawn corridor stays provably the scanned one. The mirrored
+geometry swaps left/right, which is exactly the sign the 180°-rotated cloud needs; the `Vehicle
+check:` line logs the offset at attach. The PLANNER's corridor scans still reason about the node's
+path — its 0.35 m margin absorbs typical offsets, and re-centring it changes steering, which
+wants live validation first. `test_body_centring.py` pins all of it, in both directions.
+
 **Sensor `pos.z` and `ground_z_vehicle` are different data and must not be mixed.** The
 simulator already references a vehicle-space sensor `pos` to the vehicle's ground plane, so
 `derive_vehicle_geometry` passes `SENSOR_HEIGHT_ABOVE_GROUND_M` through **verbatim**. Adding
