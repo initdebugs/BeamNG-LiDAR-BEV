@@ -162,24 +162,21 @@ LIDAR_ROOF_FAR_M = 55.0
 # Budget: ~+1.9 standard units at density 12.5 (~+15%), the same narrowness
 # trade the long-range FRONT unit makes for AEB. Every figure here needs the
 # live `Sensor reach:` check like the rest of the optics.
-# STAGE ONE OF THE VISUAL-PAINT EXPERIMENT. With this on, the road-scan unit
-# alone runs is_annotated=False, so its colour channel carries whatever the
-# engine renders there instead of annotation classes -- believed (undocumented)
-# to be the scene's visual colour, which would let paint be read by BRIGHTNESS
-# the way real reflectance lidars do, decal transparency respected, arrows and
-# hatching correctly shaped. The one-shot `Colour check:` line prints the
-# channel's distribution, which is the whole point of the stage: all-black or
-# single-valued means the channel is dead in this mode and the experiment
-# ends; a bright tail on a marked road means stage two (the brightness
-# detector) is worth building.
+# THE VISUAL-PAINT EXPERIMENT, RETIRED: measured 2026-08-10 and the channel is
+# not the scene. With is_annotated=False the colour channel carries BeamNG's
+# own point-cloud visualisation colouring -- a rainbow ramp over RANGE
+# (corr(range, R) -0.90, corr(range, B) +0.88 on a marked-road scan; the
+# rendered probe image is concentric bands with no trace of the lane lines the
+# road visibly had). No albedo, no intensity, so paint cannot be read from
+# this sensor by brightness, on this engine version, full stop. Annotation
+# remains the only channel that sees paint.
 #
-# What this costs while on: the road unit's returns carry no semantic labels,
-# so they classify as unknown and reach the road store through the
-# ground-fallback band (the unannotated-map path) -- the far road keeps
-# drawing, but annotation-based paint beyond the roof unit's 55 m stops until
-# the detector exists. A visual colour can also collide with a palette entry
-# by coincidence; rare, and a probe-stage cost, not a design.
-LIDAR_ROAD_VISUAL_COLOUR = True
+# The flag and the probe stay so the conclusion is re-testable on a future
+# BeamNG: flip this on, attach on a marked road, and read the one-shot
+# `Colour check:` line plus logs/road_colour_probe.npz. While on, the road
+# unit's returns carry no semantic labels and reach the road store through
+# the ground-fallback band.
+LIDAR_ROAD_VISUAL_COLOUR = False
 LIDAR_ROAD_MAX_DISTANCE_M = 110.0
 LIDAR_ROAD_HORIZONTAL_FOV_DEG = 80.0
 LIDAR_ROAD_DENSITY = 12.5

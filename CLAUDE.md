@@ -351,15 +351,18 @@ footprint came back as marking, and entire roundabout approaches rendered as one
 The `Marking check:` line prints per-class counts (excluded classes included) as the evidence for
 ever revisiting that.
 
-**The visual-paint experiment (stage one live)**: annotation labels quads, not paint, so the
-plan is to read paint by BRIGHTNESS instead — `LIDAR_ROAD_VISUAL_COLOUR` runs the road-scan unit
-alone with `is_annotated=False`, and the one-shot `Colour check:` line reports what its colour
-channel actually carries in that mode, which is the undocumented fact everything turns on
-(near-100% black or single-digit unique colours = dead channel, experiment over; thousands of
-colours with a bright tail = the rendered scene, and stage two is a luminance-based marking
-detector on that unit, decal transparency respected). While the flag is on, the road unit's
-returns carry no semantic labels and reach the road store through the ground-fallback band — the
-far road keeps drawing, but annotation paint beyond the roof unit's 55 m stops until stage two. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
+**The visual-paint experiment, RETIRED with a measured verdict** (2026-08-10): the hope was to
+read paint by BRIGHTNESS with `is_annotated=False`, the way reflectance lidars do. Probed live on
+a marked road: the unannotated colour channel is BeamNG's own **range-coded rainbow
+visualization** (corr(range, R) −0.90, corr(range, B) +0.88; the rendered probe image is
+concentric bands with no trace of the lane lines the road visibly had) — no albedo, no
+intensity. **Paint cannot be read from this sensor except through annotation, on this engine
+version.** The flag and the one-shot `Colour check:` probe (plus the `road_colour_probe.npz`
+dump) remain so the conclusion is re-testable on future BeamNG versions; do not re-run the
+experiment without them, the summary statistics alone were ambiguous. The remaining alternatives
+if annotation quality ever becomes intolerable: a camera sensor with classic bright-pixel lane
+extraction (high fidelity, real cost), or blob-filtering the annotation (demote marking regions
+wider than paint can be). The marking colour (`#857b49`, a muted paint-yellow) was solved like the
 rest — top of the road's luminance rung, ΔE ≥ 17 from every other surface. The whole feature
 hangs on one undocumented engine fact: whether the LiDAR's annotation pass labels road *decals*
 with the marking class or with the `STREET` beneath them — there is no intensity channel to fall
