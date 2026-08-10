@@ -29,7 +29,6 @@ from .config import (
     AEB_REVERSE_MIN_SPEED_MPS,
     APP_NAME,
     BEAMNG_EXE,
-    DISPLAY_INTERVAL_MS,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
     LIDAR_HORIZONTAL_FOV_DEG,
@@ -39,6 +38,7 @@ from .config import (
     LIDAR_UPDATE_HZ,
     MAX_SPEED_MPS,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
+    WORLD_STORE_REFRESH_INTERVAL_S,
 )
 from .models import BevFrame, VehicleGeometry
 from .scene_worker import SceneWorker
@@ -761,7 +761,10 @@ class MainWindow(QMainWindow):
         in both views, so the reading is honest either way.
         """
         self.scene_value.setText(f"{milliseconds:.1f} ms")
-        if milliseconds <= DISPLAY_INTERVAL_MS:
+        # The refresh runs on its own thread now, so its honest budget is the
+        # refresh CADENCE, not the display tick: only past this does the
+        # refresh rate itself start to degrade.
+        if milliseconds <= WORLD_STORE_REFRESH_INTERVAL_S * 1000.0:
             return
         now = time.monotonic()
         if now - self._scene_budget_warned_at < _SCENE_BUDGET_WARN_INTERVAL_S:
@@ -769,9 +772,10 @@ class MainWindow(QMainWindow):
         self._scene_budget_warned_at = now
         self._append_log(
             f"3D scene store refresh is over budget at {milliseconds:.1f} ms "
-            f"(tick is {DISPLAY_INTERVAL_MS} ms). The view keeps tracking the "
-            "car -- compose ticks are cheap -- but newly observed geometry "
-            "appears more slowly. Control and AEB are unaffected."
+            f"(cadence is {WORLD_STORE_REFRESH_INTERVAL_S * 1000.0:.0f} ms). "
+            "The view keeps tracking the car -- composes run on their own "
+            "thread -- but newly observed geometry appears more slowly. "
+            "Control and AEB are unaffected."
         )
 
     def _set_status(self, state: str, message: str) -> None:

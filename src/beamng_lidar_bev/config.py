@@ -165,9 +165,14 @@ LIDAR_VERTICAL_FOV_DEG = 30.0
 LIDAR_VERTICAL_RESOLUTION = 256
 # Sparsity divisor, NOT a density: 1 = dense, 100 = sparse. Point count scales
 # as 1/density (measured 49,708 at 50 and 99,736 at 25, four sensors combined).
-# This is the one dial to turn: drop to 25.0 for roughly double the returns
-# everywhere, at double the ray-tracing cost inside BeamNG.
-LIDAR_DENSITY = 50.0
+# This is the one dial to turn for more returns everywhere; the cost lands in
+# two places, one per side. Sim-side, ray tracing on the GPU. App-side, every
+# O(cloud) pass -- semantics, the AEB shape tests, the scene stores -- which is
+# why it was held at 50 until the state-poll prefetch and the async store
+# refresh opened CPU headroom. 35 buys ~+43% on the three standard wedges.
+# NEEDS THE LIVE CHECK: read VISIBLE POINTS, POLL TIME and SCENE BUILD after
+# attach, and drop back to 50 if the tick stops fitting.
+LIDAR_DENSITY = 35.0
 LIDAR_UPDATE_HZ = 30.0
 LIDAR_UPDATE_TIME_S = 1.0 / LIDAR_UPDATE_HZ
 
@@ -304,14 +309,15 @@ WORLD_ROAD_RADIUS_M = 100.0
 # the rings down its length -- which never happens for the terrain out to one
 # side, so the terrain gets roughly what a single frame resolves.
 #
-# Since the 512-channel roof unit the sampling would carry ~58 m single-frame
-# (ring spacing 2.99e-4 * r^2 against the 1.0 m bridge), so the COST is now
-# the binding constraint, not the sampling. The road is a ribbon; the ground
-# is a disc, and a 0.25 m lattice over a 70 m disc meshed to 110k vertices and
-# took the scene build to 77 ms. Area goes as r^2, so this is the constant to
-# move -- in either direction -- if SCENE BUILD starts logging; since the
-# two-rate split an overrun costs ground freshness rather than view frames.
-WORLD_SURFACE_RADIUS_M = 40.0
+# Since the 512-channel roof unit the sampling carries ~58 m single-frame
+# (ring spacing 2.99e-4 * r^2 against the 1.0 m bridge), so the COST is the
+# binding constraint, not the sampling -- and 55 spends what the async store
+# refresh freed: the refresh runs on its own thread now, so a bigger disc
+# costs ground freshness (refresh cadence), never view frames or control
+# latency. The road is a ribbon; the ground is a disc, and area goes as r^2
+# (55/40 is 1.9x the cells), so this is still the constant to move first if
+# SCENE BUILD starts logging heavily.
+WORLD_SURFACE_RADIUS_M = 55.0
 # The outer band of the road surface is dissolved into the air rather than cut
 # off, because the road stops at its own radius while everything else runs on to
 # WORLD_RADIUS_M. A hard rim reads as a cliff -- a drawn edge where there is

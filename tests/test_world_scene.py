@@ -1444,9 +1444,12 @@ def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
     against a 40 ms tick. WORLD_SURFACE_RADIUS_M is what bounds it, and it is
     bounded by the sampling anyway (see its comment).
 
-    The scene build runs on `SceneWorker`'s own thread, so overrunning costs
-    WORLD frames rather than control latency -- but it is logged for a reason,
-    and this is the case that would trip it.
+    The budget here is HALF the store-refresh cadence, not the display tick:
+    since the refresh moved to its own thread, an overrun costs ground
+    freshness rather than view frames or control latency, so the honest bound
+    is the cadence it must fit inside -- held at half so a modestly slower
+    machine still fits, and so a regression is caught long before the refresh
+    rate itself degrades.
     """
     points, groups, materials = [], [], []
     for x in np.arange(-60.0, 60.0, 0.35):
@@ -1468,7 +1471,8 @@ def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
 
     assert len(points) > 40_000, "the timing scene stopped being a worst case"
     assert len(frame.road_vertices) > 10_000, "the ground stopped being covered"
-    assert elapsed_ms < 40.0, f"scene build took {elapsed_ms:.1f} ms"
+    budget_ms = config.WORLD_STORE_REFRESH_INTERVAL_S * 1000.0 * 0.5
+    assert elapsed_ms < budget_ms, f"scene build took {elapsed_ms:.1f} ms"
 
 
 # --- Which way a slab faces ---------------------------------------------------
