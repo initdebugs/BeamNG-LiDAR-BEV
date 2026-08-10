@@ -6,6 +6,8 @@ import os
 import subprocess
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -133,6 +135,10 @@ _ACQUISITION_STALE_S = 0.5
 # a strike count: three ticks is under a tenth of a second, which is far too
 # eager to survive a map load.
 _POLL_FAILURE_GRACE_S = 2.0
+# A prefetched vehicle state older than this is re-polled instead of used: the
+# position compensation below is linear in the age, so a state from before an
+# app stall would be extrapolated across the whole stall.
+_STATE_PREFETCH_MAX_AGE_S = 0.3
 # Cadence of the driving telemetry line. Well below the display tick: it exists
 # to explain a run after the fact, not to trace every frame.
 _TELEMETRY_INTERVAL_S = 1.0
@@ -246,6 +252,21 @@ class BeamNgWorker(QObject):
         # line. Collected rather than logged in place because the cloud it
         # describes lives in `_poll_once`.
         self._pending_evidence: list[AebState] = []
+
+        # The state poll is a ~33 ms blocking round-trip -- measured, and most
+        # of the 40 ms tick -- while everything else the tick does is a few
+        # milliseconds of numpy. It is therefore PREFETCHED: each tick submits
+        # the next tick's poll to this one-thread pool on its way out, so the
+        # round-trip runs while the worker thread is idle between timer fires,
+        # and the next tick starts by collecting a result that is usually
+        # already there. Socket safety is by CONSTRUCTION, not by locking:
+        # the prefetch is submitted after the last vehicle-socket use of the
+        # tick (`_actuate`) and collected before the first of the next, so at
+        # any moment exactly one thread is using the connection.
+        self._state_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="beamng-state"
+        )
+        self._state_future: Future[tuple[dict[str, Any], float]] | None = None
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -762,6 +783,7 @@ class BeamNgWorker(QObject):
     def shutdown(self) -> None:
         self._poll_timer.stop()
         self._cleanup_sensors()
+        self._state_pool.shutdown(wait=False)
         if self._bng is not None:
             try:
                 # quit_on_close=False: closing this app leaves BeamNG.tech open.
@@ -797,7 +819,7 @@ class BeamNgWorker(QObject):
         raw_point_count = 0
         had_returns = False
         try:
-            state = self._get_vehicle_state()
+            state = self._take_vehicle_state()
             velocity = vec3(state.get("vel", (0.0, 0.0, 0.0)))
             self._last_speed = float(np.linalg.norm(velocity))
             # Signed, and computed here rather than in the control block below,
@@ -1116,6 +1138,10 @@ class BeamNgWorker(QObject):
                     rear_aeb=rear_aeb,
                 )
             )
+            # The last statement of a successful tick, deliberately after
+            # `_actuate` and the actor poll: nothing on the worker thread will
+            # touch a socket again until the next tick joins this future.
+            self._prefetch_vehicle_state()
         except Exception as exc:
             now = time.perf_counter()
             if self._first_failure_at is None:
@@ -1674,6 +1700,72 @@ class BeamNgWorker(QObject):
             raise RuntimeError("The player vehicle has no active simulation state")
         return state
 
+    def _take_vehicle_state(self) -> dict[str, Any]:
+        """
+        Collect the state the previous tick prefetched, or poll one fresh.
+
+        The prefetched state finished its round-trip up to a tick ago, so the
+        position is advanced by `vel * age` -- a linear correction that restores
+        the pose-to-cloud alignment a synchronous poll had, leaving only the
+        acceleration term (about a centimetre at full braking). The heading is
+        left alone: over these ages it moves under a degree even at full lock.
+        """
+        future, self._state_future = self._state_future, None
+        if future is None:
+            return self._get_vehicle_state()
+        try:
+            state, done_at = future.result()
+        except Exception:
+            LOGGER.debug("Prefetched state poll failed; re-polling", exc_info=True)
+            return self._get_vehicle_state()
+        age = time.perf_counter() - done_at
+        if age > _STATE_PREFETCH_MAX_AGE_S:
+            # From before an app stall; extrapolating across it would be worse
+            # than the round-trip it saves.
+            return self._get_vehicle_state()
+        if age > 0.0 and "pos" in state:
+            position = vec3(state["pos"]) + vec3(
+                state.get("vel", (0.0, 0.0, 0.0))
+            ) * age
+            state["pos"] = tuple(float(value) for value in position)
+        return state
+
+    def _prefetch_vehicle_state(self) -> None:
+        """
+        Start the NEXT tick's state poll, after this tick's last socket use.
+
+        Runs on `_state_pool`'s single thread while the worker thread is idle
+        between timer fires. The worker touches the vehicle socket again only
+        after `_take_vehicle_state` has joined this future, so the connection
+        is never used from two threads at once.
+        """
+        if self._vehicle is None or self._state_future is not None:
+            return
+
+        def request() -> tuple[dict[str, Any], float]:
+            state = self._get_vehicle_state()
+            return state, time.perf_counter()
+
+        try:
+            self._state_future = self._state_pool.submit(request)
+        except RuntimeError:
+            # The pool is shut down; the next tick simply polls synchronously.
+            self._state_future = None
+
+    def _drop_state_future(self) -> None:
+        """
+        Abandon any in-flight prefetch before teardown touches the socket.
+
+        A brief bounded wait, never `result()`: the socket has no timeout, so a
+        simulator stuck mid-request would otherwise hang every teardown path.
+        If it does not finish in time the teardown proceeds anyway -- at that
+        point the bridge is almost certainly gone and the disconnect below
+        will error the request out of its recv.
+        """
+        future, self._state_future = self._state_future, None
+        if future is not None and not future.cancel():
+            futures_wait((future,), timeout=1.0)
+
     @staticmethod
     def _attach_electrics(vehicle: Vehicle) -> None:
         """
@@ -1873,6 +1965,10 @@ class BeamNgWorker(QObject):
         # and it still holds a live vehicle handle here, so this is the one
         # place that guarantees the car is never left driving itself, nor left
         # standing on a brake this app applied.
+        #
+        # The prefetch is dropped FIRST: everything below this line talks on
+        # the same sockets the prefetch thread may still be using.
+        self._drop_state_future()
         self._disengage_aeb("Sensors stopped", announce=False)
         self._disengage_self_driving("Sensors stopped", announce=False)
         for sensor in reversed(self._sensors):

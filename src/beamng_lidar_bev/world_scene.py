@@ -121,6 +121,7 @@ from .semantics import (
 
 _EMPTY_VERTICES = np.empty((0, 3), dtype=np.float32)
 _EMPTY_COLOURS = np.empty((0, 4), dtype=np.float32)
+_EMPTY_RGB = np.empty((0, 3), dtype=np.float32)
 _EMPTY_INDICES = np.empty(0, dtype=np.uint32)
 _EMPTY_CELL_KEYS = np.empty((0, 3), dtype=np.int32)
 _EMPTY_CELL_VALUES = np.empty(0, dtype=np.float64)
@@ -775,6 +776,42 @@ def world_to_render(
         ),
         dtype=np.float32,
     )
+
+
+@dataclass(frozen=True)
+class WorldMesh:
+    """
+    A finished mesh still in WORLD coordinates, one ego projection away from
+    the screen.
+
+    This is the seam the two-rate scene build splits at: everything upstream of
+    it -- the stores, the column runs, bridging, merging, corner averaging --
+    depends only on accumulated world-anchored evidence, so it can be rebuilt
+    at WORLD_STORE_REFRESH_INTERVAL_S. Everything downstream (`present`) is the
+    part that must track the ego every snapshot: the world-to-render rotation,
+    the depth tint (a function of range from the ego) and the edge fade.
+
+    The colour is linear RGB, UNTINTED. Face shading is already baked in, which
+    means the crease cue is re-aimed only at the store rate -- a deliberate
+    staleness of at most the refresh interval on a 1.1-1.3:1 cue.
+    """
+
+    world: np.ndarray
+    colour: np.ndarray
+    indices: np.ndarray
+    edge_radius_m: np.ndarray | None = None
+
+
+_EMPTY_WORLD_MESH = WorldMesh(_EMPTY_VERTICES, _EMPTY_RGB, _EMPTY_INDICES)
+
+
+def present_world_mesh(
+    mesh: WorldMesh, snapshot: PerceptionSnapshot
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project a cached world mesh into this snapshot's ego frame and tint it."""
+    vertices = world_to_render(mesh.world, snapshot)
+    colours = depth_tint(mesh.colour, vertices, mesh.edge_radius_m)
+    return vertices, colours, mesh.indices
 
 
 def path_ribbon(
@@ -1466,6 +1503,10 @@ class WorldSceneAssembler:
         # from. Reset here so the odometer and the stamps written against it can
         # never disagree.
         self._travelled_m = 0.0
+        # The world meshes built from the stores, held between store refreshes
+        # so compose-only ticks can re-present them. None forces a full build,
+        # which is also what makes a teleport reset safe: clear() lands here.
+        self._mesh_cache: tuple[WorldMesh, WorldMesh, WorldMesh] | None = None
         self._road_keys = _EMPTY_CELL_KEYS.copy()
         self._road_height = _EMPTY_CELL_VALUES.copy()
         # Odometer readings, not timestamps.
@@ -1493,35 +1534,71 @@ class WorldSceneAssembler:
         # ground surface. Meaningless on a wall or a car, and never read there.
         self._voxel_material = np.empty(0, dtype=np.uint8)
 
-    def update(self, snapshot: PerceptionSnapshot) -> WorldFrame:
+    def update(
+        self, snapshot: PerceptionSnapshot, *, refresh_stores: bool = True
+    ) -> WorldFrame:
+        """
+        Build a frame; with ``refresh_stores=False``, re-present the last one.
+
+        The split is what lets the view track the car at the display rate while
+        the store work runs slower than it: the stores and the world meshes
+        depend only on accumulated evidence (see `WorldMesh`), so a compose-only
+        call re-projects the cached meshes into this snapshot's ego frame,
+        re-tints them, and rebuilds just the per-snapshot elements -- the AEB
+        overlay, the path, the actors and the camera. A compose-only snapshot's
+        CLOUD is not folded into the stores; that is the freshness trade
+        WORLD_STORE_REFRESH_INTERVAL_S names, and it is no different in kind
+        from the snapshots the one-slot mailbox already dropped when a slow
+        build ran head-down through them.
+
+        The odometer still advances on every call -- expiry stamps are written
+        only during ingestion, but a teleport must reset the scene no matter
+        which kind of tick notices it (`_track_ego_motion` clears, which drops
+        the mesh cache and forces the rebuild below).
+        """
         self._track_ego_motion(snapshot)
-        self._update_road_cells(snapshot)
-        self._expire_road_cells(snapshot)
-        self._update_boundary_columns(snapshot)
-        self._expire_boundary_columns(snapshot)
+        if refresh_stores or self._mesh_cache is None:
+            self._update_road_cells(snapshot)
+            self._expire_road_cells(snapshot)
+            self._update_boundary_columns(snapshot)
+            self._expire_boundary_columns(snapshot)
+
+            # Collapsed ONCE and handed to both consumers. The pass is a
+            # reduceat over the whole voxel store, and the ground surface and
+            # the slabs are the two halves of its one answer -- what is flat
+            # enough to stand on, and what is not.
+            (
+                hazard_keys,
+                hazard_base,
+                hazard_top,
+                hazard_classes,
+                surface_keys,
+                surface_height,
+                surface_material,
+            ) = self._column_runs(snapshot)
+            self._mesh_cache = (
+                self._ground_mesh(
+                    snapshot, surface_keys, surface_height, surface_material
+                ),
+                *self._solid_meshes(
+                    snapshot,
+                    hazard_keys,
+                    hazard_base,
+                    hazard_top,
+                    hazard_classes,
+                ),
+            )
 
         alert = self._alert(snapshot.aeb, snapshot.rear_aeb)
-        # Collapsed ONCE and handed to both consumers. The pass is a reduceat
-        # over the whole voxel store, and the ground surface and the slabs are
-        # the two halves of its one answer -- what is flat enough to stand on,
-        # and what is not.
-        (
-            hazard_keys,
-            hazard_base,
-            hazard_top,
-            hazard_classes,
-            surface_keys,
-            surface_height,
-            surface_material,
-        ) = self._column_runs(snapshot)
-        road_vertices, road_colors, road_indices = self._ground_mesh(
-            snapshot, surface_keys, surface_height, surface_material
+        ground_mesh, boundary_mesh, vehicle_mesh = self._mesh_cache
+        road_vertices, road_colors, road_indices = present_world_mesh(
+            ground_mesh, snapshot
         )
-        (
-            (boundary_vertices, boundary_colors, boundary_indices),
-            (vehicle_vertices, vehicle_colors, vehicle_indices),
-        ) = self._solid_meshes(
-            snapshot, hazard_keys, hazard_base, hazard_top, hazard_classes
+        boundary_vertices, boundary_colors, boundary_indices = present_world_mesh(
+            boundary_mesh, snapshot
+        )
+        vehicle_vertices, vehicle_colors, vehicle_indices = present_world_mesh(
+            vehicle_mesh, snapshot
         )
         (
             (aeb_vertices, aeb_colors, aeb_indices),
@@ -1780,7 +1857,7 @@ class WorldSceneAssembler:
         surface_keys: np.ndarray,
         surface_height: np.ndarray,
         surface_material: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> WorldMesh:
         """
         Mesh the ground cells as a CONTINUOUS surface with shared corners.
 
@@ -1809,7 +1886,7 @@ class WorldSceneAssembler:
             snapshot, surface_keys, surface_height, surface_material
         )
         if not len(cells):
-            return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
+            return _EMPTY_WORLD_MESH
 
         # Colour is resolved per CELL, before bridging, so the interpolation
         # below blends the two materials either side of a gap instead of trying
@@ -1858,8 +1935,6 @@ class WorldSceneAssembler:
                 corner_height,
             )
         )
-        vertices = world_to_render(world, snapshot)
-        colours = depth_tint(corner_colour, vertices, corner_limit)
 
         quad = inverse.reshape(-1, 4).astype(np.uint32)
         indices = np.column_stack(
@@ -1872,7 +1947,14 @@ class WorldSceneAssembler:
                 quad[:, 3],
             )
         ).reshape(-1)
-        return vertices, colours, np.ascontiguousarray(indices)
+        # World coordinates out, not render: the projection and the tint are
+        # per-snapshot work and belong to `present_world_mesh`.
+        return WorldMesh(
+            world,
+            np.ascontiguousarray(corner_colour),
+            np.ascontiguousarray(indices),
+            np.ascontiguousarray(corner_limit),
+        )
 
     def _update_boundary_columns(self, snapshot: PerceptionSnapshot) -> None:
         """
@@ -2141,7 +2223,7 @@ class WorldSceneAssembler:
         base: np.ndarray,
         top: np.ndarray,
         classes: np.ndarray,
-    ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], ...]:
+    ) -> tuple[WorldMesh, ...]:
         """
         The static scenery and the traffic, as two independently coloured meshes.
 
@@ -2173,7 +2255,7 @@ class WorldSceneAssembler:
         top: np.ndarray,
         shadow_linear: np.ndarray,
         lit_linear: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> WorldMesh:
         """
         Extrude one class of voxel runs into merged, face-shaded slabs.
 
@@ -2186,7 +2268,7 @@ class WorldSceneAssembler:
         bucket's own frame before `merge_cell_runs` can find runs along it.
         """
         if not len(keys_2d):
-            return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
+            return _EMPTY_WORLD_MESH
 
         # Layer by BOTH altitude and height so neither a facade and the kerb in
         # front of it, nor a wall and a balcony above it, can average together.
@@ -2323,7 +2405,7 @@ class WorldSceneAssembler:
             )
 
         if not boxes:
-            return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
+            return _EMPTY_WORLD_MESH
         corners = np.concatenate(boxes)
 
         # Explode each box into six independent quads so every face can hold its
@@ -2331,15 +2413,21 @@ class WorldSceneAssembler:
         # one colour.
         faces = corners[:, _BOX_FACE_CORNERS.reshape(-1), :]
         world = faces.reshape(-1, 3)
-        vertices = world_to_render(world, snapshot)
 
         shade = np.repeat(np.concatenate(shades).reshape(-1), 4)[:, None]
         colour = shadow_linear + shade * (lit_linear - shadow_linear)
-        colours = depth_tint(colour, vertices)
 
         quad = np.arange(len(corners) * 6, dtype=np.uint32) * 4
         indices = (quad[:, None] + _FACE_TRIANGLES[None, :]).reshape(-1)
-        return vertices, colours, np.ascontiguousarray(indices)
+        # World coordinates and untinted colour out; `present_world_mesh` does
+        # the per-snapshot projection and tint. The face shading above is baked
+        # against THIS snapshot's basis, so the crease cue re-aims at the store
+        # refresh rate -- a bounded staleness on a 1.1-1.3:1 cue.
+        return WorldMesh(
+            world,
+            np.ascontiguousarray(colour, dtype=np.float32),
+            np.ascontiguousarray(indices),
+        )
 
     @staticmethod
     def _aeb_meshes(

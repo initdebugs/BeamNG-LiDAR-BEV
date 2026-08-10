@@ -244,6 +244,20 @@ WORLD_VEHICLE_TTL_S = 0.15
 # which covers the azimuth spacing out to about 45 m and is far short of
 # anything the car could drive through.
 WORLD_ROAD_BRIDGE_CELLS = 3
+# How often the WORLD stores are refreshed, against a view that re-aims every
+# snapshot. The build has two halves with very different costs and very
+# different needs: folding the cloud into the stores and meshing them
+# (~50-60 ms on an accumulated street drive, and WORLD-ANCHORED -- it depends
+# on the stores, not on where the car is this instant) against re-projecting
+# the cached world meshes into the ego frame, re-tinting and re-aiming the
+# camera (a few ms, and the part that must track the car every snapshot or the
+# whole scene visibly lags and swims). Refreshing the heavy half on this clock
+# and the cheap half on every snapshot is what holds the view at the full
+# display rate while the store work runs as fast as one core carries it.
+# The cost is that NEWLY OBSERVED geometry appears at this cadence rather than
+# the display's -- an eighth of a second of ground freshness, traded for the
+# view tracking the car at 25 Hz instead of jerking along at the build rate.
+WORLD_STORE_REFRESH_INTERVAL_S = 0.12
 # --- How far the view reaches ------------------------------------------------
 #
 # TWO radii, because the road and the things standing on it are not observable

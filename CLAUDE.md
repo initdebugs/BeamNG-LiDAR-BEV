@@ -167,6 +167,20 @@ worker so it lives on and fires on the worker thread. `closeEvent` is the one ex
 stay a `QMetaObject.invokeMethod(..., BlockingQueuedConnection)` so sensors are removed before
 the thread quits. Never touch `_bng`, `_vehicle`, or `_sensors` from the GUI thread.
 
+**The state poll is PREFETCHED, and its socket safety is by construction, not by locking.**
+`poll_sensors("state")` is a ~33 ms blocking round-trip — most of the 40 ms tick, against 0.5 ms
+for all the LiDAR streams — so each tick submits the next tick's poll to a one-thread pool
+(`_prefetch_vehicle_state`) as its **last** statement, after `_actuate` and the actor poll, and the
+next tick collects it (`_take_vehicle_state`) as its **first**. Nothing on the worker thread
+touches a socket between those two points, so the connection is never used from two threads at
+once; beamngpy has no internal locking, which is why this ordering is the whole of the safety
+argument — do not move either call. The collected position is advanced by `vel · age` to restore
+the pose-to-cloud alignment a synchronous poll had; a state older than
+`_STATE_PREFETCH_MAX_AGE_S` (an app stall) is discarded and re-polled. `_cleanup_sensors` calls
+`_drop_state_future` FIRST — a bounded wait, never `result()`, because the socket has no timeout —
+so teardown traffic cannot interleave with an in-flight prefetch. Pinned by
+`test_two_rate_pipeline.py`.
+
 WORLD adds a second `WorldSceneWorkerThread`. `BeamNgWorker.perception_ready`
 queues immutable `PerceptionSnapshot` objects to `SceneWorker`, whose one-slot
 handoff retains only the latest pending snapshot. Surface meshing and actor
@@ -838,11 +852,22 @@ Three smaller measured wins sit alongside it, all output-identical:
 Together these took the steady-state build from **~100 ms to ~60 ms** on an accumulated street drive
 (67k-point cloud, 15k road cells, the voxel store at its 90k cap, 88k ground vertices). The
 remaining cost is roughly half `_ground_mesh` (bridging 10 ms, the box filter 8.5, the ego-relative
-tail 5) and half the voxel store (`_update_boundary_columns` 16 ms, expiry 6), and the largest
-untaken lever is that everything before the ego-relative tail is **world-anchored** — it depends on
-the stores, not on the pose — so it could be refreshed at a lower rate than the view tracks at.
-That trades freshness of newly-observed ground for frame rate, which is a judgement call rather than
-an optimisation.
+tail 5) and half the voxel store (`_update_boundary_columns` 16 ms, expiry 6).
+
+**That lever has now been taken: the build runs at TWO RATES on one thread.** Everything before the
+ego-relative tail is **world-anchored** — it depends on the stores, not on the pose — so
+`WorldSceneAssembler.update(refresh_stores=False)` re-presents the cached `WorldMesh`es (world
+vertices, untinted linear colour, indices, fade radii) into the current snapshot's ego frame:
+`world_to_render` + `depth_tint` + the per-snapshot elements (AEB overlay, path, actors, camera), a
+few milliseconds against the ~60. `SceneWorker` refreshes the stores on
+`WORLD_STORE_REFRESH_INTERVAL_S` and composes every snapshot in between, so the view tracks the car
+at the display rate however slow the store work gets. Three things are load-bearing: a compose
+tick's cloud is **not ingested** (the named freshness trade — no different in kind from the
+snapshots the one-slot mailbox already dropped); `_track_ego_motion` still runs on every tick so a
+**teleport during a compose still clears** — clear() drops the mesh cache, which forces the rebuild;
+and SCENE BUILD keeps meaning "the store refresh", so the over-budget warning still watches the
+right number. Face shading is baked into the cached colour, so the crease cue re-aims at the store
+rate — bounded staleness on a 1.1–1.3:1 cue. Pinned by `test_two_rate_pipeline.py`.
 
 Qt's `offscreen` platform plugin is not QRhi/3D capable, so an offscreen smoke
 can validate QML loading, property binding, lifecycle and fallback but cannot
@@ -1378,7 +1403,11 @@ comments record the numbers. Before "cleaning up" any of them, read the comment:
   it slowed down). It deliberately does *not* see building faces — every ray points below the
   horizon — and it does not out-look a car, since `d·a/(h−a)` is still unbounded when `a ≥ h`.
 - `DISPLAY_INTERVAL_MS = 40`, not 33, because `poll_sensors("state")` is a blocking round-trip
-  measured at 32.7 ms (p95 35.3) while all four `stream()` calls cost 0.54 ms combined.
+  measured at 32.7 ms (p95 35.3) while all four `stream()` calls cost 0.54 ms combined. That poll
+  is now prefetched (see the threading section), so the round-trip overlaps the idle gap between
+  ticks and the tick's own busy time is the numpy work plus whatever remains of the join. 33 ms is
+  therefore plausibly reachable now, but lower it only against a live measurement of the joined
+  wait, not from this comment.
 
 The driving constants have their own trap: several of them look like one quantity and are two.
 Before merging any pair, read the comment — each split below was made because collapsing them

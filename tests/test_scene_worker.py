@@ -9,10 +9,12 @@ class AssemblerStub:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
         self.snapshots: list[object] = []
+        self.refreshes: list[bool] = []
         self.clear_calls = 0
 
-    def update(self, snapshot: object) -> str:
+    def update(self, snapshot: object, *, refresh_stores: bool = True) -> str:
         self.snapshots.append(snapshot)
+        self.refreshes.append(refresh_stores)
         if self.error is not None:
             raise self.error
         return f"frame-{snapshot.timestamp}"  # type: ignore[attr-defined]

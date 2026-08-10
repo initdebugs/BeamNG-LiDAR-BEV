@@ -768,9 +768,10 @@ class MainWindow(QMainWindow):
             return
         self._scene_budget_warned_at = now
         self._append_log(
-            f"3D scene build is over budget at {milliseconds:.1f} ms "
-            f"(tick is {DISPLAY_INTERVAL_MS} ms), so WORLD is dropping frames. "
-            "Control and AEB are unaffected -- they run on the BeamNG thread."
+            f"3D scene store refresh is over budget at {milliseconds:.1f} ms "
+            f"(tick is {DISPLAY_INTERVAL_MS} ms). The view keeps tracking the "
+            "car -- compose ticks are cheap -- but newly observed geometry "
+            "appears more slowly. Control and AEB are unaffected."
         )
 
     def _set_status(self, state: str, message: str) -> None:

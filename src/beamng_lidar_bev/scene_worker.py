@@ -14,6 +14,7 @@ from PyQt6.QtCore import (
     pyqtSlot,
 )
 
+from .config import WORLD_STORE_REFRESH_INTERVAL_S
 from .models import PerceptionSnapshot
 from .world_scene import WorldSceneAssembler
 
@@ -39,6 +40,9 @@ class SceneWorker(QObject):
         self._scheduled = False
         self._stopped = False
         self._mailbox_lock = threading.Lock()
+        # When the stores were last refreshed. -inf so the first snapshot after
+        # construction or clear() always runs a full build.
+        self._last_refresh_at = -float("inf")
 
     @pyqtSlot(object)
     def submit(self, snapshot: PerceptionSnapshot) -> None:
@@ -72,17 +76,30 @@ class SceneWorker(QObject):
         if snapshot is None or stopped:
             return
 
+        # Two rates on one thread: the stores refresh on their own clock, and
+        # every snapshot in between re-presents the cached world meshes into
+        # its own ego frame -- which is the cheap part, and the part that must
+        # track the car or the whole scene visibly lags. See
+        # WORLD_STORE_REFRESH_INTERVAL_S.
         started = time.perf_counter()
+        refresh = (
+            started - self._last_refresh_at >= WORLD_STORE_REFRESH_INTERVAL_S
+        )
         try:
-            frame = self._assembler.update(snapshot)
+            frame = self._assembler.update(snapshot, refresh_stores=refresh)
         except Exception as exc:
             LOGGER.exception("3D scene build failed")
             self._assembler.clear()
             self.scene_error.emit(f"3D scene build failed: {exc}")
         else:
-            self.build_time_changed.emit(
-                (time.perf_counter() - started) * 1000.0
-            )
+            if refresh:
+                self._last_refresh_at = started
+                # SCENE BUILD keeps meaning "the store refresh", which is the
+                # figure the over-budget warning watches; compose-only ticks
+                # are a few milliseconds and reporting them would bury it.
+                self.build_time_changed.emit(
+                    (time.perf_counter() - started) * 1000.0
+                )
             self.world_frame_ready.emit(frame)
         with self._mailbox_lock:
             schedule = self._pending is not None and not self._stopped
@@ -96,6 +113,7 @@ class SceneWorker(QObject):
         with self._mailbox_lock:
             self._pending = None
         self._assembler.clear()
+        self._last_refresh_at = -float("inf")
 
     @pyqtSlot()
     def shutdown(self) -> None:
