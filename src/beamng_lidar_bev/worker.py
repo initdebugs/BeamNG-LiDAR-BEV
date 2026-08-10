@@ -896,7 +896,7 @@ class BeamNgWorker(QObject):
                 # stubs may arm sensors without it, and they have no road unit.
                 if index < len(self._sensor_names):
                     self._watch_visual_colours(
-                        self._sensor_names[index], colours
+                        self._sensor_names[index], colours, points
                     )
                 finite = np.isfinite(points).all(axis=1)
                 if not finite.all():
@@ -1387,7 +1387,9 @@ class BeamNgWorker(QObject):
             event.sample(forward_speed, dt)
             self._log_brake_measurement(event.finish())
 
-    def _watch_visual_colours(self, name: str, colours: np.ndarray) -> None:
+    def _watch_visual_colours(
+        self, name: str, colours: np.ndarray, points: np.ndarray
+    ) -> None:
         """
         Stage one of the visual-paint experiment, as one log line.
 
@@ -1410,6 +1412,15 @@ class BeamNgWorker(QObject):
         luminance = colours.astype(np.float64) @ (0.2126, 0.7152, 0.0722)
         black = 100.0 * float(np.mean(np.all(colours == 0, axis=1)))
         unique = int(len(np.unique(pack_rgb_rows(colours))))
+        # R==G==B distinguishes an intensity-style grayscale channel from a
+        # genuinely rendered scene; the first probe's summary could not tell
+        # the two apart, which is exactly what this line has to answer.
+        grey = 100.0 * float(
+            np.mean(
+                (colours[:, 0] == colours[:, 1])
+                & (colours[:, 1] == colours[:, 2])
+            )
+        )
         spread = ", ".join(
             f"p{p} {v:.0f}"
             for p, v in zip(
@@ -1420,16 +1431,35 @@ class BeamNgWorker(QObject):
         bright = 100.0 * float(np.mean(luminance > 160.0))
         LOGGER.info(
             "Colour check: road unit visual channel over %d returns -- "
-            "%.1f%% pure black, %d unique colours, luminance %s, %.2f%% "
-            "above 160. Dead channel: near-100%% black or single-digit "
-            "unique colours. Rendered scene: thousands of colours and a "
-            "bright tail wherever there is paint.",
+            "%.1f%% pure black, %d unique colours, %.1f%% grayscale "
+            "(R==G==B), luminance %s, %.2f%% above 160. Dead channel: "
+            "near-100%% black. Intensity channel: ~100%% grayscale. "
+            "Rendered scene: mostly non-gray colours.",
             len(colours),
             black,
             unique,
+            grey,
             spread,
             bright,
         )
+        self._dump_colour_probe(points, colours)
+
+    @staticmethod
+    def _dump_colour_probe(points: np.ndarray, colours: np.ndarray) -> None:
+        """
+        Save the probed scan so the channel can be LOOKED at, not just
+        summarised: scatter the points coloured by the channel and lane lines
+        are either visibly there or visibly not, which settles stage one in a
+        way no statistic does. One file, overwritten per attach.
+        """
+        try:
+            target = (
+                Path(__file__).parents[2] / "logs" / "road_colour_probe.npz"
+            )
+            np.savez_compressed(target, points=points, colours=colours)
+            LOGGER.info("Colour check: scan dumped to %s", target)
+        except Exception:
+            LOGGER.debug("Could not dump the colour probe", exc_info=True)
 
     def _watch_for_markings(
         self, materials: np.ndarray, colours: np.ndarray

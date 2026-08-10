@@ -1112,10 +1112,11 @@ def test_the_colour_probe_fires_once_and_only_for_the_road_unit() -> None:
     colours = np.asarray(
         [[12, 12, 12], [240, 240, 238], [128, 128, 128]], dtype=np.uint8
     )
+    points = np.zeros((3, 3), dtype=np.float32)
 
     probe = SimpleNamespace(_logged_colour_probe=False)
-    BeamNgWorker._watch_visual_colours(probe, "front", colours)  # type: ignore[arg-type]
+    BeamNgWorker._watch_visual_colours(probe, "front", colours, points)  # type: ignore[arg-type]
     assert probe._logged_colour_probe is False
 
-    BeamNgWorker._watch_visual_colours(probe, "road", colours)  # type: ignore[arg-type]
+    BeamNgWorker._watch_visual_colours(probe, "road", colours, points)  # type: ignore[arg-type]
     assert probe._logged_colour_probe is True
