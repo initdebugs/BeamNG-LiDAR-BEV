@@ -349,7 +349,17 @@ decal QUADS and the annotation labels the whole quad, transparent texels include
 is barely wider than its paint, but junction furniture ships as big rectangular decals whose full
 footprint came back as marking, and entire roundabout approaches rendered as one sheet of paint.
 The `Marking check:` line prints per-class counts (excluded classes included) as the evidence for
-ever revisiting that. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
+ever revisiting that.
+
+**The visual-paint experiment (stage one live)**: annotation labels quads, not paint, so the
+plan is to read paint by BRIGHTNESS instead — `LIDAR_ROAD_VISUAL_COLOUR` runs the road-scan unit
+alone with `is_annotated=False`, and the one-shot `Colour check:` line reports what its colour
+channel actually carries in that mode, which is the undocumented fact everything turns on
+(near-100% black or single-digit unique colours = dead channel, experiment over; thousands of
+colours with a bright tail = the rendered scene, and stage two is a luminance-based marking
+detector on that unit, decal transparency respected). While the flag is on, the road unit's
+returns carry no semantic labels and reach the road store through the ground-fallback band — the
+far road keeps drawing, but annotation paint beyond the roof unit's 55 m stops until stage two. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
 rest — top of the road's luminance rung, ΔE ≥ 17 from every other surface. The whole feature
 hangs on one undocumented engine fact: whether the LiDAR's annotation pass labels road *decals*
 with the marking class or with the `STREET` beneath them — there is no intensity channel to fall

@@ -1097,3 +1097,25 @@ def test_a_firing_explains_itself_once(
     assert len(evidence) == 1
     assert "AEB at 10.0 m" in evidence[0]
     assert not worker._pending_evidence
+
+
+def test_the_colour_probe_fires_once_and_only_for_the_road_unit() -> None:
+    """
+    Stage one of the visual-paint experiment: with LIDAR_ROAD_VISUAL_COLOUR
+    on, the road unit runs unannotated and one log line reports what its
+    colour channel carries. It must never fire for the annotated units, whose
+    colours are class labels and would read as a nonsense distribution.
+    """
+    assert worker_module.LIDAR_ROAD_VISUAL_COLOUR, (
+        "the probe stage is meant to be on; retire this test with the flag"
+    )
+    colours = np.asarray(
+        [[12, 12, 12], [240, 240, 238], [128, 128, 128]], dtype=np.uint8
+    )
+
+    probe = SimpleNamespace(_logged_colour_probe=False)
+    BeamNgWorker._watch_visual_colours(probe, "front", colours)  # type: ignore[arg-type]
+    assert probe._logged_colour_probe is False
+
+    BeamNgWorker._watch_visual_colours(probe, "road", colours)  # type: ignore[arg-type]
+    assert probe._logged_colour_probe is True

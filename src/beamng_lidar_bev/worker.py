@@ -43,6 +43,7 @@ from .config import (
     CONTROL_INTERVAL_MS,
     DISPLAY_INTERVAL_MS,
     LIDAR_RANGE_M,
+    LIDAR_ROAD_VISUAL_COLOUR,
     LIDAR_UPDATE_HZ,
     LIDAR_UPDATE_TIME_S,
     LOOKAHEAD_MAX_M,
@@ -248,6 +249,9 @@ class BeamNgWorker(QObject):
         # Packed palette colour -> class name for every paint-ish class, built
         # at attach so the Marking check line can attribute counts per class.
         self._marking_names: dict[int, str] = {}
+        # One-shot for the visual-paint experiment: what the road unit's
+        # colour channel actually carries with annotation off.
+        self._logged_colour_probe = False
 
         # --- Plant diagnostics, which change nothing ------------------------
         #
@@ -450,7 +454,14 @@ class BeamNgWorker(QObject):
                     # BeamNG writes each latest 30 Hz scan directly into shared
                     # memory so the display loop never waits on four requests.
                     is_streaming=True,
-                    is_annotated=True,
+                    # The road-scan unit runs unannotated while the visual-
+                    # paint experiment is on: its colour channel then carries
+                    # whatever the engine renders instead of class colours,
+                    # and the one-shot `Colour check:` line reports what that
+                    # actually is. See LIDAR_ROAD_VISUAL_COLOUR.
+                    is_annotated=not (
+                        LIDAR_ROAD_VISUAL_COLOUR and mount.name == "road"
+                    ),
                     is_static=False,
                     is_snapping_desired=False,
                     is_force_inside_triangle=False,
@@ -881,6 +892,12 @@ class BeamNgWorker(QObject):
                 if not len(points):
                     continue
                 colours = self._coerce_colours(reading.get("colours"), len(points))
+                # The names list is parallel to _sensors from attach; offline
+                # stubs may arm sensors without it, and they have no road unit.
+                if index < len(self._sensor_names):
+                    self._watch_visual_colours(
+                        self._sensor_names[index], colours
+                    )
                 finite = np.isfinite(points).all(axis=1)
                 if not finite.all():
                     points = points[finite]
@@ -1369,6 +1386,50 @@ class BeamNgWorker(QObject):
         elif event.active:
             event.sample(forward_speed, dt)
             self._log_brake_measurement(event.finish())
+
+    def _watch_visual_colours(self, name: str, colours: np.ndarray) -> None:
+        """
+        Stage one of the visual-paint experiment, as one log line.
+
+        With LIDAR_ROAD_VISUAL_COLOUR on, the road unit runs unannotated and
+        this reports what its colour channel actually carries -- the
+        undocumented fact the whole experiment turns on. Reading the verdict:
+        near-100% black or a handful of unique values means the channel is
+        dead in this mode and the experiment ends here; thousands of unique
+        colours with a bright luminance tail on a marked road means it is the
+        rendered scene, and paint is readable by brightness -- stage two.
+        """
+        if (
+            self._logged_colour_probe
+            or not LIDAR_ROAD_VISUAL_COLOUR
+            or name != "road"
+            or not len(colours)
+        ):
+            return
+        self._logged_colour_probe = True
+        luminance = colours.astype(np.float64) @ (0.2126, 0.7152, 0.0722)
+        black = 100.0 * float(np.mean(np.all(colours == 0, axis=1)))
+        unique = int(len(np.unique(pack_rgb_rows(colours))))
+        spread = ", ".join(
+            f"p{p} {v:.0f}"
+            for p, v in zip(
+                (5, 25, 50, 75, 95),
+                np.percentile(luminance, (5, 25, 50, 75, 95)),
+            )
+        )
+        bright = 100.0 * float(np.mean(luminance > 160.0))
+        LOGGER.info(
+            "Colour check: road unit visual channel over %d returns -- "
+            "%.1f%% pure black, %d unique colours, luminance %s, %.2f%% "
+            "above 160. Dead channel: near-100%% black or single-digit "
+            "unique colours. Rendered scene: thousands of colours and a "
+            "bright tail wherever there is paint.",
+            len(colours),
+            black,
+            unique,
+            spread,
+            bright,
+        )
 
     def _watch_for_markings(
         self, materials: np.ndarray, colours: np.ndarray
@@ -2073,6 +2134,7 @@ class BeamNgWorker(QObject):
         self._logged_marking_silence = False
         self._marking_free_scans = 0
         self._marking_names = {}
+        self._logged_colour_probe = False
         self._palette = None
         # A stop in progress when the sensors go is not a stop that was
         # measured, and the next attach may well be a different car.

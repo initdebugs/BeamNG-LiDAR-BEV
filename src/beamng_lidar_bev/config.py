@@ -162,6 +162,24 @@ LIDAR_ROOF_FAR_M = 55.0
 # Budget: ~+1.9 standard units at density 12.5 (~+15%), the same narrowness
 # trade the long-range FRONT unit makes for AEB. Every figure here needs the
 # live `Sensor reach:` check like the rest of the optics.
+# STAGE ONE OF THE VISUAL-PAINT EXPERIMENT. With this on, the road-scan unit
+# alone runs is_annotated=False, so its colour channel carries whatever the
+# engine renders there instead of annotation classes -- believed (undocumented)
+# to be the scene's visual colour, which would let paint be read by BRIGHTNESS
+# the way real reflectance lidars do, decal transparency respected, arrows and
+# hatching correctly shaped. The one-shot `Colour check:` line prints the
+# channel's distribution, which is the whole point of the stage: all-black or
+# single-valued means the channel is dead in this mode and the experiment
+# ends; a bright tail on a marked road means stage two (the brightness
+# detector) is worth building.
+#
+# What this costs while on: the road unit's returns carry no semantic labels,
+# so they classify as unknown and reach the road store through the
+# ground-fallback band (the unannotated-map path) -- the far road keeps
+# drawing, but annotation-based paint beyond the roof unit's 55 m stops until
+# the detector exists. A visual colour can also collide with a palette entry
+# by coincidence; rare, and a probe-stage cost, not a design.
+LIDAR_ROAD_VISUAL_COLOUR = True
 LIDAR_ROAD_MAX_DISTANCE_M = 110.0
 LIDAR_ROAD_HORIZONTAL_FOV_DEG = 80.0
 LIDAR_ROAD_DENSITY = 12.5
