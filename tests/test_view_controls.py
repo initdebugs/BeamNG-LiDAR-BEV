@@ -52,11 +52,13 @@ def test_side_and_rear_wedges_point_out_of_their_own_sides() -> None:
 
 def test_the_roof_reach_is_its_ground_annulus_not_its_slant_range() -> None:
     depression = math.radians(10.0)
+    # A slant range deliberately different from the annulus far edge, so the
+    # assertion below can tell which one the coverage reports.
     mount = SensorMount(
         "roof",
         (0.0, 0.0, 1.6),
         (0.0, -math.cos(depression), -math.sin(depression)),
-        max_distance_m=100.0,
+        max_distance_m=LIDAR_ROOF_FAR_M + 35.0,
         horizontal_fov_deg=170.0,
     )
     coverage = sensor_coverage(mount)

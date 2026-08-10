@@ -16,6 +16,7 @@ from .config import (
     LIDAR_ROOF_HORIZONTAL_FOV_DEG,
     LIDAR_ROOF_MAX_DISTANCE_M,
     LIDAR_ROOF_NEAR_M,
+    LIDAR_ROOF_VERTICAL_RESOLUTION,
     ROOF_SENSOR_CLEARANCE_M,
     SENSOR_BODY_CLEARANCE_M,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
@@ -154,6 +155,11 @@ def derive_vehicle_geometry(
             horizontal_fov_deg=LIDAR_ROOF_HORIZONTAL_FOV_DEG,
             density=LIDAR_ROOF_DENSITY,
             vertical_fov_deg=roof_fov_deg,
+            # Twice the global figure, because ring spacing on the ground is
+            # (r^2/h) * dtheta and halving dtheta is what pushed the road
+            # surface from 70 m to WORLD_ROAD_RADIUS_M. Channels spread the
+            # ray budget rather than adding to it, so this is nearly free.
+            vertical_resolution=LIDAR_ROOF_VERTICAL_RESOLUTION,
         ),
     }
 

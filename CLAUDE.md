@@ -51,14 +51,15 @@ value. Claims about sensor placement, FOV or ray budget need a live check — at
 `Mount check:` line the worker logs (one per mount now, since they no longer share a height),
 and confirm VISIBLE POINTS is in the tens of thousands with grey reaching the outer rings.
 
-The **roof unit has not been live-checked at all** (added 2026-07-29). Three things the offline
-suite cannot reach. Whether `density` holds the ray *count* constant as the FOV narrows or scales
-it with solid angle is still undocumented and unmeasured — the `Sensor reach:` line prints each
-unit's own return count and furthest return, which settles it. Whether a fifth unit at
-`LIDAR_ROOF_DENSITY = 12.5` (≈ +57% total ray budget, still less than halving `LIDAR_DENSITY`
-globally) costs sim frames — if it does, raise it to 25.0 first, which halves the azimuth
-sampling and leaves the radial win untouched. And whether the road visibly fills: the prediction
-is that the arcs-with-bands look disappears inside ~29 m immediately, before any of the WORLD
+The **roof unit has not been live-checked at all** (added 2026-07-29; retuned 2026-08-10 to
+density 25, 512 channels over a 6–100 m annulus). Four things the offline suite cannot reach.
+Whether `density` holds the ray *count* constant as the FOV narrows or scales it with solid angle
+is still undocumented and unmeasured — the `Sensor reach:` line prints each unit's own return
+count and furthest return, which settles it. Whether the fifth unit (≈ +28% total ray budget at
+density 25) costs sim frames. Whether **512 channels over a ~14° aperture** (0.027°/channel,
+finer than anything measured on this engine) actually delivers the halved ring spacing the
+100 m road radius is built on. And whether the road visibly fills: the prediction is that the
+arcs-with-bands look disappears inside ~29 m immediately, before any of the WORLD
 accumulation work. **It also puts new returns into the AEB height band from above, so the
 phantom-braking checklist below has to be re-run before trusting it.** Self-driving has its own live checklist: the `Drive check:` line
 at engage, the slope allowance at the 40 km/h cap on a hilly map (see `SLOPE_ALLOWANCE_PER_M`),
@@ -787,17 +788,18 @@ every large surface is a `NoLighting` material and those skip the lighting path 
 **There are THREE radii, because structure, road and open ground are not observable to the same
 distance.** `WORLD_RADIUS_M` is 150 m and covers structure, traffic and actors: the front
 unit reaches 200 m, a wall is a big vertical target, and azimuth spacing (which grows only as
-`r`) still puts several returns on a building at 150 m. `WORLD_ROAD_RADIUS_M` is 70 m and covers
-the ground, because ground rings go as `r²` — 0.24 m apart at 20 m but ~1.5 m at 50 m and ~6 m at
-100 m — so past about 70 m there is no surface to reconstruct, only isolated rings metres apart,
-and meshing those gives a corrugated road rather than distance.
+`r`) still puts several returns on a building at 150 m. `WORLD_ROAD_RADIUS_M` is 100 m and covers
+the ground: ground rings go as `r²` — 0.12 m apart at 20 m for the 512-channel roof unit, 0.75 m
+at 50 m, ~3 m at 100 m — so a single frame holds together to ~58 m (where the spacing outruns the
+1.0 m mesh bridge) and the 58–100 m stretch is carried by accumulation while driving. It was 70
+with 256 channels over a 6–80 m annulus; the radius, `LIDAR_ROOF_FAR_M` and
+`LIDAR_ROOF_VERTICAL_RESOLUTION` moved together, because each is useless without the other two.
 
-`WORLD_SURFACE_RADIUS_M` is 40 m and covers **unpaved** ground. Ring spacing is `(r²/h)·Δθ` =
-`5.9e-4·r²` for the roof unit — 0.72 m at 35 m, 1.19 m at 45 m — against the 0.75 m
-`WORLD_ROAD_BRIDGE_CELLS` can close, so past roughly 36 m a single frame yields disconnected rings
-rather than a surface. **The road reaches further because it is driven ALONG**: accumulation over
-`WORLD_CELL_MEMORY_M` sweeps the rings down its length and fills it in, which never happens for the
-terrain out to one side. It is also the cost bound — see the scene-build note below.
+`WORLD_SURFACE_RADIUS_M` is 40 m and covers **unpaved** ground. **The road reaches further because
+it is driven ALONG**: accumulation over `WORLD_CELL_MEMORY_M` sweeps the rings down its length and
+fills it in, which never happens for the terrain out to one side. Since the 512-channel unit the
+sampling would carry ~58 m single-frame, so the binding constraint here is now the scene-build
+COST (area goes as `r²`), not the sampling — see the scene-build note below.
 
 Each half of the ground carries its own fade radius per cell, averaged to the corners exactly as
 height and colour are, so the seam between them is a gradient and each dissolves where it really
@@ -1388,8 +1390,10 @@ comments record the numbers. Before "cleaning up" any of them, read the comment:
   `Δr = (r²/h)·Δθ` apart. That is the whole reason the road looked gappy: at the 0.20 m mounts it
   is 0.50 m at 7 m, **4.11 m at 20 m and 25.7 m at 50 m** against a 0.5 m `WORLD_CELL_SIZE_M`.
   The road arrives as concentric arcs with empty bands between them, and **no ray count closes
-  them** — extra rays go to azimuth. Measured with the roof unit: 0.24 m at 20 m, 1.48 m at 50 m,
-  so single-frame sub-cell coverage goes from **7.0 m to 29.1 m**.
+  them** — extra rays go to azimuth. Only the CHANNEL count does: the roof unit runs
+  `LIDAR_ROOF_VERTICAL_RESOLUTION = 512` over its 6–100 m annulus, computing to 0.12 m spacing at
+  20 m and 0.75 m at 50 m — the halved-`Δθ` figures the 100 m road radius is built on, still
+  awaiting their live check. (Measured at 256 over 6–80: 0.24 m at 20 m, 1.48 m at 50 m.)
 
   Note what the arithmetic actually says, because it is not the obvious thing: with the annulus
   pinned, `Δθ` scales with `h` and `Δr = (r²/h)·Δθ` cancels it — ring spacing is a property of
@@ -1428,7 +1432,7 @@ had a measured failure:
 The WORLD constants have a trap of their own: **several of them are sized by the SENSOR and one
 is sized by the RENDERER, and it is no longer the renderer that binds.**
 
-- `WORLD_RADIUS_M` (150) vs `WORLD_ROAD_RADIUS_M` (70) vs `WORLD_SURFACE_RADIUS_M` (40) are three
+- `WORLD_RADIUS_M` (150) vs `WORLD_ROAD_RADIUS_M` (100) vs `WORLD_SURFACE_RADIUS_M` (40) are three
   different questions — how far STRUCTURE is observable, how far the ROAD is, and how far OPEN
   GROUND is. Collapsing any pair either shreds a surface into rings or throws away the reach. The
   road outreaches the terrain because it is driven along and accumulation fills it in; the terrain
@@ -1442,9 +1446,11 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   the `ProceduralMesh` Python loop, not because of the data; with the raw-buffer bridge the grid
   follows the sensors instead. 0.25 is what the roof unit supports — ring spacing is 0.24 m at
   20 m — and going finer would resolve less than the returns carry.
-- `WORLD_ROAD_BRIDGE_CELLS` (3) and `WORLD_COLUMN_BRIDGE_CELLS` (4) are the same idea on
+- `WORLD_ROAD_BRIDGE_CELLS` (4) and `WORLD_COLUMN_BRIDGE_CELLS` (4) are the same idea on
   different surfaces and both scale with the cell size: halving the cell must double them or the
-  same physical gap stops being closed. The column figure went 2 → 4 for exactly that reason.
+  same physical gap stops being closed. The column figure went 2 → 4 for exactly that reason,
+  and the road figure 3 → 4 when `LIDAR_ROOF_DENSITY` went 12.5 → 25 and the azimuth stripes
+  doubled to ~0.93 m at 30 m.
 - `WORLD_COLUMN_VERTICAL_BRIDGE_BINS` (1 bin, 0.25 m) is the *opposite* axis and must stay small.
   It has to exceed the vertical sampling gap on a wall (0.10 m at 50 m) so walls stay solid, and
   stay far under the clear air beneath a canopy or a bridge deck so those still split. Raising it

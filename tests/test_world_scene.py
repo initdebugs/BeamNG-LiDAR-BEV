@@ -162,7 +162,8 @@ def test_road_cells_are_forgotten_by_distance_driven_not_by_time() -> None:
 
 def test_road_mesh_is_bounded_by_radius_and_clears_after_pose_jump() -> None:
     assembler = WorldSceneAssembler()
-    far = _snapshot(((0.0, 90.0, -0.5),), (SCENE_ROAD,))
+    beyond = float(config.WORLD_ROAD_RADIUS_M) + 20.0
+    far = _snapshot(((0.0, beyond, -0.5),), (SCENE_ROAD,))
     near = _snapshot(((0.0, 3.0, -0.5),), (SCENE_ROAD,), timestamp=0.1)
 
     assert not assembler.update(far).road_indices.size
