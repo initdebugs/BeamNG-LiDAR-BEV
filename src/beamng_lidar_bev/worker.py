@@ -100,6 +100,7 @@ from .planner import (
 )
 from .semantics import (
     SCENE_ROAD,
+    SURFACE_MARKING,
     SemanticPalette,
     classify_scene_groups,
     classify_surface_materials,
@@ -139,6 +140,10 @@ _POLL_FAILURE_GRACE_S = 2.0
 # position compensation below is linear in the age, so a state from before an
 # app stall would be extrapolated across the whole stall.
 _STATE_PREFETCH_MAX_AGE_S = 0.3
+# Scans without a single marking return before the Marking check line reports
+# the silence -- about ten seconds, enough driving to have crossed paint on any
+# marked road.
+_MARKING_SILENCE_SCANS = 250
 # Cadence of the driving telemetry line. Well below the display tick: it exists
 # to explain a run after the fact, not to trace every frame.
 _TELEMETRY_INTERVAL_S = 1.0
@@ -230,6 +235,13 @@ class BeamNgWorker(QObject):
         # One-shot per-sensor reach diagnostic, emitted from the first tick that
         # actually carries returns.
         self._logged_reach = False
+        # One-shot road-marking diagnostics: the palette has marking classes,
+        # but whether the LiDAR's annotation pass labels road DECALS with them
+        # is only knowable live. Two independent one-shots, because paint can
+        # first appear long after a silence verdict was reasonable.
+        self._logged_markings = False
+        self._logged_marking_silence = False
+        self._marking_free_scans = 0
 
         # --- Plant diagnostics, which change nothing ------------------------
         #
@@ -921,6 +933,7 @@ class BeamNgWorker(QObject):
                 scene_materials = classify_surface_materials(
                     colours, self._palette
                 )
+                self._watch_for_markings(scene_materials)
                 road_mask = scene_groups == SCENE_ROAD
                 road_points = self._limit_points(
                     bev[road_mask], MAX_ROAD_RENDER_POINTS
@@ -1339,6 +1352,44 @@ class BeamNgWorker(QObject):
         elif event.active:
             event.sample(forward_speed, dt)
             self._log_brake_measurement(event.finish())
+
+    def _watch_for_markings(self, materials: np.ndarray) -> None:
+        """
+        The live check the marking feature depends on, as one log line.
+
+        BeamNG's palette has SOLID_LINE/DASHED_LINE/ZEBRA_CROSSING classes, but
+        markings are DECALS on the road, and whether the LiDAR's annotation
+        pass labels a decal hit with the marking class -- rather than the
+        STREET beneath it -- is not documented anywhere. There is no intensity
+        channel in this sensor mode to fall back on, so if this prints zero on
+        a marked road, paint simply cannot be seen by this sensor and the
+        colours downstream will never fire.
+        """
+        if self._logged_markings:
+            return
+        count = int(np.count_nonzero(materials == SURFACE_MARKING))
+        if count:
+            self._logged_markings = True
+            LOGGER.info(
+                "Marking check: %d road-marking returns in a %d-return scan. "
+                "The LiDAR annotation does label decals; lane paint will draw.",
+                count,
+                len(materials),
+            )
+            return
+        self._marking_free_scans += 1
+        if (
+            self._marking_free_scans == _MARKING_SILENCE_SCANS
+            and not self._logged_marking_silence
+        ):
+            self._logged_marking_silence = True
+            LOGGER.info(
+                "Marking check: no road-marking returns in %d scans. Either "
+                "this stretch is unmarked, or the LiDAR annotation labels "
+                "decals as the road beneath them -- drive over lane lines to "
+                "settle it. This line will follow up if paint ever appears.",
+                _MARKING_SILENCE_SCANS,
+            )
 
     def _watch_manual_braking(self, now: float) -> None:
         """
@@ -1984,6 +2035,9 @@ class BeamNgWorker(QObject):
         self._geometry = None
         self._mirrored_geometry = None
         self._logged_reach = False
+        self._logged_markings = False
+        self._logged_marking_silence = False
+        self._marking_free_scans = 0
         self._palette = None
         # A stop in progress when the sensors go is not a stop that was
         # measured, and the next attach may well be a different car.

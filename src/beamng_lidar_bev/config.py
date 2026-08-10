@@ -583,6 +583,14 @@ WORLD_SURFACE_BARE_RGB = "#85664c"
 # came out dE 6.7 from paved, below the pair this palette already treats as its
 # closest. Hard unpaved ground is one material here.
 WORLD_SURFACE_WATER_RGB = "#447195"
+# Road paint -- lane lines, arrows, crossings. Solved in CIELAB like the rest:
+# a muted paint-yellow at the TOP of the road's luminance rung (3.03:1 against
+# the air, the band's ceiling), because real markings separate from tarmac by
+# being lighter and this band allows exactly one step of that. The hue does
+# the rest: dE 33 from paved and >= 17 from every other surface, the widest
+# margins in the surface set, because a 0.3 m stripe is the smallest patch any
+# of these colours has to carry.
+WORLD_SURFACE_MARKING_RGB = "#857b49"
 WORLD_PATH_RGB = "#4ea8f2"
 WORLD_PATH_ALERT_RGB = "#c0271e"
 # Traffic drawn from LiDAR alone, in the same blue as the corroborated actor
@@ -815,6 +823,22 @@ BARE_GROUND_CLASSES = frozenset(
     {"DIRT", "GRAVEL", "MUD", "ROCK", "SAND", "TERRAIN"}
 )
 WATER_CLASSES = frozenset({"WATER"})
+# Paint on the road. Every one of these except SPEED_BUMP is ALSO in
+# ROAD_CLASSES -- a lane line is drivable tarmac -- and the material table is
+# ordered so this set wins the colour: the marking rides on the road store
+# exactly as before and only its paint shows. Whether the LiDAR's annotation
+# pass actually labels road DECALS with these classes (rather than the STREET
+# beneath them) is the live question the worker's one-shot `Marking check:`
+# line answers; the classes exist in 0.38.5's annotations.json either way.
+MARKING_CLASSES = frozenset(
+    {
+        "DASHED_LINE",
+        "DRIVING_INSTRUCTIONS",
+        "SOLID_LINE",
+        "SPEED_BUMP",
+        "ZEBRA_CROSSING",
+    }
+)
 
 # --- Self-driving ------------------------------------------------------------
 #

@@ -317,6 +317,7 @@ SURFACES = (
     "surface_bare",
     "surface_water",
     "surface_unknown",
+    "surface_marking",
 )
 
 
@@ -328,6 +329,7 @@ def _surface_palette() -> dict[str, np.ndarray]:
         "surface_bare": linear_rgb(config.WORLD_SURFACE_BARE_RGB),
         "surface_water": linear_rgb(config.WORLD_SURFACE_WATER_RGB),
         "surface_unknown": linear_rgb(config.WORLD_SURFACE_UNKNOWN_RGB),
+        "surface_marking": linear_rgb(config.WORLD_SURFACE_MARKING_RGB),
     }
 
 

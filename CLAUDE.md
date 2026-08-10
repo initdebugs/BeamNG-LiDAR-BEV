@@ -340,6 +340,17 @@ sweeps. `ROAD_CLASSES` still answers its own separate question — *may the car 
 anything the road rule accepted but no material named is forced to `SURFACE_PAVED`, so the
 geometric fallback band keeps looking exactly as it always has.
 
+**Road markings are the case where a class sits in BOTH vocabularies on purpose.**
+`SOLID_LINE`/`DASHED_LINE`/`ZEBRA_CROSSING`/`DRIVING_INSTRUCTIONS` are in `ROAD_CLASSES` (paint is
+drivable tarmac, and the road store is what draws the surface it lies on) AND in
+`MARKING_CLASSES` → `SURFACE_MARKING`, which is listed LAST in the material table because last
+match wins the colour. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
+rest — top of the road's luminance rung, ΔE ≥ 17 from every other surface. The whole feature
+hangs on one undocumented engine fact: whether the LiDAR's annotation pass labels road *decals*
+with the marking class or with the `STREET` beneath them — there is no intensity channel to fall
+back on, so `worker._watch_for_markings` logs a one-shot `Marking check:` line either way, and a
+zero on a marked road means paint is simply invisible to this sensor.
+
 **A car's VISIBILITY must never depend on that actor path, and it once did.** Vehicle returns
 were excluded from the scene geometry on the understanding that traffic would be drawn as
 corroborated actor models instead — and `_poll_actor_observations` gets its poses from

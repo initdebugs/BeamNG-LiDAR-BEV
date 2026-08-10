@@ -10,6 +10,7 @@ from .config import (
     GROUND_FALLBACK_ABOVE_M,
     GROUND_FALLBACK_BELOW_M,
     GROUND_FALLBACK_CLASSES,
+    MARKING_CLASSES,
     ROAD_CLASSES,
     SIDEWALK_CLASSES,
     VEGETATION_CLASSES,
@@ -37,16 +38,20 @@ SURFACE_SIDEWALK = np.uint8(2)
 SURFACE_VEGETATION = np.uint8(3)
 SURFACE_BARE = np.uint8(4)
 SURFACE_WATER = np.uint8(5)
+SURFACE_MARKING = np.uint8(6)
 
 # Ordered most-general first, so a class named in two sets takes the LAST
-# match. Nothing currently overlaps, and the order is what decides it if
-# anything ever does.
+# match. MARKING_CLASSES relies on that: lane lines, arrows and crossings are
+# all in ROAD_CLASSES too -- paint is drivable tarmac -- and listing the
+# markings last is what gives them their own colour while the road rule keeps
+# treating them as road.
 _MATERIAL_CLASSES: tuple[tuple[frozenset[str], np.uint8], ...] = (
     (frozenset(ROAD_CLASSES), SURFACE_PAVED),
     (frozenset(SIDEWALK_CLASSES), SURFACE_SIDEWALK),
     (frozenset(VEGETATION_CLASSES), SURFACE_VEGETATION),
     (frozenset(BARE_GROUND_CLASSES), SURFACE_BARE),
     (frozenset(WATER_CLASSES), SURFACE_WATER),
+    (frozenset(MARKING_CLASSES), SURFACE_MARKING),
 )
 
 _VEHICLE_CLASSES = frozenset(

@@ -7,9 +7,13 @@ from beamng_lidar_bev.semantics import (
     SCENE_ROAD,
     SCENE_UNKNOWN,
     SCENE_VEHICLE,
+    SURFACE_MARKING,
+    SURFACE_PAVED,
+    SURFACE_SIDEWALK,
     SemanticPalette,
     classify_road_points,
     classify_scene_groups,
+    classify_surface_materials,
     pack_rgb,
 )
 
@@ -105,3 +109,52 @@ def test_scene_road_group_is_exactly_the_road_mask() -> None:
         groups = classify_scene_groups(colours, heights, 0.0, palette)
         road = classify_road_points(colours, heights, 0.0, palette)
         np.testing.assert_array_equal(groups == SCENE_ROAD, road)
+
+
+def test_road_markings_are_road_to_drive_on_but_paint_to_look_at() -> None:
+    """
+    Lane lines, arrows and crossings sit in BOTH vocabularies on purpose: the
+    road rule must keep accepting them (paint is drivable tarmac, and the road
+    store is what draws the surface they lie on) while the material table gives
+    them their own colour. The material sets are ordered so MARKING_CLASSES
+    wins that second question -- last match takes the cell.
+    """
+    annotations = {
+        "STREET": (255, 0, 0),
+        "SOLID_LINE": (255, 196, 128),
+        "DASHED_LINE": (196, 196, 256),  # the uint8-wraparound class
+        "ZEBRA_CROSSING": (255, 128, 128),
+        "DRIVING_INSTRUCTIONS": (132, 226, 244),
+        "SIDEWALK": (89, 118, 155),
+    }
+    palette = SemanticPalette.from_annotations(annotations)
+    colours = np.asarray(
+        [
+            annotations["STREET"],
+            annotations["SOLID_LINE"],
+            [196, 196, 0],  # DASHED_LINE as the renderer actually emits it
+            annotations["ZEBRA_CROSSING"],
+            annotations["DRIVING_INSTRUCTIONS"],
+            annotations["SIDEWALK"],
+        ],
+        dtype=np.uint8,
+    )
+    heights = np.full(len(colours), -0.5)
+
+    road = classify_road_points(colours, heights, -0.5, palette)
+    materials = classify_surface_materials(colours, palette)
+
+    np.testing.assert_array_equal(
+        road, (True, True, True, True, True, False)
+    )
+    np.testing.assert_array_equal(
+        materials,
+        (
+            SURFACE_PAVED,
+            SURFACE_MARKING,
+            SURFACE_MARKING,
+            SURFACE_MARKING,
+            SURFACE_MARKING,
+            SURFACE_SIDEWALK,
+        ),
+    )
