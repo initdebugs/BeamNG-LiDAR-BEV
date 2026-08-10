@@ -147,6 +147,9 @@ def test_road_markings_are_road_to_drive_on_but_paint_to_look_at() -> None:
     np.testing.assert_array_equal(
         road, (True, True, True, True, True, False)
     )
+    # DRIVING_INSTRUCTIONS is road but deliberately NOT paint: it ships as big
+    # rectangular decals whose whole quad annotates as the class, and painting
+    # every cell they touch flooded entire junctions. See MARKING_CLASSES.
     np.testing.assert_array_equal(
         materials,
         (
@@ -154,7 +157,7 @@ def test_road_markings_are_road_to_drive_on_but_paint_to_look_at() -> None:
             SURFACE_MARKING,
             SURFACE_MARKING,
             SURFACE_MARKING,
-            SURFACE_MARKING,
+            SURFACE_PAVED,
             SURFACE_SIDEWALK,
         ),
     )

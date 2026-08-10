@@ -48,6 +48,7 @@ from .config import (
     LOOKAHEAD_MAX_M,
     LOOKAHEAD_MIN_M,
     LOOKAHEAD_TIME_S,
+    MARKING_CLASSES,
     MAX_OBSTACLE_RENDER_POINTS,
     MAX_ROAD_RENDER_POINTS,
     MAX_SPEED_MPS,
@@ -104,6 +105,8 @@ from .semantics import (
     SemanticPalette,
     classify_scene_groups,
     classify_surface_materials,
+    pack_rgb,
+    pack_rgb_rows,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -242,6 +245,9 @@ class BeamNgWorker(QObject):
         self._logged_markings = False
         self._logged_marking_silence = False
         self._marking_free_scans = 0
+        # Packed palette colour -> class name for every paint-ish class, built
+        # at attach so the Marking check line can attribute counts per class.
+        self._marking_names: dict[int, str] = {}
 
         # --- Plant diagnostics, which change nothing ------------------------
         #
@@ -395,7 +401,18 @@ class BeamNgWorker(QObject):
             state = self._get_vehicle_state()
             geometry = derive_vehicle_geometry(state, vehicle.get_bbox())
             self._log_vehicle_check(geometry)
-            palette = SemanticPalette.from_annotations(self._load_annotations())
+            annotations = self._load_annotations()
+            palette = SemanticPalette.from_annotations(annotations)
+            # Every paint-ish class by its palette colour, INCLUDING the ones
+            # deliberately excluded from MARKING_CLASSES: the per-class counts
+            # in the Marking check line are the evidence for revisiting that
+            # exclusion, so the excluded classes have to be counted too.
+            self._marking_names = {
+                pack_rgb(rgb): name.upper()
+                for name, rgb in annotations.items()
+                if name.upper()
+                in (MARKING_CLASSES | {"DRIVING_INSTRUCTIONS", "SPEED_BUMP"})
+            }
 
             sensor_prefix = f"bev_{os.getpid()}_{int(time.monotonic() * 1000)}"
             self._sensors = []
@@ -933,7 +950,7 @@ class BeamNgWorker(QObject):
                 scene_materials = classify_surface_materials(
                     colours, self._palette
                 )
-                self._watch_for_markings(scene_materials)
+                self._watch_for_markings(scene_materials, colours)
                 road_mask = scene_groups == SCENE_ROAD
                 road_points = self._limit_points(
                     bev[road_mask], MAX_ROAD_RENDER_POINTS
@@ -1353,17 +1370,18 @@ class BeamNgWorker(QObject):
             event.sample(forward_speed, dt)
             self._log_brake_measurement(event.finish())
 
-    def _watch_for_markings(self, materials: np.ndarray) -> None:
+    def _watch_for_markings(
+        self, materials: np.ndarray, colours: np.ndarray
+    ) -> None:
         """
         The live check the marking feature depends on, as one log line.
 
-        BeamNG's palette has SOLID_LINE/DASHED_LINE/ZEBRA_CROSSING classes, but
-        markings are DECALS on the road, and whether the LiDAR's annotation
-        pass labels a decal hit with the marking class -- rather than the
-        STREET beneath it -- is not documented anywhere. There is no intensity
-        channel in this sensor mode to fall back on, so if this prints zero on
-        a marked road, paint simply cannot be seen by this sensor and the
-        colours downstream will never fire.
+        Markings are DECALS, and the annotation labels a decal's whole QUAD,
+        transparent texels included -- which is why the wide-area classes
+        (DRIVING_INSTRUCTIONS, SPEED_BUMP) are excluded from MARKING_CLASSES:
+        their footprints flooded entire junctions with paint. The per-class
+        breakdown here is the evidence that exclusion rests on, counted for
+        the excluded classes too so it can be revisited from numbers.
         """
         if self._logged_markings:
             return
@@ -1371,10 +1389,12 @@ class BeamNgWorker(QObject):
         if count:
             self._logged_markings = True
             LOGGER.info(
-                "Marking check: %d road-marking returns in a %d-return scan. "
-                "The LiDAR annotation does label decals; lane paint will draw.",
+                "Marking check: %d road-marking returns in a %d-return scan "
+                "(%s). Lane paint will draw; classes not in MARKING_CLASSES "
+                "render as tarmac however many returns they post.",
                 count,
                 len(materials),
+                self._marking_breakdown(colours),
             )
             return
         self._marking_free_scans += 1
@@ -1384,12 +1404,26 @@ class BeamNgWorker(QObject):
         ):
             self._logged_marking_silence = True
             LOGGER.info(
-                "Marking check: no road-marking returns in %d scans. Either "
-                "this stretch is unmarked, or the LiDAR annotation labels "
-                "decals as the road beneath them -- drive over lane lines to "
-                "settle it. This line will follow up if paint ever appears.",
+                "Marking check: no road-marking returns in %d scans (%s). "
+                "Either this stretch is unmarked, or the LiDAR annotation "
+                "labels decals as the road beneath them -- drive over lane "
+                "lines to settle it. This line will follow up if paint ever "
+                "appears.",
                 _MARKING_SILENCE_SCANS,
+                self._marking_breakdown(colours),
             )
+
+    def _marking_breakdown(self, colours: np.ndarray) -> str:
+        """Per-class return counts for every paint-ish class, one-shot cost."""
+        if not self._marking_names or not len(colours):
+            return "no paint classes in this map's palette"
+        packed = pack_rgb_rows(colours)
+        parts = [
+            f"{name} {hits}"
+            for code, name in sorted(self._marking_names.items())
+            if (hits := int(np.count_nonzero(packed == code)))
+        ]
+        return ", ".join(parts) if parts else "no paint-class returns"
 
     def _watch_manual_braking(self, now: float) -> None:
         """
@@ -2038,6 +2072,7 @@ class BeamNgWorker(QObject):
         self._logged_markings = False
         self._logged_marking_silence = False
         self._marking_free_scans = 0
+        self._marking_names = {}
         self._palette = None
         # A stop in progress when the sensors go is not a stop that was
         # measured, and the next attach may well be a different car.

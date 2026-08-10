@@ -826,19 +826,25 @@ BARE_GROUND_CLASSES = frozenset(
     {"DIRT", "GRAVEL", "MUD", "ROCK", "SAND", "TERRAIN"}
 )
 WATER_CLASSES = frozenset({"WATER"})
-# Paint on the road. Every one of these except SPEED_BUMP is ALSO in
-# ROAD_CLASSES -- a lane line is drivable tarmac -- and the material table is
-# ordered so this set wins the colour: the marking rides on the road store
-# exactly as before and only its paint shows. Whether the LiDAR's annotation
-# pass actually labels road DECALS with these classes (rather than the STREET
-# beneath them) is the live question the worker's one-shot `Marking check:`
-# line answers; the classes exist in 0.38.5's annotations.json either way.
+# Paint on the road. Every one of these is ALSO in ROAD_CLASSES -- a lane
+# line is drivable tarmac -- and the material table is ordered so this set
+# wins the colour: the marking rides on the road store exactly as before and
+# only its paint shows. (Confirmed live 2026-08-10: decals DO annotate through
+# the LiDAR.)
+#
+# DRIVING_INSTRUCTIONS and SPEED_BUMP are deliberately NOT here. Markings are
+# decal QUADS and the annotation labels the whole quad, transparent texels
+# included; a line's quad is barely wider than its paint, but junction
+# furniture -- chevron hatching, arrows, give-way triangles -- ships as big
+# rectangular decals, and their whole footprint came back as marking: entire
+# roundabout approaches rendered as one sheet of paint. Until the sensor can
+# tell paint from the quad it rides on, the wide-area classes stay tarmac.
+# The `Marking check:` line logs per-class counts, which is the evidence to
+# revisit this with.
 MARKING_CLASSES = frozenset(
     {
         "DASHED_LINE",
-        "DRIVING_INSTRUCTIONS",
         "SOLID_LINE",
-        "SPEED_BUMP",
         "ZEBRA_CROSSING",
     }
 )

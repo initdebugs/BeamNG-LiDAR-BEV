@@ -341,10 +341,15 @@ anything the road rule accepted but no material named is forced to `SURFACE_PAVE
 geometric fallback band keeps looking exactly as it always has.
 
 **Road markings are the case where a class sits in BOTH vocabularies on purpose.**
-`SOLID_LINE`/`DASHED_LINE`/`ZEBRA_CROSSING`/`DRIVING_INSTRUCTIONS` are in `ROAD_CLASSES` (paint is
-drivable tarmac, and the road store is what draws the surface it lies on) AND in
-`MARKING_CLASSES` → `SURFACE_MARKING`, which is listed LAST in the material table because last
-match wins the colour. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
+`SOLID_LINE`/`DASHED_LINE`/`ZEBRA_CROSSING` are in `ROAD_CLASSES` (paint is drivable tarmac, and
+the road store is what draws the surface it lies on) AND in `MARKING_CLASSES` →
+`SURFACE_MARKING`, which is listed LAST in the material table because last match wins the colour.
+**`DRIVING_INSTRUCTIONS` and `SPEED_BUMP` are deliberately road-but-not-paint**: markings are
+decal QUADS and the annotation labels the whole quad, transparent texels included — a line's quad
+is barely wider than its paint, but junction furniture ships as big rectangular decals whose full
+footprint came back as marking, and entire roundabout approaches rendered as one sheet of paint.
+The `Marking check:` line prints per-class counts (excluded classes included) as the evidence for
+ever revisiting that. The marking colour (`#857b49`, a muted paint-yellow) was solved like the
 rest — top of the road's luminance rung, ΔE ≥ 17 from every other surface. The whole feature
 hangs on one undocumented engine fact: whether the LiDAR's annotation pass labels road *decals*
 with the marking class or with the `STREET` beneath them — there is no intensity channel to fall

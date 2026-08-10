@@ -668,3 +668,30 @@
 2026-08-10 14:05:40,927 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 156.4 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
 2026-08-10 14:05:55,935 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 138.8 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
 2026-08-10 14:06:11,054 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 139.6 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:06:26,202 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 143.8 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:06:41,325 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 125.8 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:06:56,435 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 144.1 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:07:11,435 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 150.7 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:07:26,540 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 138.5 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:07:41,607 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 143.4 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:07:56,625 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 136.0 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:08:11,670 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 139.8 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:08:26,794 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 142.4 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:08:34,881 INFO beamng_lidar_bev.main_window: Looking for a running BeamNG.tech session
+2026-08-10 14:08:34,881 INFO beamng_lidar_bev.main_window: Application ready
+2026-08-10 14:08:35,284 INFO beamng_lidar_bev.main_window: Found a running BeamNG.tech session; ready to attach
+2026-08-10 14:08:36,521 INFO beamng_lidar_bev.main_window: Looking for the current player vehicle
+2026-08-10 14:08:36,527 INFO beamng_lidar_bev.main_window: Connecting to BeamNG.tech
+2026-08-10 14:08:39,479 INFO beamng_lidar_bev.worker: Connected to the BeamNG.tech bridge on port 64256
+2026-08-10 14:08:39,480 INFO beamng_lidar_bev.main_window: Finding the current player vehicle
+2026-08-10 14:08:40,316 INFO beamng_lidar_bev.worker: Vehicle check: model 'vivace' (plant measured on 'vivace') | bbox 2.02 wide x 4.33 long x 1.46 tall | overhang front 1.84 rear 2.49 | body centre -0.16 m right of the reference node (the AEB corridor and the WORLD ego are shifted by this) | ground plane -0.304 m from the reference node | mount z: front 0.20, left 0.20, right 0.20, rear 0.20, roof 1.58, road 1.58
+2026-08-10 14:08:40,333 ERROR beamng_lidar_bev.worker: Could not attach LiDAR sensors
+Traceback (most recent call last):
+  File "C:\Users\initd\Documents\Projects\BeamNG.Tech Mods\BeamNG-LiDAR-BEV\src\beamng_lidar_bev\worker.py", line 407, in attach_to_player
+    # in the Marking check line are the evidence for revisiting that
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\initd\Documents\Projects\BeamNG.Tech Mods\BeamNG-LiDAR-BEV\src\beamng_lidar_bev\worker.py", line 411, in <dictcomp>
+    for name, rgb in annotations.items()
+        ^^^^^^^^^^^^^^^
+NameError: name 'MARKING_CLASSES' is not defined
+2026-08-10 14:08:40,335 INFO beamng_lidar_bev.main_window: Sensor attach failed: name 'MARKING_CLASSES' is not defined
