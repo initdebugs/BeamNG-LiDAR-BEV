@@ -51,8 +51,12 @@ value. Claims about sensor placement, FOV or ray budget need a live check — at
 `Mount check:` line the worker logs (one per mount now, since they no longer share a height),
 and confirm VISIBLE POINTS is in the tens of thousands with grey reaching the outer rings.
 
-The **roof unit has not been live-checked at all** (added 2026-07-29; retuned 2026-08-10 to
-density 25, 512 channels over a 6–100 m annulus). Four things the offline suite cannot reach.
+The **roof and road-scan units have not been live-checked at all** (roof added 2026-07-29;
+2026-08-10 the ground work split in two: the roof unit narrowed to a 6–55 m annulus at density
+25, and a sixth **road-scan unit** — an 80° forward wedge fitted to a 20–100 m annulus at
+density 12.5, 512 channels — took the far road, because an equal-angle aperture starves far
+rings quadratically: over 6–100 m, 74% of the roof unit's channels landed inside 20 m). Four
+things the offline suite cannot reach.
 Whether `density` holds the ray *count* constant as the FOV narrows or scales it with solid angle
 is still undocumented and unmeasured — the `Sensor reach:` line prints each unit's own return
 count and furthest return, which settles it. Whether the fifth unit (≈ +28% total ray budget at
@@ -805,11 +809,14 @@ every large surface is a `NoLighting` material and those skip the lighting path 
 distance.** `WORLD_RADIUS_M` is 150 m and covers structure, traffic and actors: the front
 unit reaches 200 m, a wall is a big vertical target, and azimuth spacing (which grows only as
 `r`) still puts several returns on a building at 150 m. `WORLD_ROAD_RADIUS_M` is 100 m and covers
-the ground: ground rings go as `r²` — 0.12 m apart at 20 m for the 512-channel roof unit, 0.75 m
-at 50 m, ~3 m at 100 m — so a single frame holds together to ~58 m (where the spacing outruns the
-1.0 m mesh bridge) and the 58–100 m stretch is carried by accumulation while driving. It was 70
-with 256 channels over a 6–80 m annulus; the radius, `LIDAR_ROOF_FAR_M` and
-`LIDAR_ROOF_VERTICAL_RESOLUTION` moved together, because each is useless without the other two.
+the ground, and since 2026-08-10 the ground is TWO instruments: the roof unit owns the near bowl
+and the terrain (6–55 m annulus, all around), and the **road-scan unit** owns the far road (20–
+100 m annulus through an 80° forward wedge — rings 0.20 m at 50 m and 0.78 m at 100, single-frame
+sub-bridge to the full radius, with `WORLD_ROAD_BRIDGE_CELLS` at 6 sized to its ~1.55 m azimuth
+stripes at 100 m). The split exists because an equal-angle aperture spends channels quadratically
+close-in — one 6–100 m annulus put 74% of its 512 channels inside 20 m and ~33 across 50–100 m,
+which is why the far road stayed thin no matter the channel count. Behind and beside, the road
+still fills by accumulation while driving.
 
 `WORLD_SURFACE_RADIUS_M` is 40 m and covers **unpaved** ground. **The road reaches further because
 it is driven ALONG**: accumulation over `WORLD_CELL_MEMORY_M` sweeps the rings down its length and

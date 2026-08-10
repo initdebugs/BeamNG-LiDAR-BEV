@@ -52,6 +52,7 @@ _SENSOR_DEBUG_COLOURS = {
     "right": "#ff6fd8",
     "rear": "#9bd356",
     "roof": "#34d5d0",
+    "road": "#e8d44d",
 }
 # Wheel zoom bounds: 1.0 is the classic full plot, 8x closes to a 13 m radius
 # for reading kerb-height detail around the car.

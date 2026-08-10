@@ -11,6 +11,12 @@ from .config import (
     LIDAR_FRONT_DENSITY,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
+    LIDAR_ROAD_DENSITY,
+    LIDAR_ROAD_FAR_M,
+    LIDAR_ROAD_HORIZONTAL_FOV_DEG,
+    LIDAR_ROAD_MAX_DISTANCE_M,
+    LIDAR_ROAD_NEAR_M,
+    LIDAR_ROAD_VERTICAL_RESOLUTION,
     LIDAR_ROOF_DENSITY,
     LIDAR_ROOF_FAR_M,
     LIDAR_ROOF_HORIZONTAL_FOV_DEG,
@@ -114,6 +120,11 @@ def derive_vehicle_geometry(
     far_rad = float(np.arctan2(roof_z, LIDAR_ROOF_FAR_M))
     roof_fov_deg = float(np.degrees(near_rad - far_rad))
     depression = 0.5 * (near_rad + far_rad)
+    # The road-scan unit's aperture, fitted the same way to its own annulus.
+    road_near_rad = float(np.arctan2(roof_z, LIDAR_ROAD_NEAR_M))
+    road_far_rad = float(np.arctan2(roof_z, LIDAR_ROAD_FAR_M))
+    road_fov_deg = float(np.degrees(road_near_rad - road_far_rad))
+    road_depression = 0.5 * (road_near_rad + road_far_rad)
     mounts = {
         # The long-range unit. Further, narrower and denser than the other
         # three, because AEB has to act from far enough out to stop from
@@ -161,6 +172,26 @@ def derive_vehicle_geometry(
             # ray budget rather than adding to it, so this is nearly free.
             vertical_resolution=LIDAR_ROOF_VERTICAL_RESOLUTION,
         ),
+        # The road-scan unit: the far half of the ground, ahead only. An
+        # equal-angle aperture starves far rings quadratically, so the roof
+        # unit alone could never resolve the road past ~55 m however many
+        # channels it got -- this one spends its whole budget on the 20-100 m
+        # annulus through a narrow forward wedge. Slightly ahead of the roof
+        # unit so the two never coincide.
+        "road": SensorMount(
+            "road",
+            (0.0, -0.25, roof_z),
+            (
+                0.0,
+                -float(np.cos(road_depression)),
+                -float(np.sin(road_depression)),
+            ),
+            max_distance_m=LIDAR_ROAD_MAX_DISTANCE_M,
+            horizontal_fov_deg=LIDAR_ROAD_HORIZONTAL_FOV_DEG,
+            density=LIDAR_ROAD_DENSITY,
+            vertical_fov_deg=road_fov_deg,
+            vertical_resolution=LIDAR_ROAD_VERTICAL_RESOLUTION,
+        ),
     }
 
     # Measured along world Z, to match world_points_to_bev's gravity-referenced
@@ -179,6 +210,14 @@ def derive_vehicle_geometry(
         height_m=height,
         mounts=mounts,
     )
+
+
+# The ground-annulus units: every ray points below the horizon, so their reach
+# is the ring of ground they were fitted to, not their slant range.
+_GROUND_ANNULI = {
+    "roof": (LIDAR_ROOF_NEAR_M, LIDAR_ROOF_FAR_M),
+    "road": (LIDAR_ROAD_NEAR_M, LIDAR_ROAD_FAR_M),
+}
 
 
 @dataclass(frozen=True)
@@ -213,10 +252,9 @@ def sensor_coverage(mount: SensorMount) -> SensorCoverage:
     boresight_forward = -float(dir_y)
     if math.hypot(boresight_right, boresight_forward) < 1e-9:
         boresight_right, boresight_forward = 0.0, 1.0
-    if mount.name == "roof":
-        near_m, far_m = LIDAR_ROOF_NEAR_M, LIDAR_ROOF_FAR_M
-    else:
-        near_m, far_m = 0.0, float(mount.max_distance_m)
+    near_m, far_m = _GROUND_ANNULI.get(
+        mount.name, (0.0, float(mount.max_distance_m))
+    )
     return SensorCoverage(
         right_m=-float(local_x),
         forward_m=-float(local_y),

@@ -123,22 +123,52 @@ LIDAR_ROOF_DENSITY = 25.0
 # The far-field lever, same as the global LIDAR_VERTICAL_RESOLUTION and just as
 # nearly-free: channels decide how the ray budget spreads across the aperture,
 # not how many rays there are. Ring spacing is dr = (r^2/h)*dtheta; over the
-# 6-100 m annulus at 512 channels that is 0.12 m at 20 m, 0.27 at 30, 0.75 at
-# 50, 3.0 at 100 -- half the spacing 256 gave, so the single-frame surface
-# reaches sqrt(2) further and stays inside the 1.0 m mesh bridge out to ~58 m.
-# NEEDS A LIVE CHECK like everything optical: 512 over a ~14 deg aperture is
-# 0.027 deg per channel, finer than anything measured on this engine so far;
-# the `Sensor reach:` line settles whether it delivers.
+# 6-55 m annulus at 512 channels that is 0.09 m at 20 m and 0.86 m at 55 --
+# inside the mesh bridge over the whole span this unit serves. NEEDS A LIVE
+# CHECK like everything optical: 512 over a ~13 deg aperture is finer than
+# anything measured on this engine so far; the `Sensor reach:` line settles
+# whether it delivers.
 LIDAR_ROOF_VERTICAL_RESOLUTION = 512
 # The ground annulus the aperture is fitted to, in metres. NEAR must stay under
 # the ~7 m the 0.20 m mounts resolve in a single frame or the two sets leave a
-# blind ring; FAR matches WORLD_ROAD_RADIUS_M, since filling road the renderer
-# then discards buys nothing -- and the road store reaching 100 m is why it is
-# 100. Widening the span costs ring spacing linearly, because the same channels
-# have to cover it; 6-80 -> 6-100 widened the angular span by only 0.23 deg
-# (the far edge is nearly at the horizon already), so the cost was nil.
+# blind ring. FAR was 100 and is now 55: an equal-angle aperture spends its
+# channels quadratically close-in -- over 6-100 m, 74% of the channels landed
+# inside 20 m (0.03 m rings the quarter-metre grid cannot even use) and ~33
+# covered the whole 50-100 m stretch, which is why the far road stayed thin
+# however many channels the span got. The far field now belongs to the ROAD
+# unit below; this one owns the near bowl and the TERRAIN out to
+# WORLD_SURFACE_RADIUS_M, which is what 55 matches. Over 6-55 the same 512
+# channels put rings 0.11 m apart at 20 m and 0.86 m at 55 -- everything this
+# unit still serves is inside the mesh bridge.
 LIDAR_ROOF_NEAR_M = 6.0
-LIDAR_ROOF_FAR_M = 100.0
+LIDAR_ROOF_FAR_M = 55.0
+
+# --- The forward road-scan sensor ---------------------------------------------
+#
+# A sixth unit, and the answer to "the road ahead is undetailed past ~50 m". It
+# is NOT more of the roof unit: the roof unit's job is the ground bowl all
+# around the car, and an equal-angle aperture over a wide annulus starves the
+# far rings by construction (see LIDAR_ROOF_FAR_M above). This one squeezes its
+# whole channel budget into the 20-100 m annulus -- a ~3.7 deg aperture, so 512
+# channels put ground rings 0.20 m apart at 50 m and 0.78 m at 100 m,
+# sub-bridge in a SINGLE frame the whole way out -- and its sweep is a forward
+# wedge rather than a 170 deg fan, which concentrates the azimuth budget where
+# the road actually is: ~0.9 deg columns are 0.8 m stripes at 50 m and 1.55 m
+# at 100 m, against the 1.5 m the road mesh can bridge.
+#
+# NEAR overlaps the roof unit's annulus (20 < 55) so there is no seam, and the
+# wedge is 80 deg because a road plus its verges at 100 m subtends far less --
+# widening it would spend azimuth on terrain the roof unit already owns.
+# Budget: ~+1.9 standard units at density 12.5 (~+15%), the same narrowness
+# trade the long-range FRONT unit makes for AEB. Every figure here needs the
+# live `Sensor reach:` check like the rest of the optics.
+LIDAR_ROAD_MAX_DISTANCE_M = 110.0
+LIDAR_ROAD_HORIZONTAL_FOV_DEG = 80.0
+LIDAR_ROAD_DENSITY = 12.5
+LIDAR_ROAD_VERTICAL_RESOLUTION = 512
+LIDAR_ROAD_NEAR_M = 20.0
+LIDAR_ROAD_FAR_M = 100.0
+
 # Above the bounding-box top, so the mount tracks the vehicle rather than
 # assuming a saloon. Sensor pos is referenced to the vehicle ground plane (see
 # SENSOR_HEIGHT_ABOVE_GROUND_M), so this is added to the bbox HEIGHT, never to
@@ -258,13 +288,14 @@ WORLD_VEHICLE_TTL_S = 0.15
 # MESHING (never in the store). The finer grid resolves the near field properly
 # but outruns the sampling at range: ground returns thin as r^2 radially and as
 # r in azimuth, so past roughly 20 m they no longer reach every cell and the
-# surface arrives as a checkerboard of disconnected quads. 4 cells is 1.0 m:
-# it went 3 -> 4 when LIDAR_ROOF_DENSITY went 12.5 -> 25, because the azimuth
-# stripes doubled to ~1.8 deg (0.93 m at 30 m) and 0.75 m stopped closing them.
-# 1.0 m covers the doubled stripes to ~32 m and the 512-channel ring spacing to
-# ~58 m single-frame -- accumulation while driving fills beyond both -- and is
-# still far short of anything the car could drive through.
-WORLD_ROAD_BRIDGE_CELLS = 4
+# surface arrives as a checkerboard of disconnected quads. 6 cells is 1.5 m,
+# sized to the ROAD unit's azimuth stripes -- ~0.9 deg columns are 1.55 m
+# apart at 100 m, and azimuth is what bridging has to close because driving
+# sweeps rings radially through the world but never sweeps stripes sideways.
+# Radial spacing is far inside it everywhere (0.78 m at 100 m from the road
+# unit). Still under anything the car could drive through: the narrowest gap
+# a 1.8 m-wide body threads is wider than 1.5 m of missing cells.
+WORLD_ROAD_BRIDGE_CELLS = 6
 # How often the WORLD stores are refreshed, against a view that re-aims every
 # snapshot. The build has two halves with very different costs and very
 # different needs: folding the cloud into the stores and meshing them
@@ -290,19 +321,14 @@ WORLD_STORE_REFRESH_INTERVAL_S = 0.12
 # several returns on a building at 150 m. Drawing it is what makes the view feel
 # like it can see, and it is the half the driver actually reads at speed.
 WORLD_RADIUS_M = 150.0
-# The ROAD SURFACE is not, and the bound is the sampling, not taste. A channel
-# at depression theta meets the ground at r = h/tan theta, so consecutive
-# ground RINGS land dr = (r^2/h)*dtheta apart: with the 512-channel roof unit
-# that is 0.12 m at 20 m, 0.75 m at 50 m and ~3 m at 100 m. Single-frame the
-# surface holds together to ~58 m (where the ring spacing outruns the 1.0 m
-# mesh bridge); the stretch from there to 100 m is carried by ACCUMULATION --
-# the rings sweep down the road as the car drives, and WORLD_CELL_MEMORY_M of
-# travel fills the lattice in. 100 therefore reads as a solid road while
-# moving and thins toward sparse rings at the far end when parked; past it
-# nothing is drawn at all, which is honest: nothing was measured there. It was
-# 70 with 256 channels over a 6-80 m annulus; the radius, LIDAR_ROOF_FAR_M and
-# LIDAR_ROOF_VERTICAL_RESOLUTION moved together, because each is useless
-# without the other two.
+# The ROAD SURFACE is not, and the bound is the sampling, not taste. Ahead,
+# the ROAD unit's 20-100 m annulus puts rings 0.78 m apart at 100 m and its
+# 80 deg wedge keeps azimuth stripes inside the 1.5 m bridge, so the road in
+# front resolves to the full radius in a SINGLE frame. To the sides and
+# behind, the roof unit carries the ground to ~55 m and ACCUMULATION -- rings
+# sweeping down the road as the car drives, over WORLD_CELL_MEMORY_M of
+# travel -- fills the rest. Past 100 nothing is drawn at all, which is honest:
+# nothing was measured there.
 WORLD_ROAD_RADIUS_M = 100.0
 # ...and the UNPAVED surface stops sooner still. The road reaches further
 # because it is driven ALONG -- accumulation over WORLD_CELL_MEMORY_M sweeps

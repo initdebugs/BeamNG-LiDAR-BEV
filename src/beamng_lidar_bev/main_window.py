@@ -33,6 +33,8 @@ from .config import (
     LIDAR_FRONT_MAX_DISTANCE_M,
     LIDAR_HORIZONTAL_FOV_DEG,
     LIDAR_MAX_DISTANCE_M,
+    LIDAR_ROAD_FAR_M,
+    LIDAR_ROAD_NEAR_M,
     LIDAR_ROOF_FAR_M,
     LIDAR_ROOF_NEAR_M,
     LIDAR_UPDATE_HZ,
@@ -242,7 +244,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(sensor_title)
 
         self._add_spec_row(
-            sidebar_layout, "Units", "Front / Left / Right / Rear / Roof"
+            sidebar_layout, "Units", "Front / L / R / Rear / Roof / Road"
         )
         self._add_spec_row(
             sidebar_layout,
@@ -416,6 +418,7 @@ class MainWindow(QMainWindow):
             ("rear", f"{LIDAR_MAX_DISTANCE_M:.0f} m · "
                      f"{LIDAR_HORIZONTAL_FOV_DEG:.0f}°"),
             ("roof", f"ground {LIDAR_ROOF_NEAR_M:.0f}–{LIDAR_ROOF_FAR_M:.0f} m"),
+            ("road", f"ground {LIDAR_ROAD_NEAR_M:.0f}–{LIDAR_ROAD_FAR_M:.0f} m"),
         ):
             button = QPushButton(sensor_name.upper())
             button.setObjectName("lidarDebugButton")
@@ -1120,6 +1123,9 @@ class MainWindow(QMainWindow):
             }
             QPushButton#lidarDebugButton[sensor="roof"]:checked {
                 background: #34d5d0;
+            }
+            QPushButton#lidarDebugButton[sensor="road"]:checked {
+                background: #e8d44d;
             }
             QPushButton#viewToggleButton {
                 min-width: 62px;

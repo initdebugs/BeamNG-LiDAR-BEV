@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from beamng_lidar_bev.config import (
+    LIDAR_ROAD_FAR_M,
+    LIDAR_ROAD_NEAR_M,
     LIDAR_ROOF_FAR_M,
     LIDAR_ROOF_NEAR_M,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
@@ -85,11 +87,13 @@ def test_mount_height_ignores_the_bbox_bottom(min_z: float) -> None:
 
     assert geometry.ground_z_vehicle == pytest.approx(min_z)
     for name, mount in geometry.mounts.items():
-        if name == "roof":
+        if name in ("roof", "road"):
             continue
         assert mount.position_vehicle[2] == pytest.approx(0.2)
-    # _bbox() is 2.0 m tall at every shift.
+    # _bbox() is 2.0 m tall at every shift; the road-scan unit rides beside
+    # the roof unit on the same plane.
     assert geometry.mounts["roof"].position_vehicle[2] == pytest.approx(2.12)
+    assert geometry.mounts["road"].position_vehicle[2] == pytest.approx(2.12)
 
 
 @pytest.mark.parametrize("vehicle_height_m", (1.28, 1.45, 2.0, 2.9, 4.1))
@@ -141,6 +145,50 @@ def test_roof_aperture_holds_its_ground_annulus_at_any_vehicle_height(
     # 20 m against the 4.11 m the 0.20 m mounts manage there.
     d_theta = np.radians(roof.vertical_fov_deg / (roof.vertical_resolution - 1))
     assert (20.0**2 / height) * d_theta < 0.3
+
+
+@pytest.mark.parametrize("vehicle_height_m", (1.28, 1.45, 2.0, 2.9))
+def test_road_scan_aperture_holds_its_far_annulus_at_any_height(
+    vehicle_height_m: float,
+) -> None:
+    """
+    The road unit exists because an equal-angle aperture starves far rings
+    quadratically: over 6-100 m, 74% of the roof unit's channels landed inside
+    20 m. This one owns 20-100 m alone, so its whole channel budget lands
+    where the far road actually is -- and the payoff assertion is the whole
+    point: ground rings inside the mesh bridge at 100 m, in a single frame.
+    """
+    half = vehicle_height_m / 2.0
+    corners = itertools.product((-1.0, 1.0), (-2.0, 2.0), (-half, half))
+    bbox = dict(
+        zip(
+            _bbox().keys(),
+            [(10.0 - x, 20.0 - y, 1.0 + z) for x, y, z in corners],
+            strict=True,
+        )
+    )
+    geometry = derive_vehicle_geometry(_state(), bbox, roof_clearance_m=0.12)
+    road = geometry.mounts["road"]
+
+    height = road.position_vehicle[2]
+    assert height == pytest.approx(vehicle_height_m + 0.12)
+    x, y, z = road.direction_vehicle
+    assert x == pytest.approx(0.0)
+    assert y < 0.0 and z < 0.0
+
+    aim_deg = np.degrees(np.arctan2(-z, -y))
+    top_deg = aim_deg - road.vertical_fov_deg / 2.0
+    bottom_deg = aim_deg + road.vertical_fov_deg / 2.0
+    assert top_deg > 0.0
+
+    near_m = height / np.tan(np.radians(bottom_deg))
+    far_m = height / np.tan(np.radians(top_deg))
+    assert near_m == pytest.approx(LIDAR_ROAD_NEAR_M)
+    assert far_m == pytest.approx(LIDAR_ROAD_FAR_M)
+
+    # Rings inside the 1.5 m road bridge at the FAR edge, single frame.
+    d_theta = np.radians(road.vertical_fov_deg / (road.vertical_resolution - 1))
+    assert (LIDAR_ROAD_FAR_M**2 / height) * d_theta < 1.0
 
 
 def test_transforms_world_points_to_ego_right_forward_frame() -> None:
