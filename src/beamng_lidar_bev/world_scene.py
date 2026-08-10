@@ -837,6 +837,22 @@ class WorldMesh:
 _EMPTY_WORLD_MESH = WorldMesh(_EMPTY_VERTICES, _EMPTY_RGB, _EMPTY_INDICES)
 
 
+@dataclass(frozen=True)
+class _MeshCache:
+    """
+    The three cached world meshes plus the ego pose they were built at.
+
+    Immutable and committed to `_mesh_cache` as one assignment, which is what
+    lets `compose` read it from another thread without a lock. The anchor is
+    what `compose`'s teleport guard measures against.
+    """
+
+    ground: WorldMesh
+    boundary: WorldMesh
+    vehicle: WorldMesh
+    anchor: np.ndarray
+
+
 def present_world_mesh(
     mesh: WorldMesh, snapshot: PerceptionSnapshot
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1536,9 +1552,9 @@ class WorldSceneAssembler:
         # never disagree.
         self._travelled_m = 0.0
         # The world meshes built from the stores, held between store refreshes
-        # so compose-only ticks can re-present them. None forces a full build,
+        # so compose ticks can re-present them. None forces a full build,
         # which is also what makes a teleport reset safe: clear() lands here.
-        self._mesh_cache: tuple[WorldMesh, WorldMesh, WorldMesh] | None = None
+        self._mesh_cache: _MeshCache | None = None
         self._road_keys = _EMPTY_CELL_KEYS.copy()
         self._road_height = _EMPTY_CELL_VALUES.copy()
         # Odometer readings, not timestamps.
@@ -1572,57 +1588,99 @@ class WorldSceneAssembler:
         """
         Build a frame; with ``refresh_stores=False``, re-present the last one.
 
-        The split is what lets the view track the car at the display rate while
-        the store work runs slower than it: the stores and the world meshes
-        depend only on accumulated evidence (see `WorldMesh`), so a compose-only
-        call re-projects the cached meshes into this snapshot's ego frame,
-        re-tints them, and rebuilds just the per-snapshot elements -- the AEB
-        overlay, the path, the actors and the camera. A compose-only snapshot's
-        CLOUD is not folded into the stores; that is the freshness trade
-        WORLD_STORE_REFRESH_INTERVAL_S names, and it is no different in kind
-        from the snapshots the one-slot mailbox already dropped when a slow
-        build ran head-down through them.
+        A convenience over the two halves below for synchronous callers and
+        the offline suite. `SceneWorker` calls `refresh` and `compose`
+        directly, on different threads -- see their contracts.
+        """
+        if refresh_stores or self._mesh_cache is None:
+            self.refresh(snapshot)
+        return self.compose(snapshot)
 
-        The odometer still advances on every call -- expiry stamps are written
-        only during ingestion, but a teleport must reset the scene no matter
-        which kind of tick notices it (`_track_ego_motion` clears, which drops
-        the mesh cache and forces the rebuild below).
+    def refresh(self, snapshot: PerceptionSnapshot) -> None:
+        """
+        The STORE half: fold this snapshot's cloud in and rebuild the world
+        meshes. Slow (tens of ms accumulated), and world-anchored throughout.
+
+        THREAD CONFINEMENT is the whole safety argument, not locking: the
+        stores, the odometer and this method belong to exactly one thread at a
+        time (`SceneWorker` runs it single-flight on its refresh pool), and the
+        only thing `compose` reads from here is `_mesh_cache` -- committed as
+        ONE attribute assignment of an immutable object, which is atomic under
+        the GIL. A teleport clears the stores and the cache in here
+        (`_track_ego_motion`); the view-side state -- actor tracks, camera --
+        is compose's own and heals on its own clocks.
+
+        A snapshot that only ever passes through `compose` is never folded in;
+        that is the freshness trade WORLD_STORE_REFRESH_INTERVAL_S names, no
+        different in kind from the snapshots the one-slot mailbox already
+        dropped when a slow build ran head-down through them.
         """
         self._track_ego_motion(snapshot)
-        if refresh_stores or self._mesh_cache is None:
-            self._update_road_cells(snapshot)
-            self._expire_road_cells(snapshot)
-            self._update_boundary_columns(snapshot)
-            self._expire_boundary_columns(snapshot)
+        self._update_road_cells(snapshot)
+        self._expire_road_cells(snapshot)
+        self._update_boundary_columns(snapshot)
+        self._expire_boundary_columns(snapshot)
 
-            # Collapsed ONCE and handed to both consumers. The pass is a
-            # reduceat over the whole voxel store, and the ground surface and
-            # the slabs are the two halves of its one answer -- what is flat
-            # enough to stand on, and what is not.
-            (
+        # Collapsed ONCE and handed to both consumers. The pass is a
+        # reduceat over the whole voxel store, and the ground surface and
+        # the slabs are the two halves of its one answer -- what is flat
+        # enough to stand on, and what is not.
+        (
+            hazard_keys,
+            hazard_base,
+            hazard_top,
+            hazard_classes,
+            surface_keys,
+            surface_height,
+            surface_material,
+        ) = self._column_runs(snapshot)
+        self._mesh_cache = _MeshCache(
+            self._ground_mesh(
+                snapshot, surface_keys, surface_height, surface_material
+            ),
+            *self._solid_meshes(
+                snapshot,
                 hazard_keys,
                 hazard_base,
                 hazard_top,
                 hazard_classes,
-                surface_keys,
-                surface_height,
-                surface_material,
-            ) = self._column_runs(snapshot)
-            self._mesh_cache = (
-                self._ground_mesh(
-                    snapshot, surface_keys, surface_height, surface_material
-                ),
-                *self._solid_meshes(
-                    snapshot,
-                    hazard_keys,
-                    hazard_base,
-                    hazard_top,
-                    hazard_classes,
-                ),
+            ),
+            anchor=np.asarray(snapshot.ego_pos_world, dtype=np.float64),
+        )
+
+    def compose(self, snapshot: PerceptionSnapshot) -> WorldFrame:
+        """
+        The VIEW half: re-project the cached world meshes into this snapshot's
+        ego frame, re-tint, and rebuild the per-snapshot elements -- the AEB
+        overlay, path, actors and camera. A few milliseconds, and the part
+        that must track the car every snapshot or the whole scene lags.
+
+        The anchor test is the teleport guard for the window between a jump
+        and the refresh that notices it: presenting a cached city at a pose
+        `WORLD_POSE_JUMP_RESET_M` from where it was built would draw the old
+        map in the new one, so the cache is dropped and the frame goes out
+        empty until the next refresh rebuilds from the (then cleared) stores.
+        Ordinary driving between refreshes is metres, far under the threshold.
+        """
+        cache = self._mesh_cache
+        if cache is not None:
+            offset = (
+                np.asarray(snapshot.ego_pos_world, dtype=np.float64)
+                - cache.anchor
             )
+            if float(np.dot(offset, offset)) > WORLD_POSE_JUMP_RESET_M**2:
+                cache = None
+                self._mesh_cache = None
+        if cache is not None:
+            ground_mesh, boundary_mesh, vehicle_mesh = (
+                cache.ground,
+                cache.boundary,
+                cache.vehicle,
+            )
+        else:
+            ground_mesh = boundary_mesh = vehicle_mesh = _EMPTY_WORLD_MESH
 
         alert = self._alert(snapshot.aeb, snapshot.rear_aeb)
-        ground_mesh, boundary_mesh, vehicle_mesh = self._mesh_cache
         road_vertices, road_colors, road_indices = present_world_mesh(
             ground_mesh, snapshot
         )
@@ -1711,9 +1769,12 @@ class WorldSceneAssembler:
         if self._last_ego_pos is not None:
             step = float(np.linalg.norm(position - self._last_ego_pos))
             if step > WORLD_POSE_JUMP_RESET_M:
-                # A teleport, not a drive. Clearing resets the odometer too, so
-                # the jump is never counted as travel.
-                self.clear()
+                # A teleport, not a drive. STORES only, not `clear()`: this
+                # runs on the refresh thread, and the actor tracks and camera
+                # are compose's own state -- they fade and re-damp on their own
+                # clocks within a second anyway. `_clear_geometry` resets the
+                # odometer too, so the jump is never counted as travel.
+                self._clear_geometry()
             else:
                 self._travelled_m += step
         self._last_ego_pos = position

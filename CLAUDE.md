@@ -872,20 +872,31 @@ Together these took the steady-state build from **~100 ms to ~60 ms** on an accu
 remaining cost is roughly half `_ground_mesh` (bridging 10 ms, the box filter 8.5, the ego-relative
 tail 5) and half the voxel store (`_update_boundary_columns` 16 ms, expiry 6).
 
-**That lever has now been taken: the build runs at TWO RATES on one thread.** Everything before the
-ego-relative tail is **world-anchored** — it depends on the stores, not on the pose — so
-`WorldSceneAssembler.update(refresh_stores=False)` re-presents the cached `WorldMesh`es (world
-vertices, untinted linear colour, indices, fade radii) into the current snapshot's ego frame:
-`world_to_render` + `depth_tint` + the per-snapshot elements (AEB overlay, path, actors, camera), a
-few milliseconds against the ~60. `SceneWorker` refreshes the stores on
-`WORLD_STORE_REFRESH_INTERVAL_S` and composes every snapshot in between, so the view tracks the car
-at the display rate however slow the store work gets. Three things are load-bearing: a compose
-tick's cloud is **not ingested** (the named freshness trade — no different in kind from the
-snapshots the one-slot mailbox already dropped); `_track_ego_motion` still runs on every tick so a
-**teleport during a compose still clears** — clear() drops the mesh cache, which forces the rebuild;
-and SCENE BUILD keeps meaning "the store refresh", so the over-budget warning still watches the
-right number. Face shading is baked into the cached colour, so the crease cue re-aims at the store
-rate — bounded staleness on a 1.1–1.3:1 cue. Pinned by `test_two_rate_pipeline.py`.
+**That lever has now been taken twice: the build runs at TWO RATES on TWO THREADS.** Everything
+before the ego-relative tail is **world-anchored** — it depends on the stores, not on the pose —
+so the assembler is split into `refresh(snapshot)` (odometer, stores, and the cached
+`WorldMesh`es: world vertices, untinted linear colour, indices, fade radii) and
+`compose(snapshot)` (`world_to_render` + `depth_tint` over the cache plus the per-snapshot
+elements — AEB overlay, path, actors, camera — a few milliseconds against the ~60).
+`SceneWorker` composes every snapshot on its own thread and runs `refresh` on a one-thread pool
+at `WORLD_STORE_REFRESH_INTERVAL_S`, so **composes never wait on a refresh** — run inline, the
+refresh stalled the view for its whole duration on every cadence tick, a rhythmic hitch. Safety
+is **confinement, not locking**: the stores and odometer belong to the refresh thread
+(single-flight), the view state (actor tracks, camera pose) to the compose thread, and the only
+shared value is the immutable `_MeshCache`, committed in one attribute assignment. Five things
+are load-bearing: a compose tick's cloud is **not ingested** (the named freshness trade — no
+different in kind from the snapshots the one-slot mailbox already dropped); the **teleport guard
+is split** — `compose` drops a cache anchored further than `WORLD_POSE_JUMP_RESET_M` from the
+current pose (presentational, so the old map is never drawn in the new one) while the refresh's
+own `_track_ego_motion` clears the stores, and it clears **stores only**, because full `clear()`
+would touch compose-thread state from the refresh thread; the **first build after construction or
+clear runs inline** so the first frame carries a world; SCENE BUILD still means "the store
+refresh", but its budget is now the **cadence** (120 ms), not the display tick — both the
+over-budget log and `test_covering_the_ground_stays_inside_the_scene_budget` measure against it;
+and a refresh error clears from the compose thread only after the future is reaped, when nothing
+is in flight. Face shading is baked into the cached colour, so the crease cue re-aims at the
+refresh rate — bounded staleness on a 1.1–1.3:1 cue. Pinned by `test_two_rate_pipeline.py` and
+`test_scene_worker.py` (including a hung-refresh test proving composes keep flowing).
 
 Qt's `offscreen` platform plugin is not QRhi/3D capable, so an offscreen smoke
 can validate QML loading, property binding, lifecycle and fallback but cannot

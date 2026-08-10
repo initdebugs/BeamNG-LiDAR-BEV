@@ -14,7 +14,6 @@ import numpy as np
 
 from beamng_lidar_bev.config import WORLD_POSE_JUMP_RESET_M
 from beamng_lidar_bev.models import PerceptionSnapshot, VehicleGeometry
-from beamng_lidar_bev.scene_worker import SceneWorker
 from beamng_lidar_bev.semantics import SCENE_BOUNDARY, SCENE_ROAD
 from beamng_lidar_bev.worker import BeamNgWorker
 from beamng_lidar_bev.world_scene import WorldSceneAssembler
@@ -186,48 +185,29 @@ def test_a_compose_tick_tracks_the_ego_without_touching_the_stores() -> None:
     )
 
 
-def test_a_teleport_on_a_compose_tick_still_resets_the_scene() -> None:
+def test_a_teleport_is_never_presented_and_the_next_refresh_resets() -> None:
+    """
+    A compose tick cannot touch the stores (they belong to the refresh
+    thread), so its teleport guard is presentational: the cached city must
+    not be drawn 35 m from where it was built. The stores themselves reset
+    on the next refresh, whose odometer sees the jump.
+    """
     assembler = WorldSceneAssembler()
     assembler.update(_snapshot(_POINTS, _GROUPS))
     assert len(assembler._road_keys)
 
     jump = float(WORLD_POSE_JUMP_RESET_M) + 10.0
-    frame = assembler.update(
+    composed = assembler.update(
         _snapshot((), (), ego_pos_world=(jump, 0.0, 0.0), timestamp=0.04),
         refresh_stores=False,
     )
+    # The stale meshes are dropped, not drawn; the stores are untouched.
+    assert not len(composed.road_vertices)
+    assert len(assembler._road_keys)
 
-    # clear() dropped the stores AND the mesh cache, and the forced rebuild
-    # drew from the (now empty) stores rather than presenting stale meshes.
+    refreshed = assembler.update(
+        _snapshot((), (), ego_pos_world=(jump, 0.0, 0.0), timestamp=0.08)
+    )
     assert not len(assembler._road_keys)
-    assert not len(frame.road_vertices)
+    assert not len(refreshed.road_vertices)
     assert assembler._travelled_m == 0.0
-
-
-def test_scene_worker_refreshes_the_stores_on_its_own_clock() -> None:
-    class AssemblerStub:
-        def __init__(self) -> None:
-            self.refreshes: list[bool] = []
-
-        def update(self, snapshot: object, *, refresh_stores: bool = True) -> str:
-            self.refreshes.append(refresh_stores)
-            return "frame"
-
-        def clear(self) -> None:
-            pass
-
-    assembler = AssemblerStub()
-    worker = SceneWorker(assembler=assembler)
-
-    for tick in range(3):
-        worker.submit(SimpleNamespace(timestamp=float(tick)))  # type: ignore[arg-type]
-        worker._process_pending()
-
-    # Three back-to-back snapshots land inside one refresh interval: the first
-    # builds the stores, the ones behind it only re-present.
-    assert assembler.refreshes == [True, False, False]
-
-    worker.clear()
-    worker.submit(SimpleNamespace(timestamp=9.0))  # type: ignore[arg-type]
-    worker._process_pending()
-    assert assembler.refreshes[-1] is True
