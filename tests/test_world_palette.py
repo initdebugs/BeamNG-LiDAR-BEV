@@ -368,6 +368,16 @@ def test_every_surface_material_stays_on_the_ladder(name: str) -> None:
     palette = _palette() | _surface_palette()
     colour = palette[name]
 
+    if name == "surface_marking":
+        # The second deliberate ladder break, after the path ribbon: paint is
+        # a graphic ON the road, not a surface silhouetted against the air,
+        # so its legibility partner is the tarmac it lies on. What it must
+        # hold is a paint-strength step over the road and full separation
+        # from the obstacle band.
+        assert contrast_ratio(colour, palette["surface_paved"]) >= 2.5
+        assert contrast_ratio(colour, palette["boundary"]) >= 3.0
+        return
+
     assert contrast_ratio(colour, palette["air"]) >= 3.0
     assert contrast_ratio(colour, palette["boundary"]) >= 3.0
 

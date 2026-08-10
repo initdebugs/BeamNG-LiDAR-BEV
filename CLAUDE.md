@@ -349,7 +349,19 @@ rest — top of the road's luminance rung, ΔE ≥ 17 from every other surface. 
 hangs on one undocumented engine fact: whether the LiDAR's annotation pass labels road *decals*
 with the marking class or with the `STREET` beneath them — there is no intensity channel to fall
 back on, so `worker._watch_for_markings` logs a one-shot `Marking check:` line either way, and a
-zero on a marked road means paint is simply invisible to this sensor.
+zero on a marked road means paint is simply invisible to this sensor. (Confirmed live 2026-08-10:
+decals DO annotate through the LiDAR; paint draws.)
+
+Three things were then fixed from the first live look, all pinned in `test_world_scene.py`:
+**paint is near-white (`#c6c8c1`) and the SECOND deliberate ladder break** after the path ribbon —
+paint is a graphic ON the road, its contrast partner is the tarmac (3.4:1), not the air, and the
+in-band paint-yellow read as a stain; **marking cells are re-drawn as crisp full-colour quads 2 cm
+above the blended surface** (`_append_paint_quads`), because shared-corner averaging renders a
+one-cell line as a soft two-cell tent — the quads are observed cells only, deliberately unbridged,
+since a gap in paint (a dash gap) is data in a way a gap in tarmac is not; and **the road store's
+material takes the group MAXIMUM rather than newest-wins**, because a 0.25 m cell over a 0.12 m
+line holds street returns beside the paint and flickered — marking is the highest code and the
+road store only ever holds paved or marking, so the maximum means "paint was ever seen here".
 
 **A car's VISIBILITY must never depend on that actor path, and it once did.** Vehicle returns
 were excluded from the scene geometry on the understanding that traffic would be drawn as

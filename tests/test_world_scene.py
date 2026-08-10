@@ -1650,3 +1650,67 @@ def test_an_unoriented_footprint_is_meshed_exactly_as_before() -> None:
 
     assert len(_boxes(frame)) == 1
     np.testing.assert_allclose(_slab_tilts(frame), 0.0, atol=1e-6)
+
+
+def test_paint_draws_as_crisp_full_colour_quads_above_the_blend() -> None:
+    """
+    The shared-corner ground mesh averages a one-cell lane line 50/50 with the
+    tarmac at every corner, so paint rendered as a soft two-cell tent -- "a
+    bit blurry" was the live report. Marking cells are therefore drawn AGAIN
+    as hard-edged quads of the pure paint colour, lifted just above the
+    surface. The blend underneath stays; the pure colour on top is the line.
+    """
+    points = tuple((0.0, 4.0 + 0.25 * i, -0.45) for i in range(8)) + tuple(
+        (x, 4.0 + 0.25 * i, -0.45)
+        for x in (-0.5, 0.5)
+        for i in range(8)
+    )
+    groups = (SCENE_ROAD,) * len(points)
+    from beamng_lidar_bev.semantics import SURFACE_MARKING, SURFACE_PAVED
+
+    material_codes = tuple(
+        int(SURFACE_MARKING) if index < 8 else int(SURFACE_PAVED)
+        for index in range(len(points))
+    )
+    frame = WorldSceneAssembler().update(
+        _snapshot(points, groups, materials=material_codes)
+    )
+
+    paint_linear = world_scene.linear_rgb(config.WORLD_SURFACE_MARKING_RGB)
+    colours = frame.road_colors[:, :3]
+    exact = np.all(np.abs(colours - paint_linear) < 1e-5, axis=1)
+    assert exact.any(), "no vertex carries the pure paint colour"
+    # The pure-paint vertices sit the lift above the blended surface ones.
+    lifted = frame.road_vertices[exact][:, 1]
+    assert float(lifted.min()) > float(
+        frame.road_vertices[~exact][:, 1].max()
+    ) - 1e-6
+
+
+def test_paint_sticks_to_its_cell_across_tarmac_looks() -> None:
+    """
+    A 0.25 m cell over a 0.12 m line holds street returns beside the paint,
+    and newest-wins made the cell flicker between the two. The material takes
+    the group maximum instead, so a cell that has ever seen paint stays paint
+    until it expires with the rest of the store.
+    """
+    from beamng_lidar_bev.semantics import SURFACE_MARKING, SURFACE_PAVED
+
+    assembler = WorldSceneAssembler()
+    assembler.update(
+        _snapshot(
+            ((0.0, 5.0, -0.45),),
+            (SCENE_ROAD,),
+            materials=(int(SURFACE_MARKING),),
+        )
+    )
+    assembler.update(
+        _snapshot(
+            ((0.0, 5.0, -0.45),),
+            (SCENE_ROAD,),
+            materials=(int(SURFACE_PAVED),),
+            timestamp=0.04,
+        )
+    )
+
+    assert SURFACE_MARKING in assembler._road_material

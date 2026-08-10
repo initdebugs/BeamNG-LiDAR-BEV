@@ -583,14 +583,17 @@ WORLD_SURFACE_BARE_RGB = "#85664c"
 # came out dE 6.7 from paved, below the pair this palette already treats as its
 # closest. Hard unpaved ground is one material here.
 WORLD_SURFACE_WATER_RGB = "#447195"
-# Road paint -- lane lines, arrows, crossings. Solved in CIELAB like the rest:
-# a muted paint-yellow at the TOP of the road's luminance rung (3.03:1 against
-# the air, the band's ceiling), because real markings separate from tarmac by
-# being lighter and this band allows exactly one step of that. The hue does
-# the rest: dE 33 from paved and >= 17 from every other surface, the widest
-# margins in the surface set, because a 0.3 m stripe is the smallest patch any
-# of these colours has to carry.
-WORLD_SURFACE_MARKING_RGB = "#857b49"
+# Road paint -- lane lines, arrows, crossings -- and the SECOND deliberate
+# break in the luminance ladder, for the same reason WORLD_PATH_RGB is the
+# first: paint is a graphic ON the road, not a surface silhouetted against the
+# air, so its contrast partner is the tarmac it lies on rather than the sky it
+# never touches. A near-white (3.4:1 against the road) is what makes it read
+# as paint; the in-band paint-yellow tried first read as a road stain. The
+# cost is honesty at the rim -- far paint dissolves into the air a little
+# early under the depth tint -- which is the correct direction for the least
+# structural thing in the scene. Exempted from the air-side ladder assertion
+# in test_world_palette with this same argument.
+WORLD_SURFACE_MARKING_RGB = "#c6c8c1"
 WORLD_PATH_RGB = "#4ea8f2"
 WORLD_PATH_ALERT_RGB = "#c0271e"
 # Traffic drawn from LiDAR alone, in the same blue as the corroborated actor

@@ -876,6 +876,68 @@ def present_world_mesh(
     return vertices, colours, mesh.indices
 
 
+# Just enough lift that the paint always wins the depth test against the
+# surface it lies on, and far too little to read as a raised object.
+_PAINT_LIFT_M = 0.02
+
+
+def _append_paint_quads(
+    world: np.ndarray,
+    colours: np.ndarray,
+    indices: np.ndarray,
+    limits: np.ndarray,
+    cells_xy: np.ndarray,
+    heights: np.ndarray,
+    cell_limits: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Re-draw marking cells as crisp full-colour quads over the blended ground.
+
+    The ground mesh shares corners, so a one-cell lane line's corners average
+    50/50 with the tarmac around them and the paint rendered as a soft
+    two-cell tent. The blended base stays (it reads as the paint's soft
+    fringe); these quads put a hard-edged cell of pure paint colour on top,
+    which is what makes a line look like a line. Emitted with BOTH windings so
+    the quad is visible however the render basis faces it -- paint cells are
+    few, so the doubled triangles are noise.
+    """
+    x0 = cells_xy[:, 0] * WORLD_CELL_SIZE_M
+    y0 = cells_xy[:, 1] * WORLD_CELL_SIZE_M
+    z = np.asarray(heights, dtype=np.float64) + _PAINT_LIFT_M
+    corners = np.empty((len(cells_xy) * 4, 3), dtype=np.float64)
+    corners[0::4] = np.column_stack((x0, y0, z))
+    corners[1::4] = np.column_stack((x0 + WORLD_CELL_SIZE_M, y0, z))
+    corners[2::4] = np.column_stack(
+        (x0 + WORLD_CELL_SIZE_M, y0 + WORLD_CELL_SIZE_M, z)
+    )
+    corners[3::4] = np.column_stack((x0, y0 + WORLD_CELL_SIZE_M, z))
+
+    base = (
+        np.arange(len(cells_xy), dtype=np.uint32)[:, None] * np.uint32(4)
+        + np.uint32(len(world))
+    )
+    both_windings = np.asarray(
+        (0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2), dtype=np.uint32
+    )
+    quad_indices = (base + both_windings[None, :]).reshape(-1)
+
+    paint_colour = np.broadcast_to(
+        _SURFACE_LINEAR[int(SURFACE_MARKING)], (len(corners), 3)
+    )
+    return (
+        np.concatenate((world, corners)),
+        np.ascontiguousarray(
+            np.concatenate((colours, paint_colour.astype(colours.dtype)))
+        ),
+        np.concatenate((indices.astype(np.uint32), quad_indices)),
+        np.ascontiguousarray(
+            np.concatenate(
+                (limits, np.repeat(cell_limits, 4).astype(limits.dtype))
+            )
+        ),
+    )
+
+
 def path_ribbon(
     points_bev: np.ndarray, half_width_m: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1857,7 +1919,20 @@ class WorldSceneAssembler:
         newest = combined_order[_group_ends(combined_packed[combined_order])]
         self._road_keys = all_keys[newest]
         self._road_height = all_height[newest]
-        self._road_material = all_material[newest]
+        # The MATERIAL takes the group maximum rather than the newest reading.
+        # A 0.25 m cell over a 0.12 m lane line holds street returns beside the
+        # paint, so newest-wins made the cell's colour depend on which return
+        # happened to land last -- painted cells flickered between paint and
+        # tarmac frame to frame. SURFACE_MARKING is the highest material code
+        # and the road store only ever holds PAVED or MARKING (nothing else
+        # passes the road rule), so the maximum means "paint was ever seen
+        # here" and holds until the cell expires with the rest of the store.
+        # The reduceat follows the same sorted group order `newest` does, so
+        # the two stay aligned row for row.
+        self._road_material = np.maximum.reduceat(
+            all_material[combined_order],
+            _group_starts(combined_packed[combined_order]),
+        )
         self._road_seen = all_seen[newest]
 
     def _expire_road_cells(self, snapshot: PerceptionSnapshot) -> None:
@@ -2011,6 +2086,18 @@ class WorldSceneAssembler:
         if not len(cells):
             return _EMPTY_WORLD_MESH
 
+        # Captured BEFORE bridging and corner averaging, both of which exist to
+        # smooth the surface and are exactly what made paint blurry: a corner
+        # shared with tarmac averages 50/50, so a one-cell line rendered as a
+        # soft two-cell tent. These cells become crisp full-colour quads 2 cm
+        # above the surface below -- observed cells only, deliberately
+        # unbridged, because a gap in paint is DATA (a dash gap, the end of a
+        # line) in a way a gap in tarmac is not.
+        paint = materials == SURFACE_MARKING
+        paint_cells = cells[paint, :2]
+        paint_height = heights[paint]
+        paint_limit = limits[paint]
+
         # Colour is resolved per CELL, before bridging, so the interpolation
         # below blends the two materials either side of a gap instead of trying
         # to interpolate a material CODE -- which has no meaningful midpoint.
@@ -2070,13 +2157,26 @@ class WorldSceneAssembler:
                 quad[:, 3],
             )
         ).reshape(-1)
+
+        colours = np.ascontiguousarray(corner_colour)
+        limits_out = np.ascontiguousarray(corner_limit)
+        if len(paint_cells):
+            world, colours, indices, limits_out = _append_paint_quads(
+                world,
+                colours,
+                indices,
+                limits_out,
+                paint_cells,
+                paint_height,
+                paint_limit,
+            )
         # World coordinates out, not render: the projection and the tint are
         # per-snapshot work and belong to `present_world_mesh`.
         return WorldMesh(
             world,
-            np.ascontiguousarray(corner_colour),
+            colours,
             np.ascontiguousarray(indices),
-            np.ascontiguousarray(corner_limit),
+            limits_out,
         )
 
     def _update_boundary_columns(self, snapshot: PerceptionSnapshot) -> None:
