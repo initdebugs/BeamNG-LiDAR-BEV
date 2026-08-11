@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import (
     QColor,
@@ -172,6 +173,10 @@ class BevWidget(QWidget):
                 self._draw_sensor_coverage(
                     painter, plot_rect, self._frame.vehicle_geometry
                 )
+            # Under the plan arc: the route is where navigation says to go,
+            # the plan is what the planner chose, and the choice reads on top.
+            if self._frame.route_points is not None:
+                self._draw_route(painter, plot_rect, self._frame.route_points)
             if self._frame.plan is not None:
                 self._draw_plan(painter, plot_rect, self._frame.plan)
             # After the plan, so the emergency corridor is never buried under
@@ -494,8 +499,60 @@ class BevWidget(QWidget):
             painter.setBrush(accent)
             painter.drawEllipse(chosen.at(chosen.count() - 1), 3.0, 3.0)
 
-        if arc.nav_heading_rad is not None:
-            self._draw_nav_hint(painter, rect, arc.nav_heading_rad)
+        if plan.reverse_arc is not None:
+            # The arc the recovery is actually about to drive. mirror_points
+            # is a 180-degree ROTATION, so negating both coordinates returns
+            # the travel-frame path to the forward BEV frame -- the same
+            # un-rotation `_aeb_to_screen` applies to the rear corridor.
+            reverse = plan.reverse_arc
+            reverse_points = path_polyline(
+                reverse.curvature,
+                reverse.transition_distance_m,
+                reverse.next_curvature,
+                min(max(reverse.free_distance_m, 2.0), 10.0),
+                samples=32,
+            )
+            backward = QPolygonF(
+                [
+                    bev_to_screen(rect, -float(x), -float(y), self._radius_m)
+                    for x, y in reverse_points
+                ]
+            )
+            painter.setPen(QPen(QColor(_MODE_COLOURS["REVERSING"]), 2.2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(backward)
+
+        # The spoke prefers the route TANGENT (an honest heading) over the
+        # legacy bearing-to-a-node hint, whichever the planner actually used.
+        heading_hint = (
+            arc.route_heading_rad
+            if arc.route_heading_rad is not None
+            else arc.nav_heading_rad
+        )
+        if heading_hint is not None:
+            self._draw_nav_hint(painter, rect, heading_hint)
+        painter.restore()
+
+    def _draw_route(
+        self, painter: QPainter, rect: QRectF, route_points: np.ndarray
+    ) -> None:
+        """The route being followed: dashed, in the nav-hint blue, and drawn
+        zoom-aware through the same mapping as every other overlay."""
+        if len(route_points) < 2:
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        polyline = QPolygonF(
+            [
+                bev_to_screen(rect, float(x), float(y), self._radius_m)
+                for x, y in route_points
+            ]
+        )
+        pen = QPen(QColor(116, 191, 255, 140), 1.4)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(polyline)
         painter.restore()
 
     def _draw_nav_hint(

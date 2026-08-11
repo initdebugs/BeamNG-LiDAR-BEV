@@ -37,6 +37,9 @@ from .config import (
     REVERSE_DISTANCE_M,
     REVERSE_MIN_CLEARANCE_M,
     REVERSE_SPEED_MPS,
+    ROUTE_ARRIVAL_BOOST_PER_S,
+    ROUTE_ARRIVAL_DECEL_MPS2,
+    ROUTE_ARRIVED_SPEED_LIMIT_MPS,
     SPEED_KV,
     STALL_SPEED_MPS,
     STEER_GAIN_ADAPT_RATE,
@@ -185,6 +188,10 @@ class DrivingController:
         # always looks clear when the car is kerbed or wedged. Without this the
         # controller flip-flops BLOCKED -> DRIVING forever and never recovers.
         self._blocked_by_stall = False
+        self._reverse_arc: ArcPlan | None = None
+        # The arrival brake's non-progress ratchet (see _drive).
+        self._arrival_boost = 0.0
+        self._arrival_last_speed = float("inf")
 
     @property
     def mode(self) -> str:
@@ -214,6 +221,7 @@ class DrivingController:
         rear_free_distance_m: float = REVERSE_MIN_CLEARANCE_M,
         reported_gear: object = None,
         heading_rad: float | None = None,
+        reverse_arc: ArcPlan | None = None,
     ) -> ControlCommand:
         dt = max(float(dt), 1e-3)
         speed = float(forward_speed_mps)
@@ -221,6 +229,10 @@ class DrivingController:
         self._speed_abs = abs(speed)
         self._observe_yaw(heading_rad, dt)
         self._mode_elapsed += dt
+        # The reverse plan for THIS tick, if the worker computed one. Held on
+        # the instance so `_enter`'s tail call into `_reverse` sees it too;
+        # None reproduces the old straight reverse exactly.
+        self._reverse_arc = reverse_arc
 
         if self._mode == REVERSING:
             self._reversed_m += max(0.0, -speed) * dt
@@ -234,6 +246,84 @@ class DrivingController:
     def _drive(
         self, plan: ArcPlan, speed: float, dt: float
     ) -> ControlCommand:
+        if (
+            plan.route_speed_limit_mps is not None
+            and plan.route_speed_limit_mps < ROUTE_ARRIVED_SPEED_LIMIT_MPS
+            and abs(speed) < HOLD_TAPER_SPEED_MPS
+        ):
+            # Arriving: explicit branches, never merely a zero target. At a
+            # zero target the throttle path serves the trim integrator (wound
+            # up on the drive here) and the coast band hands the final metres
+            # to engine drag -- measured, the car idle-crept 6.7 m past the
+            # marker. Zero throttle also means the stall recovery cannot
+            # fire. Mode stays DRIVING: clearing or changing the destination
+            # raises the limit and driving resumes on the next tick.
+            if abs(speed) < STALL_SPEED_MPS:
+                return ControlCommand(
+                    steering=self._steer(0.0, dt, abs(speed)),
+                    throttle=0.0,
+                    brake=self._hold_brake(speed, dt),
+                    gear=self._forward_gear,
+                    mode=DRIVING,
+                    target_speed_mps=0.0,
+                    reason="Arrived at destination",
+                )
+            # A collapsed free distance OUTRANKS the gentle arrival. Below
+            # AEB_MIN_SPEED_MPS forward AEB cannot arm, so the blocked entry
+            # this branch sits in front of was the only sub-2 m/s obstacle
+            # response there is -- masking it with a 0.2 pedal would roll the
+            # car into whatever just entered the corridor. Mode still stays
+            # DRIVING: a hold, not a reverse recovery, is the right end state
+            # at a destination facing an obstacle.
+            if plan.free_distance_m <= STOP_MARGIN_M:
+                return ControlCommand(
+                    steering=self._steer(0.0, dt, abs(speed)),
+                    throttle=0.0,
+                    brake=self._hold_brake(speed, dt),
+                    gear=self._forward_gear,
+                    mode=DRIVING,
+                    target_speed_mps=0.0,
+                    reason="Arriving; path blocked",
+                )
+            # Below walking pace, still rolling: a gentle dedicated brake to
+            # rest, bypassing the coast band -- against a permanently-zero
+            # target there is no chatter for the band to prevent. The pedal
+            # is open-loop, so while the car is NOT actually slowing (a
+            # downgrade beating 1.5 m/s^2) it ratchets up -- an integrator on
+            # non-progress, or the car hovers downhill past the marker
+            # forever. On flat ground the ratchet never engages.
+            self._throttle = 0.0
+            self._braking = True
+            if abs(speed) >= self._arrival_last_speed - 1e-3:
+                self._arrival_boost = min(
+                    self._arrival_boost + ROUTE_ARRIVAL_BOOST_PER_S * dt, 1.0
+                )
+            self._arrival_last_speed = abs(speed)
+            pedal = min(
+                1.0,
+                (ROUTE_ARRIVAL_DECEL_MPS2 - ENGINE_DRAG_MPS2)
+                / BRAKE_GAIN_MPS2
+                + self._arrival_boost,
+            )
+            self._brake = _slew(
+                self._brake,
+                pedal,
+                BRAKE_SLEW_UP_PER_S,
+                BRAKE_SLEW_DOWN_PER_S,
+                dt,
+            )
+            return ControlCommand(
+                steering=self._steer(0.0, dt, abs(speed)),
+                throttle=0.0,
+                brake=self._brake,
+                gear=self._forward_gear,
+                mode=DRIVING,
+                target_speed_mps=0.0,
+                reason="Arriving at destination",
+            )
+        self._arrival_boost = 0.0
+        self._arrival_last_speed = float("inf")
+
         if plan.free_distance_m <= STOP_MARGIN_M:
             return self._enter(
                 BLOCKED, plan, speed, dt, "Path blocked ahead"
@@ -325,8 +415,18 @@ class DrivingController:
         # Speed is signed, so reversing at 2 m/s reads as -2.0. Compare
         # magnitudes and let the same PI law do the work.
         throttle, brake = self._longitudinal(REVERSE_SPEED_MPS, abs(speed), dt)
+        # The reverse plan reasons in the 180-degree-rotated TRAVEL frame
+        # (`aeb.mirror_points`' frame). For a car reversing with front-frame
+        # curvature k_f, yaw rate is v_signed * k_f with v_signed < 0, so the
+        # travel-frame path curvature is k_m = yaw/|v| = -k_f -- the mirror is
+        # a curvature-domain NEGATION, applied here, before STEERING_SIGN, so
+        # the one-place-reconciles-conventions rule survives. No plan means
+        # dead straight, exactly as before steered reversing existed.
+        steer_curvature = (
+            0.0 if self._reverse_arc is None else -self._reverse_arc.curvature
+        )
         return ControlCommand(
-            steering=self._steer(0.0, dt, abs(speed)),
+            steering=self._steer(steer_curvature, dt, abs(speed)),
             throttle=throttle,
             brake=brake,
             gear=REVERSE_GEAR,
@@ -400,6 +500,13 @@ class DrivingController:
                     plan.next_curvature, plan.transition_distance_m
                 ),
             )
+        # The route preview: upcoming curvature, turning junctions and the
+        # destination, folded into ONE value by route_model's backward pass.
+        # Path knowledge arriving through the plan -- the same category as
+        # next_curvature above -- which is what keeps this a min() and never
+        # a lookahead computed here.
+        if plan.route_speed_limit_mps is not None:
+            target = min(target, plan.route_speed_limit_mps)
         headroom = max(0.0, plan.free_distance_m - STOP_MARGIN_M)
         return min(target, math.sqrt(2.0 * COMFORT_DECEL_MPS2 * headroom))
 
@@ -567,7 +674,8 @@ class DrivingController:
         m/s^2 through a 25 m bend against a 3.5 limit. As the car slows the
         ceiling opens and the turn completes.
 
-        Below about 16 km/h the ceiling is wider than full lock, so parking
+        Below v = sqrt(MAX_LATERAL_ACCEL / K_MAX) -- 6.0 m/s, about 22 km/h at
+        the 6.0 grip figure -- the ceiling is wider than full lock, so parking
         manoeuvres are untouched.
         """
         return MAX_LATERAL_ACCEL_MPS2 / max(abs(speed), 1e-3) ** 2

@@ -12,6 +12,9 @@ from beamng_lidar_bev.models import (
     STANDBY,
     ActorObservation,
     AebState,
+    ArcPlan,
+    ControlCommand,
+    DrivingPlan,
     PerceptionSnapshot,
     VehicleGeometry,
 )
@@ -69,6 +72,8 @@ def _snapshot(
     aeb: object = None,
     rear_aeb: object = None,
     materials: tuple[int, ...] | None = None,
+    route_world: np.ndarray | None = None,
+    plan: DrivingPlan | None = None,
 ) -> PerceptionSnapshot:
     return PerceptionSnapshot(
         points_world=np.asarray(points, dtype=np.float32).reshape(-1, 3),
@@ -86,8 +91,10 @@ def _snapshot(
         ),
         vehicle_geometry=GEOMETRY,
         actors=actors,
+        plan=plan,
         aeb=aeb,  # type: ignore[arg-type]
         rear_aeb=rear_aeb,  # type: ignore[arg-type]
+        route_world=route_world,
     )
 
 
@@ -1714,3 +1721,88 @@ def test_paint_sticks_to_its_cell_across_tarmac_looks() -> None:
     )
 
     assert SURFACE_MARKING in assembler._road_material
+
+
+# --- the route ribbon --------------------------------------------------------
+
+
+def test_the_route_ribbon_is_built_only_from_a_snapshot_route() -> None:
+    """No route, no ribbon -- and with one, dashes: a 30 m straight at the
+    2 m / 1.5 m dash cycle is nine deliberately unbridged strips, because a
+    gap in guidance is a gap on purpose."""
+    bare = WorldSceneAssembler().update(
+        _snapshot(((0.0, 5.0, 0.0),), (SCENE_ROAD,))
+    )
+    assert len(bare.route_vertices) == 0
+
+    route = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 30.0, 0.0]], dtype=np.float32
+    )
+    framed = WorldSceneAssembler().update(
+        _snapshot(((0.0, 5.0, 0.0),), (SCENE_ROAD,), route_world=route)
+    )
+    assert len(framed.route_vertices) == 9 * 8  # 9 dashes, 4 samples each
+    assert len(framed.route_indices) % 6 == 0
+
+
+def test_the_route_ribbon_is_visually_subordinate_to_the_path() -> None:
+    """Chroma and alpha are the route's channels: it ships translucent under
+    the fully-opaque plan ribbon, and sits 5 mm beneath its height so the
+    plan wins wherever they overlap."""
+    route = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 30.0, 0.0]], dtype=np.float32
+    )
+    frame = WorldSceneAssembler().update(
+        _snapshot(((0.0, 5.0, 0.0),), (SCENE_ROAD,), route_world=route)
+    )
+
+    assert float(frame.route_colors[:, 3].max()) == pytest.approx(
+        config.WORLD_ROUTE_ALPHA
+    )
+    np.testing.assert_allclose(
+        frame.route_vertices[:, 1],
+        GEOMETRY.ground_z_vehicle + 0.025,
+        atol=1e-6,
+    )
+
+
+def _arc(curvature: float = 0.0, free: float = 20.0) -> ArcPlan:
+    empty = np.zeros(1, dtype=np.float32)
+    return ArcPlan(
+        curvature=curvature,
+        free_distance_m=free,
+        clearance_m=3.0,
+        keep_right_target_m=None,
+        nav_heading_rad=None,
+        candidate_curvatures=empty,
+        candidate_costs=empty,
+        candidate_free_distances=empty,
+    )
+
+
+def test_a_reverse_plan_draws_the_reverse_path() -> None:
+    """During the steered reverse the drawn ribbon must be the arc actually
+    being driven, un-rotated from the travel frame -- a forward-pointing
+    ribbon while the tail swings is a display-honesty breach."""
+    plan = DrivingPlan(
+        arc=_arc(),
+        command=ControlCommand(
+            steering=0.3,
+            throttle=0.2,
+            brake=0.0,
+            gear=-1,
+            mode="REVERSING",
+            target_speed_mps=2.0,
+            reason="Reversing",
+        ),
+        forward_speed_mps=-1.5,
+        reverse_arc=_arc(curvature=0.08, free=8.0),
+    )
+    frame = WorldSceneAssembler().update(
+        _snapshot(((0.0, 5.0, 0.0),), (SCENE_ROAD,), plan=plan)
+    )
+
+    # Render z is -forward: a reverse path lies entirely BEHIND the car.
+    assert len(frame.path_vertices)
+    assert float(frame.path_vertices[:, 2].min()) >= -1e-5
+    assert float(frame.path_vertices[:, 2].max()) > 4.0

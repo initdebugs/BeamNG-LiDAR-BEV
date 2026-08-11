@@ -213,6 +213,7 @@ class SceneBridge(QObject):
         self._aeb_geometry = SceneGeometry(triangles)
         self._aeb_marker_geometry = SceneGeometry(triangles)
         self._path_geometry = SceneGeometry(triangles)
+        self._route_geometry = SceneGeometry(triangles)
         self._uncertain_geometry = SceneGeometry(
             QQuick3DGeometry.PrimitiveType.Points
         )
@@ -264,6 +265,10 @@ class SceneBridge(QObject):
     @pyqtProperty(QQuick3DGeometry, constant=True)
     def pathGeometry(self) -> QQuick3DGeometry:
         return self._path_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def routeGeometry(self) -> QQuick3DGeometry:
+        return self._route_geometry
 
     @pyqtProperty(QQuick3DGeometry, constant=True)
     def uncertainGeometry(self) -> QQuick3DGeometry:
@@ -354,6 +359,9 @@ class SceneBridge(QObject):
         self._path_geometry.set_mesh(
             frame.path_vertices, frame.path_colors, frame.path_indices
         )
+        self._route_geometry.set_mesh(
+            frame.route_vertices, frame.route_colors, frame.route_indices
+        )
         self._uncertain_geometry.set_mesh(
             frame.uncertain_points, frame.uncertain_colors
         )
@@ -396,6 +404,7 @@ class SceneBridge(QObject):
             self._aeb_geometry,
             self._aeb_marker_geometry,
             self._path_geometry,
+            self._route_geometry,
             self._uncertain_geometry,
         ):
             geometry.clear_mesh()

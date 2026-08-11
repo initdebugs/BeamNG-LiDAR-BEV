@@ -16,21 +16,29 @@ a straight road cannot reach.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
+from beamng_lidar_bev.aeb import mirror_points, mirrored
 from beamng_lidar_bev.config import (
     MAX_LATERAL_ACCEL_MPS2,
     MIN_TURN_RADIUS_M,
+    REVERSE_COST_SMOOTHNESS,
+    REVERSE_MIN_CLEARANCE_M,
+    REVERSE_REQUIRED_FREE_M,
+    ROUTE_ARRIVAL_LATCH_M,
     STEERING_SIGN,
 )
 from beamng_lidar_bev.controller import DrivingController
-from beamng_lidar_bev.models import VehicleGeometry
+from beamng_lidar_bev.models import RouteHint, VehicleGeometry
 from beamng_lidar_bev.planner import (
     geometric_obstacles,
     plan_arc,
     rear_free_distance,
 )
+from beamng_lidar_bev.route_model import build_route_path
 
 GEOMETRY = VehicleGeometry(
     ground_z_vehicle=-0.5,
@@ -234,6 +242,254 @@ def _drive_corner(radius_m: float, seconds: float = 30.0) -> dict[str, float]:
         "closest_m": closest,
         "modes": modes,
     }
+
+
+# --- steered reverse recovery ------------------------------------------------
+
+
+def _hline(x_from: float, x_to: float, y: float) -> np.ndarray:
+    xs = np.arange(x_from, x_to, 0.1)
+    return np.column_stack((xs, np.full_like(xs, y)))
+
+
+def _drive_pocket(seconds: float) -> dict[str, object]:
+    """
+    A dead end: wall ahead, straight-back and behind-left blocked, open
+    behind-right and ahead-left. The escape REQUIRES steering in reverse --
+    the tail swings right into the open, the nose rotates left toward the
+    gap, and the forward re-plan takes it from there.
+    """
+    # Wall ahead covering left and centre (open front-right); a parked car
+    # half a lane right, dead behind (straight-back room falls short of the
+    # 6 m reverse); open behind-left for the diagonal out.
+    parked = [
+        _hline(0.3, 3.4, y) for y in (-4.5, -5.0, -5.5, -6.0)
+    ]
+    world = np.concatenate(
+        (
+            _hline(-12.0, 3.0, 3.5),
+            _hline(-12.0, 3.0, 3.8),
+            *parked,
+        )
+    )
+    controller = DrivingController()
+    mirror_geometry = mirrored(GEOMETRY)
+    pos = np.zeros(2)
+    psi = np.pi / 2
+    speed = 0.0  # signed: reversing reads negative
+    modes: list[str] = []
+    reverse_steer = 0.0
+    straight_back = np.inf
+
+    for tick in range(int(seconds / _DT)):
+        forward = np.asarray((np.cos(psi), np.sin(psi)))
+        right = np.asarray((np.sin(psi), -np.cos(psi)))
+        rel = world - pos
+        bev = np.column_stack((rel @ right, rel @ forward)).astype(np.float32)
+        obstacles = bev[np.hypot(bev[:, 0], bev[:, 1]) <= 35.0]
+
+        plan = plan_arc(
+            obstacles,
+            GEOMETRY,
+            previous_curvature=controller.current_curvature,
+            lookahead_m=min(30.0, max(16.0, 2.8 * abs(speed))),
+        )
+        rear_free = rear_free_distance(obstacles, GEOMETRY)
+        if tick == 0:
+            straight_back = rear_free
+        # The worker's steered-reverse wiring, mirrored exactly.
+        reverse_arc = None
+        if controller.mode == "REVERSING" or (
+            controller.mode == "BLOCKED" and abs(speed) < 0.3
+        ):
+            reverse_arc = plan_arc(
+                mirror_points(obstacles),
+                mirror_geometry,
+                previous_curvature=-controller.current_curvature,
+                lookahead_m=10.0,
+                keep_right=False,
+                required_free_m=REVERSE_REQUIRED_FREE_M,
+                smoothness_weight=REVERSE_COST_SMOOTHNESS,
+            )
+            rear_free = float(reverse_arc.free_distance_m)
+        command = controller.step(
+            plan,
+            speed,
+            _DT,
+            rear_free_distance_m=rear_free,
+            reported_gear="D",
+            heading_rad=psi,
+            reverse_arc=reverse_arc,
+        )
+
+        curvature = (command.steering / STEERING_SIGN) * _K_MAX
+        direction = 1.0 if command.gear > 0 else -1.0
+        speed += direction * command.throttle * 3.5 * _DT
+        drop = (command.brake * 6.0 + 0.1) * _DT
+        if speed > 0.0:
+            speed = max(0.0, speed - drop)
+        elif speed < 0.0:
+            speed = min(0.0, speed + drop)
+        psi += speed * curvature * _DT
+        pos = pos + np.asarray((np.cos(psi), np.sin(psi))) * speed * _DT
+
+        modes.append(command.mode)
+        if command.mode == "REVERSING":
+            reverse_steer = max(reverse_steer, abs(command.steering))
+
+    return {
+        "modes": modes,
+        "position": pos,
+        "reverse_steer": reverse_steer,
+        "straight_back_m": straight_back,
+    }
+
+
+def test_a_cornered_car_escapes_with_a_steered_reverse() -> None:
+    """
+    Backing straight only postpones this pocket: the rear wall sits dead
+    behind, so a straight reverse ends still nose-to-wall and the cycle
+    repeats forever. The only productive reverse is the diagonal -- tail
+    right into the open, nose left toward the gap -- which is exactly what a
+    straight-only recovery cannot do.
+    """
+    result = _drive_pocket(30.0)
+
+    modes = result["modes"]
+    assert result["straight_back_m"] >= REVERSE_MIN_CLEARANCE_M  # it MAY back up
+    assert "REVERSING" in modes
+    assert "STUCK" not in modes
+    assert modes[-1] == "DRIVING"
+    assert result["reverse_steer"] > 0.05  # it steered, not straight
+    assert float(result["position"][1]) > 6.0  # clear of the pocket
+
+
+# --- route following ---------------------------------------------------------
+#
+# Open ground, no kerbs: the route reference path is the ONLY thing shaping
+# the drive, which is exactly the point -- lateral tracking comes from the
+# cross-track/tangent terms and longitudinal shaping from the backward speed
+# pass, with no obstacle geometry to hide behind.
+
+
+def _route_hint(nodes: list[tuple[float, float]]) -> RouteHint:
+    array = np.asarray([(x, y, 0.0) for x, y in nodes], dtype=np.float64)
+    chords = float(np.sum(np.hypot(*np.diff(array[:, :2], axis=0).T)))
+    return RouteHint(path_world=array, remaining_m=chords)
+
+
+def _drive_route(
+    hint: RouteHint, seconds: float
+) -> dict[str, object]:
+    controller = DrivingController()
+    pos = np.zeros(2)
+    psi = np.pi / 2
+    speed = 0.0
+    arrived_hold = False
+    speeds: list[float] = []
+    brakes: list[float] = []
+    cross: list[float] = []
+    modes: set[str] = set()
+    reason = ""
+    no_obstacles = np.empty((0, 2), dtype=np.float32)
+
+    for _ in range(int(seconds / _DT)):
+        state = {
+            "pos": (float(pos[0]), float(pos[1]), 0.0),
+            "dir": (float(np.cos(psi)), float(np.sin(psi)), 0.0),
+            "up": (0.0, 0.0, 1.0),
+            "vel": (
+                float(np.cos(psi) * speed),
+                float(np.sin(psi) * speed),
+                0.0,
+            ),
+        }
+        route_path = build_route_path(hint, state)
+        plan = plan_arc(
+            no_obstacles,
+            GEOMETRY,
+            previous_curvature=controller.current_curvature,
+            lookahead_m=min(30.0, max(16.0, 2.8 * abs(speed))),
+            route=route_path,
+        )
+        # The worker's arrival latch, mirrored: near the marker the game (and
+        # a consumed polyline) clears the route, and without the latch the
+        # speed law would get its full cap back right at the destination.
+        if route_path is not None:
+            arrived_hold = route_path.remaining_m <= ROUTE_ARRIVAL_LATCH_M
+            cross.append(abs(route_path.cross_track_m))
+        elif arrived_hold:
+            plan = replace(plan, route_speed_limit_mps=0.0)
+        command = controller.step(
+            plan,
+            speed,
+            _DT,
+            rear_free_distance_m=20.0,
+            reported_gear="D",
+            heading_rad=psi,
+        )
+
+        curvature = (command.steering / STEERING_SIGN) * _K_MAX
+        speed = max(
+            0.0, speed + (command.throttle * 3.5 - command.brake * 6.0 - 0.1) * _DT
+        )
+        psi += speed * curvature * _DT
+        pos = pos + np.asarray((np.cos(psi), np.sin(psi))) * speed * _DT
+
+        speeds.append(speed)
+        brakes.append(command.brake)
+        modes.add(command.mode)
+        reason = command.reason
+
+    return {
+        "speeds": np.asarray(speeds),
+        "brakes": np.asarray(brakes),
+        "cross": np.asarray(cross),
+        "modes": modes,
+        "position": pos,
+        "reason": reason,
+    }
+
+
+def test_a_route_corner_is_previewed_and_driven_smoothly() -> None:
+    """
+    A 90-degree right at R = 15 m, 60 m out, with nothing but the route to
+    say so. The speed pass must ramp the car down to corner speed before the
+    bend -- gently, because the target falls as the sqrt envelope, never as a
+    surprise -- and the lateral terms must carry it round and out the far
+    side.
+    """
+    nodes: list[tuple[float, float]] = [(0.0, float(y)) for y in range(0, 61, 10)]
+    for angle in np.linspace(np.pi, np.pi / 2, 7)[1:]:
+        nodes.append((15.0 + 15.0 * np.cos(angle), 60.0 + 15.0 * np.sin(angle)))
+    nodes.extend((float(x), 75.0) for x in range(25, 320, 10))
+
+    result = _drive_route(_route_hint(nodes), seconds=25.0)
+
+    speeds = result["speeds"]
+    settled = speeds[int(3.0 / _DT) :]
+    corner_speed = np.sqrt(2.8 * 15.0)  # ~6.5 m/s at R = 15
+    assert result["modes"] == {"DRIVING"}
+    assert float(speeds.max()) > 9.5  # reached near the cap on the straight
+    assert float(settled.min()) <= corner_speed + 1.0  # slowed for the bend
+    assert float(settled.min()) >= 3.0  # but never crawled or stopped
+    assert float(result["position"][0]) > 35.0  # made the exit, heading east
+    # Smooth modulation: the ramped target keeps the pedal far below a slam.
+    assert float(result["brakes"].max()) <= 0.55
+    assert float(result["cross"].max()) < 3.0  # tracked the lane throughout
+
+
+def test_the_car_stops_at_the_destination_and_stays() -> None:
+    result = _drive_route(
+        _route_hint([(0.0, float(y)) for y in range(0, 81, 10)]), seconds=30.0
+    )
+
+    speeds = result["speeds"]
+    assert result["modes"] == {"DRIVING"}
+    assert float(speeds.max()) > 9.0  # it drove there, not crept
+    assert float(np.max(speeds[-int(3.0 / _DT) :])) < 0.1  # and STAYS stopped
+    assert 66.0 < float(result["position"][1]) < 80.0  # short of the marker
+    assert result["reason"] == "Arrived at destination"
 
 
 @pytest.mark.parametrize("radius_m", (60.0, 35.0, 25.0))

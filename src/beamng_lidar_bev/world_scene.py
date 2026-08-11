@@ -78,6 +78,11 @@ from .config import (
     WORLD_ROAD_BRIDGE_CELLS,
     WORLD_ROAD_RADIUS_M,
     WORLD_ROAD_RGB,
+    WORLD_ROUTE_ALPHA,
+    WORLD_ROUTE_DASH_M,
+    WORLD_ROUTE_GAP_M,
+    WORLD_ROUTE_HALF_WIDTH_M,
+    WORLD_ROUTE_RGB,
     WORLD_SLAB_BOTTOM_SHADE,
     WORLD_SLAB_HEIGHT_BUCKET_M,
     WORLD_SLAB_LIGHT_DIR,
@@ -196,6 +201,7 @@ _BOUNDARY_LINEAR = linear_rgb(WORLD_BOUNDARY_RGB)
 _BOUNDARY_LIT_LINEAR = linear_rgb(WORLD_BOUNDARY_LIT_RGB)
 _PATH_LINEAR = linear_rgb(WORLD_PATH_RGB)
 _PATH_ALERT_LINEAR = linear_rgb(WORLD_PATH_ALERT_RGB)
+_ROUTE_LINEAR = linear_rgb(WORLD_ROUTE_RGB)
 _UNCERTAIN_LINEAR = linear_rgb(WORLD_UNCERTAIN_RGB)
 # Indexed by SURFACE_* code, so the lookup is one fancy-index over the cells.
 # Every entry sits on the road's rung of the contrast ladder and separates by
@@ -1773,6 +1779,7 @@ class WorldSceneAssembler:
         uncertain, uncertain_colors = self._uncertain_points(snapshot)
         actors = self._update_actors(snapshot)
         path_vertices, path_colors, path_indices = self._planned_path(snapshot, alert)
+        route_vertices, route_colors, route_indices = self._route_ribbon(snapshot)
         camera_position, camera_euler = self._camera(snapshot, alert)
         plan = snapshot.plan
 
@@ -1795,6 +1802,9 @@ class WorldSceneAssembler:
             path_vertices=path_vertices,
             path_colors=path_colors,
             path_indices=path_indices,
+            route_vertices=route_vertices,
+            route_colors=route_colors,
+            route_indices=route_indices,
             uncertain_points=uncertain,
             uncertain_colors=uncertain_colors,
             actors=actors,
@@ -2895,6 +2905,65 @@ class WorldSceneAssembler:
         )
 
     @staticmethod
+    def _route_ribbon(
+        snapshot: PerceptionSnapshot,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        The navigation route as a DASHED thin ribbon, subordinate to the plan
+        path by chroma and alpha (never luminance -- chroma is the overlay
+        channel and the luminance rungs are full).
+
+        Dashed on purpose: the route is where navigation says to go, the
+        path is what the planner chose, and a second solid ribbon would read
+        as a second opinion rather than a reference. Like the path it is not
+        depth-tinted -- guidance, not percept -- and it sits 5 mm under the
+        path's height so the plan always wins where they overlap.
+        """
+        route = snapshot.route_world
+        if route is None or len(route) < 2:
+            return (
+                _EMPTY_VERTICES.copy(),
+                _EMPTY_COLOURS.copy(),
+                _EMPTY_INDICES.copy(),
+            )
+        render = world_to_render(route, snapshot)
+        bev = np.column_stack((render[:, 0], -render[:, 2]))
+        chords = np.hypot(*np.diff(bev, axis=0).T)
+        along = np.concatenate(([0.0], np.cumsum(chords)))
+        total = float(along[-1])
+        if total < WORLD_ROUTE_DASH_M:
+            return (
+                _EMPTY_VERTICES.copy(),
+                _EMPTY_COLOURS.copy(),
+                _EMPTY_INDICES.copy(),
+            )
+        pieces: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        period = WORLD_ROUTE_DASH_M + WORLD_ROUTE_GAP_M
+        start = 0.0
+        while start < total:
+            end = min(start + WORLD_ROUTE_DASH_M, total)
+            span = np.linspace(start, end, 4)
+            dash = np.column_stack(
+                (np.interp(span, along, bev[:, 0]), np.interp(span, along, bev[:, 1]))
+            )
+            vertices, indices = path_ribbon(dash, WORLD_ROUTE_HALF_WIDTH_M)
+            if len(vertices):
+                colours = np.tile(
+                    np.asarray(
+                        (*_ROUTE_LINEAR, WORLD_ROUTE_ALPHA), dtype=np.float32
+                    ),
+                    (len(vertices), 1),
+                )
+                pieces.append((vertices, colours, indices))
+            start += period
+        combined = _combine(pieces)
+        vertices = combined[0]
+        # path_ribbon builds at y = 0.03; drop the route 5 mm so the plan
+        # ribbon renders over it wherever the two coincide.
+        vertices[:, 1] += snapshot.vehicle_geometry.ground_z_vehicle - 0.005
+        return combined
+
+    @staticmethod
     def _planned_path(
         snapshot: PerceptionSnapshot, alert: str
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -2902,14 +2971,28 @@ class WorldSceneAssembler:
         if plan is None:
             return _EMPTY_VERTICES.copy(), _EMPTY_COLOURS.copy(), _EMPTY_INDICES.copy()
         arc = plan.arc
-        length = max(4.0, float(arc.free_distance_m))
-        points = path_polyline(
-            arc.curvature,
-            arc.transition_distance_m,
-            arc.next_curvature,
-            length,
-            samples=64,
-        )
+        if plan.reverse_arc is not None:
+            # The recovery's own arc, which is what the car is actually about
+            # to drive. It reasons in the 180-degree-rotated travel frame, so
+            # negating both coordinates un-rotates it -- the same way the
+            # rear AEB corridor comes back to the forward frame.
+            reverse = plan.reverse_arc
+            points = -path_polyline(
+                reverse.curvature,
+                reverse.transition_distance_m,
+                reverse.next_curvature,
+                min(max(2.0, float(reverse.free_distance_m)), 10.0),
+                samples=32,
+            )
+        else:
+            length = max(4.0, float(arc.free_distance_m))
+            points = path_polyline(
+                arc.curvature,
+                arc.transition_distance_m,
+                arc.next_curvature,
+                length,
+                samples=64,
+            )
         vertices, indices = path_ribbon(
             points,
             snapshot.vehicle_geometry.width_m * 0.5 + 0.18,

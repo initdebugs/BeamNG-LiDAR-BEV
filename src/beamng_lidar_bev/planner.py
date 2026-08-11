@@ -33,6 +33,9 @@ from .config import (
     COST_FREE_DISTANCE,
     COST_KEEP_RIGHT,
     COST_NAV_HEADING,
+    COST_ROAD_BONUS,
+    COST_ROUTE_HEADING,
+    COST_ROUTE_XTRACK,
     COST_SMOOTHNESS,
     COST_TRANSITION,
     DESIRED_CLEARANCE_M,
@@ -53,11 +56,14 @@ from .config import (
     PLANNER_LOOKAHEAD_M,
     PLANNER_MAX_OBSTACLE_POINTS,
     REQUIRED_FREE_DISTANCE_M,
+    ROAD_BONUS_SAMPLES,
+    ROUTE_MATCH_SAMPLES,
+    ROUTE_XTRACK_SCALE_M,
     SLOPE_ALLOWANCE_PER_M,
     SLOPE_ALLOWANCE_START_M,
     TRANSITION_DISTANCES_M,
 )
-from .models import ArcPlan, VehicleGeometry
+from .models import ArcPlan, RoadGrid, RoutePath, VehicleGeometry
 
 MAX_CURVATURE = 1.0 / MIN_TURN_RADIUS_M
 # Quadratically spaced (|k| = K_MAX * u^2): dense around straight ahead, coarse
@@ -897,6 +903,12 @@ def plan_arc(
     previous_curvature: float = 0.0,
     lookahead_m: float = PLANNER_LOOKAHEAD_M,
     horizon_m: float = PLANNER_HORIZON_M,
+    *,
+    route: RoutePath | None = None,
+    keep_right: bool = True,
+    road_grid: RoadGrid | None = None,
+    required_free_m: float | None = None,
+    smoothness_weight: float | None = None,
 ) -> ArcPlan:
     """
     Score the two-segment candidate fan against the obstacle cloud.
@@ -908,9 +920,20 @@ def plan_arc(
     what let the planner say "keep going, the turn comes later", which is what
     corner-entry braking needs to know.
 
-    ``nav_heading_rad`` is the in-game route's bearing at the lookahead, positive
-    to the left. It enters as one cost term among several, so a blocked arc is
-    never chosen just because navigation asked for it -- LiDAR always wins.
+    ``route`` is the reference path built by `route_model` (seen here only as
+    its `models` type, which is what keeps this module free of any dependency
+    on navigation). When present it REPLACES both the nav-heading and
+    keep-right terms with a tangent and a cross-track term; when absent the
+    legacy terms run byte-identically. Either way guidance never becomes
+    authority: every route term is cost among several, so a blocked arc is
+    never chosen just because the route asked for it -- LiDAR always wins.
+
+    ``nav_heading_rad`` is the legacy bearing hint, used only when no
+    reference path could be built. ``keep_right``, ``required_free_m`` and
+    ``smoothness_weight`` exist for the reverse planner: reversing wants
+    clearance and free distance only, scores free room against the
+    manoeuvre's own needs rather than the 40 km/h braking envelope, and
+    treats "steer least" as a tie-break rather than passenger comfort.
     """
     points = _as_bev(obstacles)
     curvatures = CANDIDATE_CURVATURES
@@ -1009,11 +1032,19 @@ def plan_arc(
                 float(MAX_CORRIDOR_HALF_WIDTH_M),
             )
 
+    required_free = (
+        REQUIRED_FREE_DISTANCE_M
+        if required_free_m is None
+        else float(required_free_m)
+    )
+    smoothness = (
+        COST_SMOOTHNESS if smoothness_weight is None else float(smoothness_weight)
+    )
     # Free distance is scored against what the braking envelope actually needs,
     # not against the horizon: 20 m of clear road is not worse than 35 m, and
     # treating it as worse is what makes a planner refuse to ever turn.
     cost = COST_FREE_DISTANCE * np.clip(
-        1.0 - free_all / REQUIRED_FREE_DISTANCE_M, 0.0, 1.0
+        1.0 - free_all / required_free, 0.0, 1.0
     )
     cost = cost + COST_CLEARANCE * (
         1.0
@@ -1027,23 +1058,20 @@ def plan_arc(
     # deferral must win on geometry (an immediate turn collides, a deferred one
     # does not), never on comfort. Also the tie-break that keeps an empty scene
     # pointing straight ahead: ties resolve to the first row, the immediate fan.
-    cost = cost + COST_SMOOTHNESS * (
+    cost = cost + smoothness * (
         ((curvatures - k0) / MAX_CURVATURE) ** 2
     )[None, :]
     # The deferral tie-break: near-equal plans act now rather than promising a
     # turn that per-tick re-planning would keep postponing.
     cost = cost + COST_TRANSITION * (d1_array / max(d1_array[-1], 1.0))[:, None]
 
-    keep_right_target: float | None = None
-    left_edge, right_edge = corridor_edges(points, lookahead)
-    if right_edge is not None:
-        half_width = geometry.width_m / 2.0
-        target = right_edge - (half_width + KEEP_RIGHT_MARGIN_M)
-        if left_edge is not None:
-            # A corridor too narrow to keep right in: centre it rather than
-            # aiming the car at the left kerb.
-            target = max(target, left_edge + half_width + KEEP_RIGHT_MARGIN_M)
-        keep_right_target = float(target)
+    def _family_offsets() -> np.ndarray:
+        """
+        Candidate lateral offsets at the lookahead, per family.
+
+        The shared geometry under keep-right (no route) and the route
+        cross-track term (route present) -- only ever one of the two runs.
+        """
         offsets = np.empty((len(families), arc_count))
         for index, d1 in enumerate(families):
             if d1 <= 0.0:
@@ -1060,21 +1088,219 @@ def plan_arc(
                 local_x = -(1.0 - np.cos(safe * remaining)) / safe
                 local_y = np.sin(safe * remaining) / safe
                 offsets[index] = x1 + cos_t * local_x - sin_t * local_y
-        cost = cost + COST_KEEP_RIGHT * np.clip(
-            ((offsets - keep_right_target) / KEEP_RIGHT_SCALE_M) ** 2, 0.0, 1.0
+        return offsets
+
+    def _composite_headings() -> np.ndarray:
+        # The composite path's heading at the lookahead, identical units for
+        # every family (for the immediate fan this is algebraically the old
+        # curvature-error form).
+        return (
+            k0 * np.minimum(d1_array, lookahead)[:, None]
+            + curvatures[None, :]
+            * np.maximum(lookahead - d1_array, 0.0)[:, None]
         )
 
-    if nav_heading_rad is not None:
-        # Scored as the composite path's heading at the lookahead, in the same
-        # normalised units for every family (for the immediate fan this is
-        # algebraically the old curvature-error form).
-        theta_l = (
-            k0 * np.minimum(d1_array, lookahead)[:, None]
-            + curvatures[None, :] * np.maximum(lookahead - d1_array, 0.0)[:, None]
+    def _family_endpoints() -> tuple[np.ndarray, np.ndarray]:
+        """
+        EXACT composite-path endpoints at the lookahead, per family.
+
+        The route terms need real positions, not the small-angle offsets:
+        matching an approximated endpoint against a curved reference is what
+        let candidates cut a 90-degree bend by seven metres in the closed
+        loop, because at a mid-corner lookahead the straight-line model
+        cannot represent where a curved path actually ends up.
+        """
+        end_x = np.empty((len(families), arc_count))
+        end_y = np.empty((len(families), arc_count))
+        for index, d1 in enumerate(families):
+            if d1 >= lookahead:
+                # Still on segment A at the lookahead: one point per row.
+                ax, ay, _ = _arc_endpoint(k0, lookahead)
+                end_x[index] = ax
+                end_y[index] = ay
+                continue
+            remaining = lookahead - d1
+            local_x = -(1.0 - np.cos(safe * remaining)) / safe
+            local_y = np.sin(safe * remaining) / safe
+            if d1 <= 0.0:
+                end_x[index] = local_x
+                end_y[index] = local_y
+            else:
+                x1, y1, theta1 = ends[index]
+                cos_t, sin_t = np.cos(theta1), np.sin(theta1)
+                end_x[index] = x1 + cos_t * local_x - sin_t * local_y
+                end_y[index] = y1 + sin_t * local_x + cos_t * local_y
+        return end_x, end_y
+
+    keep_right_target: float | None = None
+    route_heading_out: float | None = None
+    if route is not None:
+        # ROUTE PRESENT: the reference path replaces BOTH lateral guidance
+        # terms. Two lateral targets fighting -- kerb band versus route
+        # centreline -- is the failure this gate avoids, and the kerb band is
+        # measured over a STRAIGHT forward slice (`corridor_edges`), which
+        # degrades on exactly the bends the route tangent is strongest on.
+        route_pts = route.points.astype(np.float64)
+        route_theta = route.headings
+        route_width = route.half_width_m
+        half_width = geometry.width_m / 2.0
+
+        def _priced_deviation(px: np.ndarray, py: np.ndarray) -> np.ndarray:
+            """
+            Cross-track cost of candidate positions against their NEAREST
+            route samples: signed offset along the matched sample's right
+            normal, against a lane target right of the centreline by half
+            the right lane -- clamped so a road too narrow to lane-keep in
+            centres rather than aiming the car at the kerb (keep-right's own
+            clamp philosophy).
+            """
+            dx = px[:, None] - route_pts[None, :, 0]
+            dy = py[:, None] - route_pts[None, :, 1]
+            nearest = np.argmin(dx * dx + dy * dy, axis=-1)
+            theta_n = route_theta[nearest]
+            width_n = route_width[nearest]
+            lane = np.clip(
+                width_n / 2.0,
+                0.0,
+                np.maximum(width_n - half_width - KEEP_RIGHT_MARGIN_M, 0.0),
+            )
+            cross = (px - route_pts[nearest, 0]) * np.cos(theta_n) + (
+                py - route_pts[nearest, 1]
+            ) * np.sin(theta_n)
+            return np.clip(
+                ((cross - lane) / ROUTE_XTRACK_SCALE_M) ** 2, 0.0, 1.0
+            )
+
+        # Conformance is the MEAN priced deviation over samples along each
+        # candidate's composite path. One endpoint cannot measure a path
+        # through a bend: a shallow arc that cuts a 90-degree corner lands
+        # its endpoint ON the ribbon at the apex, and priced there alone it
+        # read as perfect -- measured 7.4 m inside the bend in the closed
+        # loop. Every family is sampled by the same rule at the same arc
+        # lengths, so no deferral discount enters here: a deferred family
+        # whose held segment drifts off a bending route pays for exactly
+        # that drift, which is geometry, not comfort.
+        ribbon = np.zeros((len(families), arc_count))
+        fractions = (
+            np.arange(1, ROUTE_MATCH_SAMPLES + 1) / ROUTE_MATCH_SAMPLES
         )
-        cost = cost + COST_NAV_HEADING * (
-            (theta_l - float(nav_heading_rad)) / (MAX_CURVATURE * lookahead)
+        for index, d1 in enumerate(families):
+            if d1 > 0.0:
+                x1, y1, theta1 = ends[index]
+                cos_t, sin_t = np.cos(theta1), np.sin(theta1)
+            for fraction in fractions:
+                s = fraction * lookahead
+                if s <= d1:
+                    # Still on segment A: one shared point for the row.
+                    ax, ay, _ = _arc_endpoint(k0, s)
+                    ribbon[index] += _priced_deviation(
+                        np.full(arc_count, ax), np.full(arc_count, ay)
+                    )
+                    continue
+                remaining = s - d1
+                local_x = -(1.0 - np.cos(safe * remaining)) / safe
+                local_y = np.sin(safe * remaining) / safe
+                if d1 <= 0.0:
+                    px, py = local_x, local_y
+                else:
+                    px = x1 + cos_t * local_x - sin_t * local_y
+                    py = y1 + sin_t * local_x + cos_t * local_y
+                ribbon[index] += _priced_deviation(px, py)
+        cost = cost + COST_ROUTE_XTRACK * ribbon / ROUTE_MATCH_SAMPLES
+
+        # The tangent term: each candidate's EXACT endpoint matched to its
+        # nearest route sample, compared there -- never at one fixed arc
+        # distance, which rewarded turning toward a mid-corner tangent
+        # early. Rides COST_NAV_HEADING's exact normalisation so its tuned
+        # rank carries over.
+        end_x, end_y = _family_endpoints()
+        dx = end_x[..., None] - route_pts[None, None, :, 0]
+        dy = end_y[..., None] - route_pts[None, None, :, 1]
+        nearest_end = np.argmin(dx * dx + dy * dy, axis=-1)
+        cost = cost + COST_ROUTE_HEADING * (
+            (_composite_headings() - route_theta[nearest_end])
+            / (MAX_CURVATURE * lookahead)
         ) ** 2
+        # The scalar tangent at the lookahead, for the overlay spoke.
+        route_heading_out = float(
+            np.interp(lookahead, route.arc_s, route.headings)
+        )
+    elif keep_right:
+        left_edge, right_edge = corridor_edges(points, lookahead)
+        if right_edge is not None:
+            half_width = geometry.width_m / 2.0
+            target = right_edge - (half_width + KEEP_RIGHT_MARGIN_M)
+            if left_edge is not None:
+                # A corridor too narrow to keep right in: centre it rather
+                # than aiming the car at the left kerb.
+                target = max(
+                    target, left_edge + half_width + KEEP_RIGHT_MARGIN_M
+                )
+            keep_right_target = float(target)
+            cost = cost + COST_KEEP_RIGHT * np.clip(
+                ((_family_offsets() - keep_right_target) / KEEP_RIGHT_SCALE_M)
+                ** 2,
+                0.0,
+                1.0,
+            )
+
+    if nav_heading_rad is not None and route is None:
+        cost = cost + COST_NAV_HEADING * (
+            (_composite_headings() - float(nav_heading_rad))
+            / (MAX_CURVATURE * lookahead)
+        ) ** 2
+
+    if road_grid is not None:
+        # The road-coverage BONUS: mean occupancy under samples of each
+        # composite path, over the stretch actually about to be driven --
+        # min(free, lookahead), the same window clearance uses, so an arc is
+        # never rewarded for road it will brake before reaching. A NEGATIVE
+        # term, per the long-standing design note: geometry keeps deciding
+        # what is drivable; semantics only make the tarmac preferable.
+        # Out-of-grid samples read as off-road. Sampled by the same rule for
+        # every family: no deferral discount enters here either.
+        occupancy = road_grid.occupancy
+        grid_h, grid_w = occupancy.shape
+        coverage = np.zeros((len(families), arc_count))
+        fractions = np.arange(1, ROAD_BONUS_SAMPLES + 1) / ROAD_BONUS_SAMPLES
+        safe_k0_arr = np.asarray([safe_k0])
+        for index, d1 in enumerate(families):
+            window = np.minimum(free_all[index], lookahead)
+            if d1 > 0.0:
+                x1, y1, theta1 = ends[index]
+                cos_t, sin_t = np.cos(theta1), np.sin(theta1)
+            for fraction in fractions:
+                s = fraction * window  # per-candidate arc lengths
+                s_a = np.minimum(s, d1)
+                s_b = np.maximum(s - d1, 0.0)
+                if d1 <= 0.0:
+                    px = -(1.0 - np.cos(safe * s)) / safe
+                    py = np.sin(safe * s) / safe
+                else:
+                    ax = -(1.0 - np.cos(safe_k0_arr * s_a)) / safe_k0_arr
+                    ay = np.sin(safe_k0_arr * s_a) / safe_k0_arr
+                    local_x = -(1.0 - np.cos(safe * s_b)) / safe
+                    local_y = np.sin(safe * s_b) / safe
+                    on_b = s_b > 0.0
+                    px = np.where(
+                        on_b, x1 + cos_t * local_x - sin_t * local_y, ax
+                    )
+                    py = np.where(
+                        on_b, y1 + sin_t * local_x + cos_t * local_y, ay
+                    )
+                col = np.floor(
+                    (px - road_grid.origin_right_m) / road_grid.cell_m
+                ).astype(np.intp)
+                row = np.floor(
+                    (py - road_grid.origin_forward_m) / road_grid.cell_m
+                ).astype(np.intp)
+                inside = (
+                    (col >= 0) & (col < grid_w) & (row >= 0) & (row < grid_h)
+                )
+                hit = np.zeros(arc_count)
+                hit[inside] = occupancy[row[inside], col[inside]]
+                coverage[index] += hit
+        cost = cost - COST_ROAD_BONUS * coverage / ROAD_BONUS_SAMPLES
 
     family_index, best = divmod(int(np.argmin(cost)), arc_count)
     transition = float(families[family_index])
@@ -1119,4 +1345,11 @@ def plan_arc(
         next_curvature=next_curvature,
         transition_distance_m=transition,
         lookahead_m=lookahead,
+        route_speed_limit_mps=(
+            None if route is None else float(route.speed_limit_mps)
+        ),
+        route_cross_track_m=(
+            None if route is None else float(route.cross_track_m)
+        ),
+        route_heading_rad=route_heading_out,
     )

@@ -17,7 +17,7 @@ from beamng_lidar_bev.config import (
     PLANNER_HORIZON_M,
     PLANNER_MAX_OBSTACLE_POINTS,
 )
-from beamng_lidar_bev.models import VehicleGeometry
+from beamng_lidar_bev.models import RoadGrid, RoutePath, VehicleGeometry
 from beamng_lidar_bev.planner import (
     ObstacleBand,
     arc_polyline,
@@ -343,6 +343,202 @@ def test_smoothness_penalty_favours_holding_the_previous_curvature() -> None:
     )
 
     assert held.curvature > fresh.curvature
+
+
+# --- the route reference path ------------------------------------------------
+
+
+def _route(
+    points: list[tuple[float, float]],
+    half_width: float = 3.0,
+    speed_limit: float = 11.0,
+    cross_track: float = 0.0,
+) -> RoutePath:
+    """A RoutePath built straight from BEV points, the way plan_arc sees it."""
+    pts = np.asarray(points, dtype=np.float64)
+    chords = np.hypot(*np.diff(pts, axis=0).T)
+    arc = np.concatenate(([0.0], np.cumsum(chords)))
+    dx, dy = np.diff(pts[:, 0]), np.diff(pts[:, 1])
+    seg_theta = np.unwrap(np.arctan2(-dx, dy))
+    theta = np.empty(len(pts))
+    theta[0] = seg_theta[0]
+    theta[-1] = seg_theta[-1]
+    if len(pts) > 2:
+        theta[1:-1] = 0.5 * (seg_theta[:-1] + seg_theta[1:])
+    return RoutePath(
+        points=pts.astype(np.float32),
+        arc_s=arc,
+        headings=theta,
+        curvatures=np.gradient(theta, arc),
+        half_width_m=np.full(len(pts), half_width),
+        junction_turn=np.zeros(len(pts), dtype=bool),
+        remaining_m=float(arc[-1]),
+        cross_track_m=cross_track,
+        speed_limit_mps=speed_limit,
+    )
+
+
+def test_the_route_terms_pull_the_car_toward_the_reference_path() -> None:
+    """A route running parallel 2 m to the LEFT: open ground, so the
+    cross-track term alone must bend the plan toward the lane."""
+    offset_route = _route([(-2.0, 0.0), (-2.0, 60.0)])
+
+    plan = plan_arc(NO_OBSTACLES, GEOMETRY, route=offset_route)
+
+    assert plan.curvature > 0.001  # positive is left, toward the path
+
+
+def test_the_route_lane_target_sits_right_of_the_centreline() -> None:
+    """On a two-way road the reference is the RIGHT lane, not the centreline
+    the navgraph actually encodes."""
+    centred_route = _route([(0.0, 0.0), (0.0, 60.0)])
+
+    plan = plan_arc(NO_OBSTACLES, GEOMETRY, route=centred_route)
+
+    assert plan.curvature < -0.001  # negative is right, into the lane
+
+
+def test_a_narrow_route_road_centres_instead_of_hugging_the_kerb() -> None:
+    narrow_route = _route([(0.0, 0.0), (0.0, 60.0)], half_width=1.2)
+
+    plan = plan_arc(NO_OBSTACLES, GEOMETRY, route=narrow_route)
+
+    assert plan.curvature == pytest.approx(0.0, abs=1e-3)
+
+
+def test_the_route_never_overrides_a_blocked_arc() -> None:
+    """LiDAR wins: a wall to the left is not driven into because the route
+    bends left -- the mirror of the nav-hint pin above."""
+    obstacles = _rail(-2.6, 2.0, PLANNER_HORIZON_M)
+    left_route = _route([(0.0, 0.0), (-1.0, 10.0), (-4.0, 20.0), (-9.0, 30.0)])
+
+    plan = plan_arc(obstacles, GEOMETRY, route=left_route)
+
+    assert plan.free_distance_m > 20.0
+
+
+def test_a_route_disables_the_legacy_terms() -> None:
+    """The gate is structural: with a route, a stray bearing hint changes
+    nothing, because two lateral guidance sources must never fight."""
+    route = _route([(0.0, 0.0), (0.0, 60.0)])
+    kerbed = np.concatenate(
+        (_rail(-2.6, 2.0, PLANNER_HORIZON_M), _rail(2.6, 2.0, PLANNER_HORIZON_M))
+    )
+
+    bare = plan_arc(kerbed, GEOMETRY, route=route)
+    with_hint = plan_arc(kerbed, GEOMETRY, nav_heading_rad=1.0, route=route)
+
+    assert with_hint.curvature == bare.curvature
+    assert with_hint.keep_right_target_m is None
+    np.testing.assert_array_equal(with_hint.candidate_costs, bare.candidate_costs)
+
+
+def test_route_terms_carry_no_deferral_discount() -> None:
+    """A straight route on open ground scores every family identically, so
+    the transition tie-break must still resolve to acting now."""
+    plan = plan_arc(NO_OBSTACLES, GEOMETRY, route=_route([(0.0, 0.0), (0.0, 60.0)]))
+
+    assert plan.transition_distance_m == 0.0
+
+
+def test_a_route_plan_reports_its_route_fields() -> None:
+    route = _route([(0.0, 0.0), (0.0, 60.0)], speed_limit=6.5, cross_track=0.8)
+
+    routed = plan_arc(NO_OBSTACLES, GEOMETRY, route=route)
+    unrouted = plan_arc(NO_OBSTACLES, GEOMETRY)
+
+    assert routed.route_speed_limit_mps == pytest.approx(6.5)
+    assert routed.route_cross_track_m == pytest.approx(0.8)
+    assert routed.route_heading_rad == pytest.approx(0.0, abs=1e-9)
+    assert unrouted.route_speed_limit_mps is None
+    assert unrouted.route_cross_track_m is None
+    assert unrouted.route_heading_rad is None
+
+
+def test_keep_right_can_be_disabled_for_the_reverse_planner() -> None:
+    """Reversing wants clearance and free distance only."""
+    kerbed = np.concatenate(
+        (_rail(-2.6, 2.0, PLANNER_HORIZON_M), _rail(2.6, 2.0, PLANNER_HORIZON_M))
+    )
+
+    with_term = plan_arc(kerbed, GEOMETRY)
+    without = plan_arc(kerbed, GEOMETRY, keep_right=False)
+
+    assert with_term.keep_right_target_m is not None
+    assert without.keep_right_target_m is None
+
+
+# --- the road-coverage bonus -------------------------------------------------
+
+
+def _road_strip(right_from: float, right_to: float) -> RoadGrid:
+    """A straight road strip, occupancy 1 between the two lateral bounds."""
+    occupancy = np.zeros((40, 40), dtype=np.uint8)
+    col_from = int((right_from + 16.0) / 0.8)
+    col_to = int((right_to + 16.0) / 0.8)
+    occupancy[:, col_from:col_to] = 1
+    return RoadGrid(
+        occupancy=occupancy,
+        cell_m=0.8,
+        origin_right_m=-16.0,
+        origin_forward_m=0.0,
+    )
+
+
+def test_the_road_bonus_pulls_the_car_onto_the_tarmac() -> None:
+    """A kerbless annotated road beside the car: nothing geometric prefers
+    it, so only the bonus can."""
+    beside = _road_strip(1.0, 9.0)
+
+    drawn = plan_arc(NO_OBSTACLES, GEOMETRY, road_grid=beside)
+    baseline = plan_arc(NO_OBSTACLES, GEOMETRY)
+
+    assert baseline.curvature == pytest.approx(0.0, abs=1e-6)
+    assert drawn.curvature < -0.001  # bends right, onto the road
+
+
+def test_the_road_bonus_never_outbids_free_distance() -> None:
+    """A blocked road arc loses to open grass: geometry keeps deciding what
+    is drivable, semantics only make the tarmac preferable."""
+    road = _road_strip(-3.0, 3.0)
+    wall = _wall(-4.0, 4.0, 12.0)  # blocks the road, open ground beyond
+
+    plan = plan_arc(wall, GEOMETRY, road_grid=road)
+
+    assert plan.free_distance_m > 20.0  # went around, off the road
+
+
+def test_uniform_road_coverage_shifts_the_fan_without_reordering_it() -> None:
+    """Full coverage everywhere must change no decision: the shift is equal
+    across the candidates whose samples stay inside the grid, and the tie
+    still resolves to the straight immediate arc."""
+    everywhere = RoadGrid(
+        occupancy=np.ones((40, 40), dtype=np.uint8),
+        cell_m=0.8,
+        origin_right_m=-16.0,
+        origin_forward_m=0.0,
+    )
+
+    covered = plan_arc(NO_OBSTACLES, GEOMETRY, road_grid=everywhere)
+    bare = plan_arc(NO_OBSTACLES, GEOMETRY)
+
+    delta = bare.candidate_costs - covered.candidate_costs
+    centre = delta[8:-8]  # full-lock arcs curl out of the grid, honestly
+    assert np.allclose(centre, centre[0], atol=1e-5)
+    assert covered.transition_distance_m == 0.0
+    assert covered.curvature == pytest.approx(0.0, abs=1e-6)
+
+
+def test_no_road_grid_is_bit_identical_to_before() -> None:
+    kerbed = np.concatenate(
+        (_rail(-2.6, 2.0, PLANNER_HORIZON_M), _rail(2.6, 2.0, PLANNER_HORIZON_M))
+    )
+
+    first = plan_arc(kerbed, GEOMETRY, road_grid=None)
+    second = plan_arc(kerbed, GEOMETRY)
+
+    np.testing.assert_array_equal(first.candidate_costs, second.candidate_costs)
+    assert first.curvature == second.curvature
 
 
 # --- two-segment candidates --------------------------------------------------

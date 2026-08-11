@@ -957,3 +957,43 @@ NameError: name 'MARKING_CLASSES' is not defined
 2026-08-10 14:28:36,303 INFO beamng_lidar_bev.worker: AEB: ARMED at 7.4 km/h | threat none (brake-now 3.0, standoff 2.4, horizon 8.4) | required 0.0 m/s^2 ttc inf | k +0.1491 brake 0.00 | Clear to 8 m
 2026-08-10 14:28:39,092 INFO beamng_lidar_bev.worker: AEB: STANDBY at 7.0 km/h | threat none (brake-now 3.0, standoff 2.4, horizon 8.4) | required 0.0 m/s^2 ttc inf | k +0.0000 brake 0.00 | Standing by below 7 km/h
 2026-08-10 14:28:40,438 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 201.7 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-10 14:32:35,827 INFO beamng_lidar_bev.main_window: Looking for a running BeamNG.tech session
+2026-08-10 14:32:35,828 INFO beamng_lidar_bev.main_window: Application ready
+2026-08-10 14:32:36,201 INFO beamng_lidar_bev.main_window: Found a running BeamNG.tech session; ready to attach
+2026-08-10 14:32:37,497 INFO beamng_lidar_bev.main_window: Looking for the current player vehicle
+2026-08-10 14:32:37,501 INFO beamng_lidar_bev.main_window: Connecting to BeamNG.tech
+2026-08-10 14:32:39,996 INFO beamng_lidar_bev.worker: Connected to the BeamNG.tech bridge on port 64256
+2026-08-10 14:32:39,998 INFO beamng_lidar_bev.main_window: Finding the current player vehicle
+2026-08-10 14:32:40,246 INFO beamng_lidar_bev.worker: Vehicle check: model 'vivace' (plant measured on 'vivace') | bbox 2.02 wide x 4.33 long x 1.46 tall | overhang front 1.84 rear 2.49 | body centre -0.16 m right of the reference node (the AEB corridor and the WORLD ego are shifted by this) | ground plane -0.255 m from the reference node | mount z: front 0.20, left 0.20, right 0.20, rear 0.20, roof 1.58, road 1.58
+2026-08-10 14:32:40,281 INFO beamng_lidar_bev.main_window: Attaching front LiDAR (1/6)
+2026-08-10 14:32:40,313 INFO beamng_lidar_bev.worker: Mount check: front sits 0.231 m above the bbox bottom (want 0.20)
+2026-08-10 14:32:40,314 INFO beamng_lidar_bev.main_window: Attaching left LiDAR (2/6)
+2026-08-10 14:32:40,346 INFO beamng_lidar_bev.worker: Mount check: left sits 0.221 m above the bbox bottom (want 0.20)
+2026-08-10 14:32:40,348 INFO beamng_lidar_bev.main_window: Attaching right LiDAR (3/6)
+2026-08-10 14:32:40,379 INFO beamng_lidar_bev.worker: Mount check: right sits 0.221 m above the bbox bottom (want 0.20)
+2026-08-10 14:32:40,381 INFO beamng_lidar_bev.main_window: Attaching rear LiDAR (4/6)
+2026-08-10 14:32:40,414 INFO beamng_lidar_bev.worker: Mount check: rear sits 0.211 m above the bbox bottom (want 0.20)
+2026-08-10 14:32:40,415 INFO beamng_lidar_bev.main_window: Attaching roof LiDAR (5/6)
+2026-08-10 14:32:40,446 INFO beamng_lidar_bev.worker: Mount check: roof sits 1.604 m above the bbox bottom (want 1.58)
+2026-08-10 14:32:40,448 INFO beamng_lidar_bev.main_window: Attaching road LiDAR (6/6)
+2026-08-10 14:32:40,480 INFO beamng_lidar_bev.worker: Mount check: road sits 1.606 m above the bbox bottom (want 1.58)
+2026-08-10 14:32:40,481 INFO beamng_lidar_bev.worker: AEB check: on 'vivace', armed above 7.2 km/h, stopping 0.60 m clear of the front bumper, fires at the last point a 10.0 m/s^2 stop still works and then brakes FULL, corridor 2.02 m wide, obstacle floor 0.30 m with 4 hits over 0.12 s required, path predicted from measured yaw (brake only). Brake-now distances: 30 km/h -> 7.6 m, 50 km/h -> 15.3 m, 70 km/h -> 26.4 m, 100 km/h -> 49.5 m
+2026-08-10 14:32:40,481 INFO beamng_lidar_bev.main_window: 6 LiDAR sensors active on thePlayer
+2026-08-10 14:32:40,481 INFO beamng_lidar_bev.worker: REAR AEB check: on 'vivace', armed above 1.8 km/h, stopping 0.35 m clear of the rear bumper, fires at the last point a 6.8 m/s^2 stop still works and then brakes FULL, corridor 2.02 m wide, obstacle floor 0.30 m with 4 hits over 0.12 s required, path predicted from measured yaw (brake only). Brake-now distances: 10 km/h -> 3.9 m, 20 km/h -> 6.3 m, 30 km/h -> 9.8 m, 50 km/h -> 20.7 m
+2026-08-10 14:32:40,482 INFO beamng_lidar_bev.main_window: 6 LiDAR sensors attached to thePlayer (front 0.20 m, left 0.20 m, right 0.20 m, rear 0.20 m, roof 1.58 m, road 1.58 m above ground)
+2026-08-10 14:32:40,483 INFO beamng_lidar_bev.main_window: Emergency braking armed
+2026-08-10 14:32:40,484 INFO beamng_lidar_bev.main_window: Reverse AEB armed
+2026-08-10 14:32:40,534 INFO beamng_lidar_bev.worker: Sensor reach: road 64735 returns, furthest 108 m | AEB acts out to 150 m
+2026-08-10 14:32:40,540 INFO beamng_lidar_bev.worker: Marking check: 1701 road-marking returns in a 64735-return scan (DRIVING_INSTRUCTIONS 360, SOLID_LINE 1701). Lane paint will draw; classes not in MARKING_CLASSES render as tarmac however many returns they post.
+2026-08-10 14:32:40,545 INFO beamng_lidar_bev.worker: AEB: STANDBY at -0.0 km/h | threat none (brake-now 2.4, standoff 2.4, horizon 8.4) | required 0.0 m/s^2 ttc inf | k +0.0000 brake 0.00 | Standing by below 7 km/h
+2026-08-10 14:32:40,545 INFO beamng_lidar_bev.worker: REAR AEB: STANDBY at 0.0 km/h | threat none (brake-now 2.8, standoff 2.8, horizon 8.8) | required 0.0 m/s^2 ttc inf | k +0.0000 brake 0.00 | Standing by below 2 km/h
+2026-08-10 14:35:36,032 INFO beamng_lidar_bev.main_window: 3D scene store refresh is over budget at 122.5 ms (cadence is 120 ms). The view keeps tracking the car -- composes run on their own thread -- but newly observed geometry appears more slowly. Control and AEB are unaffected.
+2026-08-11 08:38:30,047 INFO beamng_lidar_bev.main_window: Looking for a running BeamNG.tech session
+2026-08-11 08:38:30,047 INFO beamng_lidar_bev.main_window: Application ready
+2026-08-11 08:38:31,951 INFO beamng_lidar_bev.main_window: Starting BeamNG.tech bridge
+2026-08-11 08:38:32,455 INFO beamng_lidar_bev.worker: Launching BeamNG.tech: C:\Users\initd\Documents\BeamNG.tech.v0.38.5.0\BeamNG.tech.exe -nosteam -tcom -tport 64256 -console -tcom-listen-ip 127.0.0.1
+2026-08-11 08:38:32,456 INFO beamng_lidar_bev.main_window: Starting BeamNG.tech process
+2026-08-11 08:38:32,465 INFO beamng_lidar_bev.worker: BeamNG.tech process created with PID 37488
+2026-08-11 08:38:32,467 INFO beamng_lidar_bev.main_window: BeamNG.tech launched; load a map and player vehicle
+2026-08-11 08:38:32,467 INFO beamng_lidar_bev.main_window: BeamNG.tech process launched; waiting for its bridge
+2026-08-11 08:38:33,156 INFO beamng_lidar_bev.main_window: BeamNG.tech is not running

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 import numpy as np
@@ -54,11 +54,69 @@ class VehicleGeometry:
 
 @dataclass(frozen=True)
 class RouteHint:
-    """The destination the player set in-game, used only to pick turns."""
+    """The destination the player set in-game, and the route to it."""
 
     path_world: np.ndarray
     """(N, 3) world-space route nodes, ordered from the car outward."""
     remaining_m: float
+    dist_to_target_m: np.ndarray | None = None
+    """(N,) metres of route left at each node; -1 where the game had none."""
+    link_counts: np.ndarray | None = None
+    """(N,) navgraph degree at each node -- the junction detector; 0 = unknown."""
+    half_width_m: np.ndarray | None = None
+    """(N,) navgraph half road width at each node; -1 where the node had none."""
+
+
+@dataclass(frozen=True)
+class RoutePath:
+    """
+    The route ahead as an ego-frame reference path, resampled and previewed.
+
+    Built fresh each tick by `route_model.build_route_path` (the ego frame
+    moves every tick), consumed by `planner.plan_arc` as guidance cost terms.
+    Everything here is derived from `RouteHint` plus the current pose; the
+    planner sees only this type, which is what keeps it free of any dependency
+    on `navigation` or `route_model`.
+    """
+
+    points: np.ndarray
+    """(M, 2) float32 BEV (right, forward) samples at uniform arc spacing."""
+    arc_s: np.ndarray
+    """(M,) arc length from the ego's projection onto the path, metres."""
+    headings: np.ndarray
+    """(M,) path heading, radians; 0 is straight ahead, positive is LEFT."""
+    curvatures: np.ndarray
+    """(M,) signed 1/m, positive left, smoothed over ROUTE_CURVATURE_SMOOTH_M."""
+    half_width_m: np.ndarray
+    """(M,) road half width, default-filled where the navgraph had none."""
+    junction_turn: np.ndarray
+    """(M,) bool: near a junction node AND the route actually turns there."""
+    remaining_m: float
+    """Metres of route left, measured along this polyline from the ego."""
+    cross_track_m: float
+    """The ego's signed offset from the path: positive when right of it."""
+    speed_limit_mps: float
+    """The backward speed pass evaluated at the ego -- the allowed speed now."""
+
+
+@dataclass(frozen=True)
+class RoadGrid:
+    """
+    Coarse BEV occupancy of road-classified returns, for the road bonus.
+
+    Built by the worker from the semantic road mask (plus remembered road
+    cells); consumed by `planner.plan_arc` as a negative cost. Like
+    `RoutePath` it is a `models` type on purpose: the planner sees only this,
+    never the semantics that produced it.
+    """
+
+    occupancy: np.ndarray
+    """(H, W) uint8, 1 where a cell held road returns; row = forward index."""
+    cell_m: float
+    origin_right_m: float
+    """BEV right coordinate of column 0's near edge."""
+    origin_forward_m: float
+    """BEV forward coordinate of row 0's near edge."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +140,20 @@ class ArcPlan:
     """Metres of `curvature` driven before bending to `next_curvature`."""
     lookahead_m: float = 20.0
     """Where keep-right/nav were evaluated; the worker scales it with speed."""
+    route_speed_limit_mps: float | None = None
+    """
+    The route preview's allowed speed now, or None with no reference path.
+
+    Computed by `route_model`'s backward pass over upcoming curvature,
+    turning junctions and the destination. This field is the SANCTIONED
+    channel for anticipation: the controller only ever takes min() with it,
+    the same category of path knowledge as `next_curvature` -- it must never
+    grow controller-side lookahead of its own.
+    """
+    route_cross_track_m: float | None = None
+    """The ego's signed offset from the route, positive right. Diagnostics."""
+    route_heading_rad: float | None = None
+    """The route TANGENT at the lookahead (not a bearing to a node)."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +174,13 @@ class DrivingPlan:
     command: ControlCommand
     forward_speed_mps: float
     """Signed: vel projected onto the vehicle forward axis, so reverse is < 0."""
+    reverse_arc: ArcPlan | None = None
+    """
+    The steered-reverse plan, in the 180-degree-rotated TRAVEL frame
+    (`aeb.mirror_points`' frame, exactly as rear AEB reasons). Present only
+    while the recovery is reversing or about to; overlays must un-rotate it
+    the same way they un-rotate the rear AEB corridor.
+    """
     reported_gear: object = None
     """
     What the gearbox says it is in, as opposed to what was commanded. A mode
@@ -195,6 +274,14 @@ class BevFrame:
     # toggle separately, and AEB is the one that also runs under a human driver.
     aeb: AebState | None = None
     rear_aeb: AebState | None = None
+    route_points: np.ndarray | None = None
+    """
+    (M, 2) BEV samples of the reference path being followed, or None.
+
+    Populated only while self-driving follows a route -- the overlay
+    disappearing when disengaged is the honest reading, because the car is
+    not following it then.
+    """
 
 
 @dataclass(frozen=True)
@@ -248,6 +335,14 @@ class PerceptionSnapshot:
     reverses, and it cannot get it from the plan: `plan` is None whenever
     self-driving is off, which is exactly when a human is doing the reversing.
     """
+    route_world: np.ndarray | None = None
+    """
+    (N, 3) float32 world nodes of the route being followed, or None.
+
+    The route reaches WORLD's compose thread through this snapshot ONLY --
+    no store, no refresh-thread contact -- so the two-rate confinement
+    contract is untouched. Populated only while self-driving follows a route.
+    """
 
     def __post_init__(self) -> None:
         points = np.asarray(self.points_world, dtype=np.float32)
@@ -275,6 +370,15 @@ class PerceptionSnapshot:
         object.__setattr__(
             self, "surface_materials", np.ascontiguousarray(materials)
         )
+        if self.route_world is not None:
+            route = np.asarray(self.route_world, dtype=np.float32)
+            if route.ndim != 2 or route.shape[1] != 3:
+                raise ValueError(
+                    f"Expected an Nx3 route node array, got {route.shape}"
+                )
+            object.__setattr__(
+                self, "route_world", np.ascontiguousarray(route)
+            )
 
 
 @dataclass(frozen=True)
@@ -347,3 +451,15 @@ class WorldFrame:
     the car is -- the whole width of the node offset, against walls that are
     drawn correctly.
     """
+    # The route ribbon: dashed, subordinate to the plan path by chroma and
+    # alpha. Defaulted empty because it exists only while a destination is
+    # being followed.
+    route_vertices: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    route_colors: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 4), dtype=np.float32)
+    )
+    route_indices: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.uint32)
+    )

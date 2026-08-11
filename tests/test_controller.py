@@ -41,7 +41,9 @@ _EMPTY = np.zeros(1, dtype=np.float32)
 
 
 def _plan(
-    free_distance_m: float = PLANNER_HORIZON_M, curvature: float = 0.0
+    free_distance_m: float = PLANNER_HORIZON_M,
+    curvature: float = 0.0,
+    route_speed_limit_mps: float | None = None,
 ) -> ArcPlan:
     return ArcPlan(
         curvature=curvature,
@@ -52,6 +54,7 @@ def _plan(
         candidate_curvatures=_EMPTY,
         candidate_costs=_EMPTY,
         candidate_free_distances=_EMPTY,
+        route_speed_limit_mps=route_speed_limit_mps,
     )
 
 
@@ -220,6 +223,170 @@ def test_target_speed_brakes_to_corner_entry_not_to_zero() -> None:
     )
     assert command.target_speed_mps == pytest.approx(entry, rel=1e-6)
     assert command.target_speed_mps > np.sqrt(CORNERING_ACCEL_MPS2 * 6.0)
+
+
+def test_the_route_speed_limit_caps_the_target() -> None:
+    """The preview arrives through the plan and the controller only min()s
+    with it -- the sanctioned channel for anticipation."""
+    command = _run(
+        DrivingController(), _plan(route_speed_limit_mps=5.0), 5.0, ticks=5
+    )
+
+    assert command.target_speed_mps <= 5.0 + 1e-6
+
+
+def test_no_route_speed_limit_leaves_the_other_terms_in_charge() -> None:
+    command = _run(DrivingController(), _plan(), 5.0, ticks=5)
+
+    assert command.target_speed_mps == pytest.approx(MAX_SPEED_MPS)
+
+
+def test_arrival_holds_the_brake_and_never_creeps() -> None:
+    """At a zero target the throttle branch would serve the trim integrator
+    (wound to its cap on the drive here) and the car would creep-limit-cycle
+    at the marker. Arrival must be an explicit hold."""
+    controller = DrivingController()
+    for _ in range(200):  # wind the trim up hard on the way there
+        controller.step(_plan(), 5.0, DT)
+
+    command = None
+    for _ in range(100):
+        command = controller.step(_plan(route_speed_limit_mps=0.0), 0.0, DT)
+
+    assert command is not None
+    assert command.throttle == 0.0
+    assert command.brake > 0.0
+    assert command.mode == "DRIVING"
+    assert command.reason == "Arrived at destination"
+
+
+def test_a_blocked_path_outranks_the_gentle_arrival_brake() -> None:
+    """Below AEB's 2.0 m/s arming speed the blocked entry is the only
+    obstacle response there is, so the rolling arrival brake must never mask
+    a collapsed free distance with its 0.2 pedal."""
+    controller = DrivingController()
+
+    command = None
+    for _ in range(30):
+        command = controller.step(
+            _plan(free_distance_m=1.0, route_speed_limit_mps=0.0), 1.9, DT
+        )
+
+    assert command is not None
+    assert command.mode == "DRIVING"  # still no reverse recovery at a marker
+    assert command.throttle == 0.0
+    assert command.brake > 0.5  # the hold taper, not the gentle arrival pedal
+
+
+def test_the_arrival_brake_ratchets_when_gravity_wins() -> None:
+    """The gentle pedal is open-loop; on a downgrade beating 1.5 m/s^2 the
+    car hovered past the marker forever. While speed is not falling in the
+    arrival branch, the pedal must escalate."""
+    controller = DrivingController()
+
+    command = None
+    for _ in range(int(3.0 / DT)):  # speed pinned: a grade the pedal loses to
+        command = controller.step(_plan(route_speed_limit_mps=0.0), 1.5, DT)
+
+    assert command is not None
+    assert command.reason == "Arriving at destination"
+    assert command.brake > 0.6  # far above the 0.2 gentle pedal
+
+
+def test_the_arrival_brake_stays_gentle_when_the_car_is_slowing() -> None:
+    controller = DrivingController()
+
+    speed = 1.8
+    command = None
+    for _ in range(20):
+        command = controller.step(
+            _plan(route_speed_limit_mps=0.0), speed, DT
+        )
+        speed = max(0.4, speed - 0.06)  # decelerating, as flat ground does
+
+    assert command is not None
+    assert command.brake < 0.3  # the ratchet never engaged
+
+
+def test_arrival_never_trips_the_stall_recovery() -> None:
+    """Zero throttle means _blocked_by_stall's precondition can never hold."""
+    controller = DrivingController()
+
+    command = None
+    for _ in range(int(STUCK_TIMEOUT_S / DT) + 100):
+        command = controller.step(_plan(route_speed_limit_mps=0.0), 0.0, DT)
+
+    assert command is not None
+    assert command.mode == "DRIVING"
+
+
+# --- steered reversing -------------------------------------------------------
+
+
+def _reversing_controller() -> DrivingController:
+    """Walk the state machine into REVERSING through the public path."""
+    controller = DrivingController()
+    blocked = _plan(free_distance_m=0.0)
+    command = controller.step(blocked, 0.0, DT)
+    assert command.mode == "BLOCKED"
+    for _ in range(int(BLOCKED_HOLD_S / DT) + 2):
+        command = controller.step(blocked, 0.0, DT)
+    assert command.mode == "REVERSING"
+    return controller
+
+
+def test_reversing_steers_the_mirror_of_the_reverse_plan() -> None:
+    """
+    Hand-derived sign pin. An obstacle behind-LEFT of the car reads as
+    travel-frame RIGHT after `mirror_points` (x -> -x), so the reverse plan
+    steers travel-LEFT: positive curvature. The tail must swing toward the
+    car's RIGHT, away from the obstacle -- and a fixed-steering car traces
+    the same circle forward and backward, so that is front wheels RIGHT,
+    which is POSITIVE BeamNG steering.
+    """
+    controller = _reversing_controller()
+
+    command = None
+    for _ in range(20):
+        command = controller.step(
+            _plan(free_distance_m=0.0),
+            -1.5,
+            DT,
+            reverse_arc=_plan(curvature=0.08),
+        )
+
+    assert command is not None
+    assert command.mode == "REVERSING"
+    assert command.steering > 0.05
+
+
+def test_without_a_reverse_plan_reversing_is_straight() -> None:
+    """The pre-steering behaviour, byte-for-byte, when no arc is supplied."""
+    controller = _reversing_controller()
+
+    command = None
+    for _ in range(20):
+        command = controller.step(_plan(free_distance_m=0.0), -1.5, DT)
+
+    assert command is not None
+    assert command.mode == "REVERSING"
+    assert command.steering == pytest.approx(0.0, abs=1e-9)
+
+
+def test_reverse_aborts_when_the_chosen_arc_is_blocked() -> None:
+    """The worker feeds the ARC's own free distance as the rear clearance,
+    so 'blocked behind' means blocked along the path actually driven."""
+    controller = _reversing_controller()
+
+    command = controller.step(
+        _plan(free_distance_m=0.0),
+        -1.0,
+        DT,
+        rear_free_distance_m=1.0,
+        reverse_arc=_plan(curvature=0.05, free_distance_m=1.0),
+    )
+
+    assert command.mode == "BLOCKED"
 
 
 def test_a_one_tick_free_distance_dip_never_reaches_the_brake() -> None:

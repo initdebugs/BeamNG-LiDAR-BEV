@@ -88,10 +88,25 @@ def _palette() -> dict[str, np.ndarray]:
         "boundary_lit": _BOUNDARY_LIT_LINEAR,
         "uncertain": linear_rgb(config.WORLD_UNCERTAIN_RGB),
         "path": linear_rgb(config.WORLD_PATH_RGB),
+        "route": linear_rgb(config.WORLD_ROUTE_RGB),
         "alert": linear_rgb(config.WORLD_PATH_ALERT_RGB),
         "ego": linear_rgb(_lit_material_colour("ego")),
         "actor": linear_rgb(_lit_material_colour("actor")),
     }
+
+
+def test_the_route_overlay_is_its_own_mark() -> None:
+    """
+    Subordinate by chroma and alpha, but still its OWN mark: the route must
+    hold apart from both the path it defers to and the road it lies on --
+    measured in CIELAB, because contrast cannot separate equal-lightness
+    pairs and the route deliberately shares the road's rung.
+    """
+    palette = _palette()
+
+    assert _delta_e(palette["route"], palette["path"]) >= 6.0
+    assert _delta_e(palette["route"], palette["road"]) >= 6.0
+    assert config.WORLD_ROUTE_ALPHA < 1.0  # the path ribbon ships at 1.0
 
 
 def test_the_qml_clear_colour_is_the_air_the_depth_tint_mixes_toward() -> None:
@@ -117,7 +132,7 @@ def test_the_unlit_materials_carry_no_colour_of_their_own() -> None:
     enough to lose the road-vs-boundary step entirely, and silent.
     """
     source = _qml_source()
-    for name in ("road", "boundary", "path", "uncertain"):
+    for name in ("road", "boundary", "path", "route", "uncertain"):
         block = re.search(
             rf"id:\s*{name}Material\b(?P<body>.*?)\n\s{{8}}\}}", source, re.DOTALL
         )

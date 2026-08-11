@@ -9,6 +9,7 @@ from beamng_lidar_bev.models import RouteHint
 from beamng_lidar_bev.navigation import (
     LUA_ROUTE_CHUNK,
     fetch_route,
+    fetch_route_reply,
     parse_route,
     route_heading,
 )
@@ -46,6 +47,14 @@ def test_the_lua_chunk_returns_an_encoded_string() -> None:
     assert "core_groundMarkers" in LUA_ROUTE_CHUNK
 
 
+def test_the_lua_chunk_carries_the_extra_node_fields() -> None:
+    """distToTarget/linkCount/radius feed the route model; each is read
+    total-function style so a missing field degrades itself, not the route."""
+    assert "distToTarget" in LUA_ROUTE_CHUNK
+    assert "linkCount" in LUA_ROUTE_CHUNK
+    assert "radius" in LUA_ROUTE_CHUNK
+
+
 # --- parse_route -------------------------------------------------------------
 
 
@@ -76,6 +85,26 @@ def test_a_nil_response_yields_no_route() -> None:
     assert parse_route("") is None
 
 
+def test_a_non_finite_node_is_skipped_not_stitched() -> None:
+    """json.loads accepts NaN literals; a NaN node would silently stitch the
+    polyline with an under-read arc length and every braking point downstream
+    would land at the wrong distance."""
+    raw = json.dumps(
+        {
+            "hasTarget": True,
+            "path": [[0.0, 0.0, 0.0], [None, 20.0, 0.0], [0.0, 60.0, 0.0]],
+            "length": 60.0,
+        }
+    ).replace("null", "NaN")
+
+    route = parse_route(raw)
+
+    assert route is not None
+    np.testing.assert_allclose(
+        route.path_world, [[0.0, 0.0, 0.0], [0.0, 60.0, 0.0]]
+    )
+
+
 def test_unusable_nodes_are_skipped_rather_than_fatal() -> None:
     raw = json.dumps(
         {"hasTarget": True, "path": [[1.0, 2.0], [3.0, 4.0, 5.0]], "length": 9.0}
@@ -85,6 +114,39 @@ def test_unusable_nodes_are_skipped_rather_than_fatal() -> None:
 
     assert route is not None
     np.testing.assert_allclose(route.path_world, [[3.0, 4.0, 5.0]])
+
+
+def test_old_three_field_nodes_still_parse_without_extras() -> None:
+    """The pre-enrichment chunk shape (and every existing stub) stays valid."""
+    route = parse_route(_payload((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)))
+
+    assert route is not None
+    assert route.dist_to_target_m is None
+    assert route.link_counts is None
+    assert route.half_width_m is None
+
+
+def test_six_field_nodes_carry_the_extras() -> None:
+    raw = json.dumps(
+        {
+            "hasTarget": True,
+            "path": [
+                [0.0, 0.0, 0.0, 55.0, 2, 3.4],
+                [0.0, 30.0, 0.0, 25.0, 4, -1],
+            ],
+            "length": 55.0,
+        }
+    )
+
+    route = parse_route(raw)
+
+    assert route is not None
+    assert route.dist_to_target_m is not None
+    assert route.link_counts is not None
+    assert route.half_width_m is not None
+    np.testing.assert_allclose(route.dist_to_target_m, [55.0, 25.0])
+    np.testing.assert_allclose(route.link_counts, [2, 4])
+    np.testing.assert_allclose(route.half_width_m, [3.4, -1.0])
 
 
 # --- fetch_route -------------------------------------------------------------
@@ -110,6 +172,19 @@ def test_a_lua_failure_never_propagates() -> None:
         raise RuntimeError("bridge went away")
 
     assert fetch_route(run_lua) is None
+
+
+def test_fetch_route_reply_is_none_only_on_transport_failure() -> None:
+    """A parseable no-target is DATA (clear the cache); an exception is NOISE
+    (keep it). The worker's stale-grace logic hangs on this distinction."""
+
+    def broken(chunk: str) -> str:
+        raise RuntimeError("bridge went away")
+
+    no_target = json.dumps({"hasTarget": False})
+
+    assert fetch_route_reply(broken) is None
+    assert fetch_route_reply(lambda chunk: no_target) == no_target
 
 
 # --- route_heading -----------------------------------------------------------

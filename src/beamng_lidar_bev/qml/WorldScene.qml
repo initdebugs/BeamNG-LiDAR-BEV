@@ -128,6 +128,17 @@ Rectangle {
         }
 
         DefaultMaterial {
+            id: routeMaterial
+            // The navigation route: guidance like the path, subordinate to it
+            // by chroma and alpha (world_scene._route_ribbon carries both in
+            // the vertex colour), so the same flat white base.
+            diffuseColor: "#ffffff"
+            vertexColorsEnabled: true
+            lighting: DefaultMaterial.NoLighting
+            cullMode: DefaultMaterial.NoCulling
+        }
+
+        DefaultMaterial {
             id: vehicleMaterial
             // Traffic as the LiDAR saw it, in the same blue as the corroborated
             // actor models. Hue is the only channel separating a car from a
@@ -257,6 +268,14 @@ Rectangle {
         Model {
             geometry: sceneBridge.vehicleGeometry
             materials: [vehicleMaterial]
+            castsShadows: false
+        }
+
+        // Before the path so the plan ribbon always reads over the route it
+        // is following.
+        Model {
+            geometry: sceneBridge.routeGeometry
+            materials: [routeMaterial]
             castsShadows: false
         }
 

@@ -611,6 +611,21 @@ WORLD_SURFACE_WATER_RGB = "#447195"
 WORLD_SURFACE_MARKING_RGB = "#c6c8c1"
 WORLD_PATH_RGB = "#4ea8f2"
 WORLD_PATH_ALERT_RGB = "#c0271e"
+# The ROUTE ribbon: where navigation says to go, as opposed to the path the
+# planner chose this tick. Subordinate to the path by CHROMA and ALPHA, never
+# by luminance -- chroma is the overlay channel and the luminance rungs are
+# full. A desaturated steel blue in the path's hue family (guidance reads as
+# one family), dashed and translucent so the plan always reads over it; the
+# exact value is held apart from both path and road in CIELAB by
+# test_world_palette, never by eye.
+WORLD_ROUTE_RGB = "#587a96"
+WORLD_ROUTE_ALPHA = 0.55
+# Dash geometry: 2 m of ribbon then 1.5 m of gap -- long enough to read as
+# one line in motion, gapped enough never to be mistaken for the solid plan
+# ribbon. The half-width is a thread against the path's half-vehicle.
+WORLD_ROUTE_DASH_M = 2.0
+WORLD_ROUTE_GAP_M = 1.5
+WORLD_ROUTE_HALF_WIDTH_M = 0.35
 # Traffic drawn from LiDAR alone, in the same blue as the corroborated actor
 # models, because hue is the only thing separating a car from a wall -- both
 # live in the dark obstacle band. See WORLD_VEHICLE_TTL_S: these are the returns
@@ -1002,6 +1017,29 @@ COST_SMOOTHNESS = 1.5
 # re-planning a near-tie deferral re-defers forever and the turn never comes.
 COST_TRANSITION = 0.05
 
+# Route reference-path terms. When `route_model` can build a path these two
+# REPLACE the nav-heading and keep-right terms (two lateral targets fighting --
+# kerb band versus route centreline -- is the failure that gate avoids); with
+# no route the legacy terms run byte-identically. The tangent term inherits
+# COST_NAV_HEADING's rank and normalisation, so its tuned "a commanded turn
+# outranks lane discipline" character carries over. Cross-track is double
+# keep-right's weight -- the route centreline is a better lane reference than
+# a straight-band kerb slice -- but the term SATURATES at its weight, so free
+# distance (whole tenths for any real pinch) plus clearance still dominate: a
+# blocked arc can never be bought back by route conformance.
+COST_ROUTE_HEADING = 3.0
+COST_ROUTE_XTRACK = 0.9
+# Lateral error that saturates the cross-track term at each matched sample;
+# the same units and character as KEEP_RIGHT_SCALE_M, which it replaces.
+ROUTE_XTRACK_SCALE_M = 2.0
+# Conformance is the MEAN cross-track cost over this many samples along each
+# candidate's composite path, each matched to its nearest route sample. One
+# endpoint cannot measure a path through a bend: a shallow arc that cuts a
+# 90-degree corner lands its endpoint ON the ribbon at the apex, and priced
+# there alone it read as perfect -- measured 7.4 m inside the bend in the
+# closed loop. Eight samples over a 30 m lookahead is one per 3.75 m.
+ROUTE_MATCH_SAMPLES = 8
+
 # Longitudinal limits. Target speed is the minimum of the cap, the cornering
 # limit sqrt(a_lat / |k|), the corner-entry limit sqrt(a_lat / |k_next| +
 # 2 * a_decel * transition) for a deferred turn, and the stopping limit
@@ -1108,9 +1146,12 @@ REQUIRED_FREE_DISTANCE_M = MAX_SPEED_MPS**2 / (2.0 * COMFORT_DECEL_MPS2) + STOP_
 # outside of every corner. 4.0 m/s^3 is still inside normal-driving comfort
 # (a relaxed lane change peaks near 3.5) and halves that to 1.2 s.
 #
-# This constant is now shared: the speed law asks the controller for the same
-# rate to work out how far the car travels while the steering winds on, so
-# corner-entry braking and steering response cannot drift apart.
+# The speed law deliberately does NOT consult this rate to credit wind-on
+# distance ("hold speed, I will slow before I am really turning") -- that is
+# the entry-allowance trap: the credit keeps the target high, the high target
+# commands no braking, and the wind-on completes with the car still at speed.
+# Anticipation comes from the path (deferred families, the route preview),
+# never from the controller.
 LAT_JERK_MAX_MPS3 = 4.0
 K_RATE_CEIL_PER_S = 0.42
 # Closed-loop steering trim: measured curvature (filtered yaw rate / speed) is
@@ -1464,13 +1505,201 @@ AEB_REVERSE_MIN_SPEED_MPS = 0.5
 # the forward 0.6 m standoff would refuse to let the car near anything.
 AEB_REVERSE_STANDOFF_M = 0.35
 
-# Navigation hint. The in-game bigmap route is used for ONE thing: which way to
-# go at a junction. It is a heading term in the arc cost, never a path to
-# follow, and its absence simply drops the term.
+# Navigation hint (LEGACY FALLBACK). The bearing-to-one-node hint survives for
+# routes `route_model.build_route_path` cannot turn into a reference path
+# (fewer than two usable nodes ahead); everywhere else the route now IS a path
+# to follow -- see the ROUTE_* block below.
 NAV_LOOKAHEAD_M = 18.0
 # A blocking Lua round-trip, so it runs far slower than the display loop. The
 # route only changes when the player sets a new destination.
 NAV_POLL_INTERVAL_MS = 1000
+
+# Route following. The bigmap route becomes an ego-frame REFERENCE PATH:
+# cross-track and tangent cost terms in the arc fan (guidance, never
+# authority -- a blocked arc outranks any conformance, exactly as the old
+# bearing hint did), plus a curvature preview that lets the speed law brake
+# for corners and the destination before the LiDAR's obstacle work would
+# force it.
+#
+# How far ahead the preview looks. The cap's whole braking envelope is
+# 24.7 m (v^2/2a + margin), so 120 m is ~5x that and ~10 s of driving --
+# far enough that the low-passed speed target falls gently rather than
+# reacting, and nothing beyond it can require action yet.
+ROUTE_PREVIEW_M = 120.0
+# Resample spacing. Navgraph nodes can be tens of metres apart on straights,
+# so curvature MUST be measured on a resampled polyline; 3 m resolves
+# v = sqrt(a/k) within ~5% for the tightest fan curvature while keeping the
+# whole preview at <= 41 samples, so every pass over it is trivial.
+ROUTE_SAMPLE_STEP_M = 3.0
+# Curvature smoothing window. Sized against the worst encoding the navgraph
+# produces: a 90-degree junction as a SINGLE VERTEX between two long chords.
+# Smearing pi/2 over 9 m reads k ~= 0.17 -> ~4 m/s creep through the turn,
+# which is conservative (over-reading curvature under-reads speed); a real
+# R = 25 m bend spans 39 m of arc and is untouched by a 9 m window.
+ROUTE_CURVATURE_SMOOTH_M = 9.0
+# Half road width where the navgraph node carried none: the 6 m two-lane road
+# the closed-loop tests drive.
+ROUTE_DEFAULT_HALF_WIDTH_M = 3.0
+# The navgraph radius is not always a lane statement: plazas and parking
+# aprons carry radii of 10 m and more, and a lane target derived from those
+# would aim the car across open ground. Clamp to ordinary road geometry --
+# half a narrow lane up to a wide two-lane carriageway.
+ROUTE_MIN_HALF_WIDTH_M = 1.5
+ROUTE_MAX_HALF_WIDTH_M = 5.0
+# Speed through a turning junction: v = sqrt(CORNERING_ACCEL / k) at
+# R ~= 17.5 m, a typical urban corner mouth.
+ROUTE_JUNCTION_SPEED_MPS = 7.0
+# A junction only slows the car when the route actually TURNS there: heading
+# change past 15 degrees across the junction window. linkCount alone would
+# brake at every crossroads driven straight through (navgraph junction nodes
+# often carry zero curvature on the through road); curvature alone misses
+# single-vertex turns the smoothing dilutes. The conjunction is the term.
+ROUTE_JUNCTION_TURN_RAD = 0.26
+ROUTE_JUNCTION_WINDOW_M = 10.0
+# The virtual stop line sits this far short of the destination marker --
+# front overhang plus the same "stop short, not on top of" character as
+# STOP_MARGIN_M.
+ROUTE_ARRIVAL_MARGIN_M = 5.0
+# The speed limit handed to the controller is the backward pass sampled THIS
+# many seconds of travel down the path, not at the ego. The speed loop is a
+# proportional law behind a low-pass: tracking a ramping target it carries a
+# standing error of decel * (1/SPEED_KV + TARGET_SPEED_TAU_S) ~= 3.9 m/s --
+# measured in the closed-loop harness as arriving at a R = 15 m corner at
+# 7.9 m/s against a 6.5 m/s entry speed, and overshooting the destination
+# stop line by 8 m. Sampling the pass one tracker time-constant ahead lowers
+# the target by exactly the error the tracker will add back, and on a flat
+# stretch of the pass it changes nothing at all. 1/0.9 + 0.45 ~= 1.56.
+# The value handed over is the MINIMUM of the pass over [now, lead], never
+# the point sample at the lead: the pass rises again right after every
+# corner dip, and a point sample past the dip inverted the constraint with
+# speed (see route_model.route_speed_limit).
+ROUTE_PREVIEW_LEAD_S = 1.56
+# One transient Lua failure used to wipe the cached route for a full poll
+# interval (the fetch overwrote the cache unconditionally). Transport failures
+# now keep the last good route for three polls; ~33 m of driving at the cap on
+# a possibly stale reference, safe because LiDAR keeps obstacle authority on
+# every arc. An explicit "no target" reply still clears immediately -- the
+# player cancelling is data, not noise.
+ROUTE_STALE_GRACE_S = 3.0
+# Below this route speed limit, at rest, the controller holds rather than
+# drives: "arrived" must be far tighter than STALL_SPEED_MPS (the same
+# reasoning as AEB_STOPPED_SPEED_MPS), and the hold has to be an explicit
+# branch because at a zero target the throttle path would serve the trim
+# integrator -- wound up to 0.35 on the drive there -- and the car would
+# creep-limit-cycle at the marker.
+ROUTE_ARRIVED_SPEED_LIMIT_MPS = 0.05
+# The terminal deceleration once the route says "stop here" and the car is
+# below walking pace. The coast band cannot finish an arrival: it exists to
+# stop brake chatter at cruise, so it hands any demand under COAST_DECEL to
+# engine drag -- and measured in the closed loop the car idle-crept 6.7 m
+# past the marker over eight seconds. Against a permanently-zero target there
+# is no chatter to avoid, so the last metre gets a gentle dedicated brake.
+ROUTE_ARRIVAL_DECEL_MPS2 = 1.5
+# The gentle pedal is open-loop, and on a downgrade steeper than the ~1.5
+# m/s^2 it delivers, gravity wins: the car hovered at ~2 m/s and descended
+# past the marker indefinitely, never slow enough for the stopped hold to
+# engage. So while the car is NOT slowing in the arrival branch, the pedal
+# ratchets up at this rate per second -- an integrator on non-progress, the
+# feedback a proportional pedal cannot provide against a constant grade. On
+# flat ground the speed falls every tick and the ratchet never engages, so
+# the gentle character is untouched.
+ROUTE_ARRIVAL_BOOST_PER_S = 0.5
+# Arriving CLEARS the in-game route (groundMarkers drops its target near the
+# marker, and a nearly-consumed polyline is too short to build a path from),
+# which would hand the speed law back its full cap right at the destination.
+# Inside this remaining distance the worker latches the arrival: the hold
+# survives the route disappearing, and only a route with more than this left
+# -- a new destination -- releases it.
+ROUTE_ARRIVAL_LATCH_M = 10.0
+
+# Planning memory: a worker-thread store of obstacle cells the PLANNER (and
+# only the planner -- AEB never reads it, because a full-authority brake on a
+# remembered ghost is the unacceptable failure) merges with each tick's
+# cloud. Kerbs persist through occlusion, the rear corridor keeps what the
+# sensors saw a moment ago, and single-frame sampling noise stops dithering
+# the free distance.
+#
+# The cell is the planner's own obstacle grid pitch (OBSTACLE_CELL_M = 0.4).
+MEMORY_CELL_M = 0.4
+# Forgotten by the METRE, like the WORLD stores: a wall-clock TTL drains the
+# map at a red light while the sweep that would re-observe it is not moving.
+# 20 m covers an occlusion pass behind a parked car and the 6 m reverse
+# recovery with margin -- and it is deliberately short, because this window
+# IS the lifetime bound on any remembered ghost. Note what "parked" means
+# here: the odometer stalls, so a ghost in front of a stopped car expires
+# only through the reverse recovery moving the car. That escape is designed,
+# not accidental.
+MEMORY_DISTANCE_M = 20.0
+# The planner's 35 m horizon plus the turn sweep and the reverse reach.
+MEMORY_RADIUS_M = 50.0
+# A 50 m disc at 0.4 m holds ~49k cells; obstacles occupy a small fraction,
+# and the cap bounds the per-tick sort-merge well under a millisecond.
+MEMORY_MAX_CELLS = 20_000
+# Cumulative returns before a remembered cell is believed. A real kerb face
+# collects dozens per tick; 3 rejects the residue a lone speck leaves after
+# despeckle.
+MEMORY_MIN_SUPPORT = 3
+# Anything the semantics call a vehicle lives on the WALL CLOCK instead --
+# WORLD's two-clocks argument: a mover stamped by the odometer is a streak of
+# itself. The same figure as WORLD_VEHICLE_TTL_S.
+MEMORY_VEHICLE_TTL_S = 0.15
+# The same teleport guard (and figure) as WORLD_POSE_JUMP_RESET_M: a respawn
+# must never leave the old map's walls standing in the new one.
+MEMORY_POSE_JUMP_RESET_M = 25.0
+# Remembered points handed to the arc scan per tick, decimated evenly. The
+# scan is O(points x arcs), and 2k remembered points cost ~1-2 ms on the
+# measured 6.7 ms plan.
+MEMORY_MAX_QUERY_POINTS = 2000
+# Road-mask returns are strided lightly before entering the memory: besides
+# the road store (which needs only presence for the coverage bonus), the same
+# returns are the GROUND-CONTRADICTION evidence that evicts remembered cells
+# the sensors can now see tarmac through -- and that test needs per-cell
+# counts to clear MEMORY_MIN_SUPPORT, so 8:1 starved it at range.
+MEMORY_ROAD_STRIDE = 2
+MEMORY_MAX_ROAD_CELLS = 20_000
+
+# The semantic road-coverage BONUS -- the upgrade path the planner's
+# geometric-not-semantic design note always named. The planner still decides
+# drivability by geometry alone (flat grass remains drivable, which is what
+# keeps unannotated maps working); coverage of road-classified returns enters
+# as a negative cost, so on an annotated kerbless road the tarmac wins and on
+# a map with no annotations the term simply never appears.
+#
+# Sized so it can never outbid safety: the free-distance term alone reaches
+# 0.35 at free = 18.6 m, so any genuinely pinched arc outranks full coverage
+# -- while 0.35 dwarfs the smoothness cost of a gentle correction
+# ((k/K_MAX)^2 * 1.5 ~= 0.02), so the bonus alone holds the road. Uniform
+# coverage shifts every candidate equally and argmin's first-occurrence tie
+# still lands on the straight immediate arc.
+COST_ROAD_BONUS = 0.35
+# Coarse on purpose: the bonus asks "is this ON the road", not "where is the
+# kerb" -- the kerb is the height band's job. 0.8 m also quarters the scatter
+# cost against the display grid.
+ROAD_BONUS_CELL_M = 0.8
+# Grid extent, BEV metres: lateral +-16 covers a full-lock arc's 2R = 12 m
+# excursion; 32 m forward covers min(free, lookahead) windows. Out-of-grid
+# samples count as off-road, which is the honest reading for a candidate
+# that leaves the mapped area.
+ROAD_BONUS_HALF_WIDTH_M = 16.0
+ROAD_BONUS_REACH_M = 32.0
+# Below this many occupied cells (~25 m^2 of road) the grid is an unannotated
+# map or a near-empty tick, and the term drops out exactly as nav/keep-right
+# do -- absent, not guessed.
+ROAD_BONUS_MIN_CELLS = 40
+# Coverage samples per candidate path, over min(free, lookahead): one per
+# ~4 m of a 30 m lookahead. 4 x 41 x 8 lookups is trivial.
+ROAD_BONUS_SAMPLES = 8
+
+# The steered reverse runs the same arc fan, but reversing is a different
+# REGIME and two of the forward weights are provably wrong for it. Free
+# distance scored against the 40 km/h braking envelope (28.7 m) made 5 m and
+# 25 m of reverse room nearly indistinguishable -- so it is scored against
+# what the manoeuvre needs, REVERSE_DISTANCE_M plus working margin. And
+# smoothness at the forward weight beat every clearing arc: "steer least"
+# while backing at 2 m/s is a tie-break, not passenger comfort, and at 1.5
+# the recovery chose a blocked straight over an open diagonal every time.
+REVERSE_REQUIRED_FREE_M = 10.0
+REVERSE_COST_SMOOTHNESS = 0.3
 
 # Vehicle.control() is a blocking ack. Raise to 80 to actuate every other tick
 # if POLL TIME ever exceeds DISPLAY_INTERVAL_MS with self-driving engaged.

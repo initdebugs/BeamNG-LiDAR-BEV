@@ -8,6 +8,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -53,10 +54,22 @@ from .config import (
     MAX_OBSTACLE_RENDER_POINTS,
     MAX_ROAD_RENDER_POINTS,
     MAX_SPEED_MPS,
+    MEMORY_ROAD_STRIDE,
     NAV_POLL_INTERVAL_MS,
     OBSTACLE_MIN_HEIGHT_M,
     PLANNER_HORIZON_M,
     PLANT_REFERENCE_VEHICLE,
+    REVERSE_COST_SMOOTHNESS,
+    REVERSE_DISTANCE_M,
+    REVERSE_REQUIRED_FREE_M,
+    ROAD_BONUS_CELL_M,
+    ROAD_BONUS_HALF_WIDTH_M,
+    ROAD_BONUS_MIN_CELLS,
+    ROAD_BONUS_REACH_M,
+    ROUTE_ARRIVAL_LATCH_M,
+    ROUTE_PREVIEW_M,
+    ROUTE_STALE_GRACE_S,
+    STALL_SPEED_MPS,
     STEERING_SIGN,
     TRANSITION_DISTANCES_M,
     WORLD_ACTOR_FADE_S,
@@ -64,7 +77,9 @@ from .config import (
     WORLD_ACTOR_STATE_INTERVAL_S,
 )
 from .controller import (
+    BLOCKED,
     REVERSE_GEAR,
+    REVERSING,
     DrivingController,
     forward_gear_index,
     gear_is_engaged,
@@ -89,10 +104,11 @@ from .models import (
     ControlCommand,
     DrivingPlan,
     PerceptionSnapshot,
+    RoadGrid,
     SensorMount,
     VehicleGeometry,
 )
-from .navigation import fetch_route, route_heading
+from .navigation import fetch_route_reply, parse_route, route_heading
 from .planner import (
     ObstacleBand,
     corridor_return_profile,
@@ -100,8 +116,11 @@ from .planner import (
     plan_arc,
     rear_free_distance,
 )
+from .planning_map import PlanningMemory
+from .route_model import build_route_path
 from .semantics import (
     SCENE_ROAD,
+    SCENE_VEHICLE,
     SURFACE_MARKING,
     SemanticPalette,
     classify_scene_groups,
@@ -151,6 +170,47 @@ _MARKING_SILENCE_SCANS = 250
 # Cadence of the driving telemetry line. Well below the display tick: it exists
 # to explain a run after the fact, not to trace every frame.
 _TELEMETRY_INTERVAL_S = 1.0
+# Cadence of the Memory check: line -- store sizes change slowly, and the line
+# exists to catch a runaway store or a map full of ghosts, not to trace it.
+_MEMORY_LOG_INTERVAL_S = 5.0
+
+
+def build_road_grid(
+    road_bev: np.ndarray, remembered_road: np.ndarray
+) -> RoadGrid | None:
+    """
+    The road-coverage bonus's occupancy grid, or None when there is not
+    enough road to say anything.
+
+    None below ROAD_BONUS_MIN_CELLS is the unannotated-map path: the term
+    vanishes from the cost exactly as nav and keep-right do when their inputs
+    are absent -- dropped, never guessed.
+    """
+    parts = [points for points in (road_bev, remembered_road) if len(points)]
+    if not parts:
+        return None
+    points = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    width = int(round(2.0 * ROAD_BONUS_HALF_WIDTH_M / ROAD_BONUS_CELL_M))
+    height = int(round(ROAD_BONUS_REACH_M / ROAD_BONUS_CELL_M))
+    cols = np.floor(
+        (points[:, 0] + ROAD_BONUS_HALF_WIDTH_M) / ROAD_BONUS_CELL_M
+    ).astype(np.intp)
+    rows = np.floor(points[:, 1] / ROAD_BONUS_CELL_M).astype(np.intp)
+    inside = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
+    if not inside.any():
+        return None
+    counts = np.bincount(
+        rows[inside] * width + cols[inside], minlength=width * height
+    )
+    occupancy = (counts > 0).astype(np.uint8).reshape(height, width)
+    if int(occupancy.sum()) < ROAD_BONUS_MIN_CELLS:
+        return None
+    return RoadGrid(
+        occupancy=occupancy,
+        cell_m=ROAD_BONUS_CELL_M,
+        origin_right_m=-ROAD_BONUS_HALF_WIDTH_M,
+        origin_forward_m=0.0,
+    )
 
 # --- What counts as a hard stop worth measuring -------------------------------
 #
@@ -210,7 +270,14 @@ class BeamNgWorker(QObject):
         self._self_driving = False
         self._controller: DrivingController | None = None
         self._route = None
+        self._route_fresh_at = 0.0
         self._last_nav_poll_at = 0.0
+        self._last_nav_rtt_ms = 0.0
+        self._route_check_logged = False
+        self._arrival_logged = False
+        self._arrived_hold = False
+        self._reverse_check_logged = False
+        self._last_route_path = None
         self._last_plan_at = 0.0
         self._last_control_at = 0.0
         self._last_control_ms = 0.0
@@ -226,6 +293,11 @@ class BeamNgWorker(QObject):
         self._rear_aeb_enabled = False
         self._rear_aeb = EmergencyBraking(REVERSE)
         self._mirrored_geometry: VehicleGeometry | None = None
+        # Planner-only obstacle/road memory, worker-thread confined. AEB
+        # never reads it -- see planning_map's module docstring.
+        self._memory = PlanningMemory()
+        self._last_memory_log_at = 0.0
+        self._last_drive_block_ms = 0.0
         # Per system, NOT shared. Both step in the same tick, so one timestamp
         # gave whichever ran second a dt of microseconds: its confirmation
         # window advanced 1 ms per tick instead of 40, so the rear brake needed
@@ -519,7 +591,14 @@ class BeamNgWorker(QObject):
 
         self._controller = DrivingController()
         self._route = None
+        self._route_fresh_at = 0.0
         self._last_nav_poll_at = 0.0
+        self._route_check_logged = False
+        self._arrival_logged = False
+        self._arrived_hold = False
+        self._reverse_check_logged = False
+        self._last_route_path = None
+        self._memory.clear()
         self._last_plan_at = 0.0
         self._last_control_at = 0.0
         self._last_control_ms = 0.0
@@ -569,6 +648,10 @@ class BeamNgWorker(QObject):
         self._self_driving = False
         self._controller = None
         self._route = None
+        self._route_fresh_at = 0.0
+        self._arrived_hold = False
+        self._last_route_path = None
+        self._memory.clear()
         if was_engaged and self._vehicle is not None:
             try:
                 # Released rather than braked: the human takes over a coasting
@@ -1001,11 +1084,17 @@ class BeamNgWorker(QObject):
                 # masquerade as a lost bridge and tear the whole connection down
                 # two seconds later. The three steps are isolated from each
                 # other too, so a fault in one never switches the other off.
+                #
+                # Timed as a whole because the on-screen POLL TIME deliberately
+                # excludes it (`finished` is captured above); the Drive: line
+                # reports the previous tick's figure, the same convention as
+                # control_ms.
+                drive_block_started = time.perf_counter()
                 obstacles = _EMPTY_BEV
                 aeb_obstacles = _EMPTY_BEV
                 measured = had_returns
 
-                _, forward, _ = vehicle_axes(state)
+                right_axis, forward, _ = vehicle_axes(state)
                 forward_speed = float(
                     vec3(state.get("vel", (0.0, 0.0, 0.0))) @ forward
                 )
@@ -1078,13 +1167,47 @@ class BeamNgWorker(QObject):
 
                 if self._self_driving:
                     try:
+                        # The planner's cloud gains the memory; AEB's band
+                        # below never does. Gated on a tick that HAS returns,
+                        # so memory can never unblind the planner: an empty
+                        # cloud still plans _BLIND_ARC and brakes.
+                        merged = obstacles
+                        road_grid = None
+                        if measured:
+                            ego_pos = vec3(state["pos"])
+                            now_mono = time.monotonic()
+                            road_bev = bev[scene_groups == SCENE_ROAD]
+                            self._memory.update(
+                                ego_pos,
+                                right_axis,
+                                forward,
+                                obstacles,
+                                bev[scene_groups == SCENE_VEHICLE],
+                                road_bev[::MEMORY_ROAD_STRIDE],
+                                now_mono,
+                            )
+                            remembered = self._memory.obstacles_bev(
+                                ego_pos, right_axis, forward
+                            )
+                            if len(remembered):
+                                merged = np.concatenate(
+                                    (obstacles, remembered)
+                                )
+                            road_grid = build_road_grid(
+                                road_bev,
+                                self._memory.road_bev(
+                                    ego_pos, right_axis, forward
+                                ),
+                            )
+                            self._log_memory(now_mono, len(merged))
                         plan = self._compute_plan(
                             state,
-                            obstacles,
+                            merged,
                             geometry,
                             forward_speed,
                             heading,
                             measured,
+                            road_grid=road_grid,
                         )
                     except Exception as exc:
                         LOGGER.exception("Self-driving planning failed")
@@ -1140,6 +1263,10 @@ class BeamNgWorker(QObject):
                         LOGGER.exception("AEB evidence logging failed")
                         self._pending_evidence = []
 
+                self._last_drive_block_ms = (
+                    time.perf_counter() - drive_block_started
+                ) * 1000.0
+
             frame = BevFrame(
                 road_points=road_points,
                 obstacle_points=obstacle_points,
@@ -1154,6 +1281,11 @@ class BeamNgWorker(QObject):
                 control_ms=self._last_control_ms,
                 aeb=aeb,
                 rear_aeb=rear_aeb,
+                route_points=(
+                    None
+                    if plan is None or self._last_route_path is None
+                    else self._last_route_path.points
+                ),
             )
             self._poll_failures = 0
             self._first_failure_at = None
@@ -1186,6 +1318,9 @@ class BeamNgWorker(QObject):
                     plan=plan,
                     aeb=aeb,
                     rear_aeb=rear_aeb,
+                    route_world=(
+                        None if plan is None else self._route_world_preview()
+                    ),
                 )
             )
             # The last statement of a successful tick, deliberately after
@@ -1229,31 +1364,111 @@ class BeamNgWorker(QObject):
         forward_speed: float,
         heading: float,
         had_returns: bool,
+        road_grid: RoadGrid | None = None,
     ) -> DrivingPlan:
         assert self._controller is not None
 
         if had_returns:
-            # ~LOOKAHEAD_TIME_S seconds of travel, so keep-right and the nav
-            # hint keep their tuned character at any speed.
+            # ~LOOKAHEAD_TIME_S seconds of travel, so the lateral guidance
+            # terms keep their tuned character at any speed.
             lookahead = min(
                 LOOKAHEAD_MAX_M,
                 max(LOOKAHEAD_MIN_M, LOOKAHEAD_TIME_S * abs(forward_speed)),
             )
+            # The reference path is rebuilt every tick (the ego frame moves
+            # every tick) from the cached route; the legacy bearing hint runs
+            # only when no path could be built, so the planner never sees two
+            # lateral guidance sources at once.
+            route_path = self._route_context(state)
+            # Stashed for the display frames built later this tick, on this
+            # same thread; cleared on disengage so the overlay only ever shows
+            # a route the car is actually following.
+            self._last_route_path = route_path
+            route_remaining = (
+                None if route_path is None else route_path.remaining_m
+            )
+            if route_path is not None and not self._route_check_logged:
+                self._route_check_logged = True
+                self._log_route_check(route_path)
             arc = plan_arc(
                 obstacles,
                 geometry,
-                nav_heading_rad=self._nav_heading(state),
+                nav_heading_rad=(
+                    None
+                    if route_path is not None
+                    else route_heading(self._route, state)
+                ),
                 # The curvature actually being driven right now, which is also
                 # segment A of every deferred candidate.
                 previous_curvature=self._controller.current_curvature,
                 lookahead_m=lookahead,
+                route=route_path,
+                road_grid=road_grid,
             )
+            if route_remaining is not None:
+                self._arrived_hold = route_remaining <= ROUTE_ARRIVAL_LATCH_M
+            elif self._arrived_hold:
+                # Arriving CLEARS the in-game route (groundMarkers drops its
+                # target at the marker, and the leftover polyline is too short
+                # to build a path from), so the hold would die exactly when it
+                # is needed and the car would pull away at the destination.
+                # The latch survives the route disappearing; only a route with
+                # meaningful distance left -- a new destination -- releases it.
+                arc = replace(arc, route_speed_limit_mps=0.0)
             rear_free_m = rear_free_distance(obstacles, geometry)
             obstacle_count = len(obstacles)
+
+            mode = self._controller.mode
+            if mode == REVERSING or (
+                mode == BLOCKED and abs(forward_speed) < STALL_SPEED_MPS
+            ):
+                # The steered reverse: plan_arc on the 180-degree-rotated
+                # cloud, exactly as rear AEB mirrors its corridor -- rotation
+                # preserves handedness, so every helper applies unchanged,
+                # and previous_curvature maps into the travel frame as -k
+                # (controller._reverse holds the derivation). keep_right off:
+                # reversing wants clearance and free distance only, and the
+                # winner is plan_arc's own argmin -- back toward the most
+                # open region while steering least. The forward re-plan after
+                # recovery re-orients the car with the full cost stack, so
+                # there is deliberately no bespoke "maximise forward options"
+                # objective here. The memory-merged cloud matters: what is
+                # straight behind left the sensors' view long ago.
+                reverse_arc = plan_arc(
+                    mirror_points(obstacles),
+                    self._mirrored_geometry
+                    if self._mirrored_geometry is not None
+                    else mirrored(geometry),
+                    previous_curvature=-self._controller.current_curvature,
+                    lookahead_m=REVERSE_DISTANCE_M + 4.0,
+                    keep_right=False,
+                    required_free_m=REVERSE_REQUIRED_FREE_M,
+                    smoothness_weight=REVERSE_COST_SMOOTHNESS,
+                )
+                # Entry and abort both read the ARC's own free distance: the
+                # arc is what will actually be driven, and gating on the
+                # straight-back corridor would refuse a recovery whose whole
+                # point is steering around what is straight behind.
+                straight_back_m = rear_free_m
+                rear_free_m = float(reverse_arc.free_distance_m)
+                if mode == REVERSING and not self._reverse_check_logged:
+                    self._reverse_check_logged = True
+                    LOGGER.info(
+                        "Reverse check: steered reverse -- travel-frame k "
+                        "%+.4f, arc free %.1f m against %.1f m straight back",
+                        reverse_arc.curvature,
+                        reverse_arc.free_distance_m,
+                        straight_back_m,
+                    )
+            else:
+                reverse_arc = None
         else:
             arc = _BLIND_ARC
             rear_free_m = 0.0
             obstacle_count = 0
+            route_remaining = None
+            reverse_arc = None
+            self._last_route_path = None
 
         now = time.perf_counter()
         dt = (
@@ -1271,12 +1486,22 @@ class BeamNgWorker(QObject):
             rear_free_distance_m=rear_free_m,
             reported_gear=reported_gear,
             heading_rad=heading,
+            reverse_arc=reverse_arc,
         )
+        if command.reason == "Arrived at destination" and not self._arrival_logged:
+            self._arrival_logged = True
+            LOGGER.info(
+                "Route check: arrived -- holding with %s of route left",
+                "n/a"
+                if route_remaining is None
+                else f"{route_remaining:.1f} m",
+            )
         self._log_driving_telemetry(arc, command, forward_speed, obstacle_count)
         return DrivingPlan(
             arc=arc,
             command=command,
             forward_speed_mps=forward_speed,
+            reverse_arc=reverse_arc,
             reported_gear=reported_gear,
         )
 
@@ -1308,7 +1533,8 @@ class BeamNgWorker(QObject):
         LOGGER.info(
             "Drive: %s %.1f/%.1f km/h thr %.2f brk %.2f | free %.1f m clear "
             "%.2f m obstacles %d | k cmd %+.4f driven %+.4f measured %s "
-            "gain %.2f | defer %.0f m -> %+.4f | %s",
+            "gain %.2f | defer %.0f m -> %+.4f | route v %s xtrack %s | "
+            "block %.1f ms | %s",
             command.mode,
             speed * 3.6,
             command.target_speed_mps * 3.6,
@@ -1323,6 +1549,15 @@ class BeamNgWorker(QObject):
             self._controller.steering_gain,
             arc.transition_distance_m,
             arc.next_curvature,
+            "n/a"
+            if arc.route_speed_limit_mps is None
+            else f"{arc.route_speed_limit_mps * 3.6:.0f}",
+            "n/a"
+            if arc.route_cross_track_m is None
+            else f"{arc.route_cross_track_m:+.1f}",
+            # The previous tick's figure, like control_ms: this tick's block
+            # is still running when this line prints.
+            self._last_drive_block_ms,
             command.reason,
         )
 
@@ -1693,19 +1928,121 @@ class BeamNgWorker(QObject):
             state.reason,
         )
 
-    def _nav_heading(self, state: dict[str, Any]) -> float | None:
+    def _poll_route(self) -> None:
         """
-        Turn hint from the in-game destination, refreshed on its own cadence.
+        Refresh the cached route on its own cadence.
 
         Reading the route is a blocking Lua round-trip, and the route only
-        changes when the player sets a new destination, so it must not ride the
-        display loop.
+        changes when the player sets a new destination, so it must not ride
+        the display loop. A parseable "no target" clears the cache immediately
+        (the player cancelling is data); a TRANSPORT failure keeps the last
+        good route for ROUTE_STALE_GRACE_S, because one dropped reply used to
+        wipe a perfectly good route for a full poll interval.
         """
         now = time.monotonic()
-        if now - self._last_nav_poll_at >= NAV_POLL_INTERVAL_MS / 1000.0:
-            self._last_nav_poll_at = now
-            self._route = fetch_route(self._run_lua)
+        if now - self._last_nav_poll_at < NAV_POLL_INTERVAL_MS / 1000.0:
+            return
+        self._last_nav_poll_at = now
+        started = time.perf_counter()
+        reply = fetch_route_reply(self._run_lua)
+        self._last_nav_rtt_ms = (time.perf_counter() - started) * 1000.0
+        if reply is None:
+            if (
+                self._route is not None
+                and now - self._route_fresh_at > ROUTE_STALE_GRACE_S
+            ):
+                self._route = None
+            return
+        self._route = parse_route(reply)
+        if self._route is not None:
+            self._route_fresh_at = now
+
+    def _nav_heading(self, state: dict[str, Any]) -> float | None:
+        """Legacy bearing hint from the cached route (see `route_heading`)."""
+        self._poll_route()
         return route_heading(self._route, state)
+
+    def _route_context(self, state: dict[str, Any]):
+        """
+        The cached route as a reference path in the current ego frame.
+
+        Polls on the nav cadence, rebuilds per tick: ~40 samples of interp
+        against the 40 ms tick. None whenever no honest path exists, which is
+        the signal to fall back to the bearing hint.
+        """
+        self._poll_route()
+        return build_route_path(self._route, state)
+
+    def _route_world_preview(self) -> np.ndarray | None:
+        """
+        The cached route's world nodes, clipped to the preview reach, for the
+        WORLD overlay. None whenever no path is being followed.
+        """
+        if self._last_route_path is None or self._route is None:
+            return None
+        nodes = self._route.path_world
+        if len(nodes) < 2:
+            return None
+        chords = np.hypot(*np.diff(nodes[:, :2], axis=0).T)
+        along = np.concatenate(([0.0], np.cumsum(chords)))
+        count = max(int(np.searchsorted(along, ROUTE_PREVIEW_M)) + 1, 2)
+        return np.asarray(nodes[:count], dtype=np.float32)
+
+    def _log_memory(self, now: float, merged_count: int) -> None:
+        if now - self._last_memory_log_at < _MEMORY_LOG_INTERVAL_S:
+            return
+        self._last_memory_log_at = now
+        LOGGER.info(
+            "Memory check: %d cells (%d vehicle), oldest %.0f m of travel "
+            "ago, %d road cells | %d obstacle points to the planner",
+            self._memory.cell_count,
+            self._memory.vehicle_cell_count,
+            self._memory.oldest_age_m(),
+            self._memory.road_cell_count,
+            merged_count,
+        )
+
+    def _log_route_check(self, path) -> None:
+        """
+        One shot at the first reference path of an engagement: the facts only
+        a live game can prove -- above all whether the enriched Lua fields
+        (radius, linkCount) actually arrived on this BeamNG version, because
+        the chunk defaults them rather than failing and the offline suite
+        cannot tell the difference.
+        """
+        route = self._route
+        nodes = 0 if route is None else len(route.path_world)
+        spacing = "n/a"
+        if route is not None and len(route.path_world) >= 2:
+            chords = np.hypot(
+                *np.diff(route.path_world[:, :2], axis=0).T
+            )
+            spacing = f"{chords.min():.1f}-{chords.max():.1f} m"
+        with_radius = (
+            0
+            if route is None or route.half_width_m is None
+            else int((route.half_width_m >= 0.0).sum())
+        )
+        with_links = (
+            0
+            if route is None or route.link_counts is None
+            else int((route.link_counts > 0).sum())
+        )
+        LOGGER.info(
+            "Route check: %d nodes, %.0f m to go (spacing %s) | %d/%d carry "
+            "radius, %d/%d carry linkCount | preview v0 %.1f km/h, "
+            "cross-track %+.2f m | lua round-trip %.0f ms",
+            nodes,
+            path.remaining_m,
+            spacing,
+            with_radius,
+            nodes,
+            with_links,
+            nodes,
+            path.speed_limit_mps * 3.6,
+            path.cross_track_m,
+            self._last_nav_rtt_ms,
+        )
 
     def _run_lua(self, chunk: str) -> Any:
         assert self._bng is not None
@@ -2159,6 +2496,7 @@ class BeamNgWorker(QObject):
         self._sensor_names.clear()
         self._geometry = None
         self._mirrored_geometry = None
+        self._memory.clear()
         self._logged_reach = False
         self._logged_markings = False
         self._logged_marking_silence = False

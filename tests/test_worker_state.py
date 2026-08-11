@@ -584,6 +584,32 @@ def test_a_route_ahead_becomes_a_turn_hint() -> None:
     assert plan.arc.nav_heading_rad > 0.0  # the route bends left
 
 
+def test_a_followed_route_reaches_both_display_frames() -> None:
+    """The overlay data flows: BEV frames carry the ego-frame reference
+    path, and it is present only because a route is actually followed."""
+    reply = json.dumps(
+        {
+            "hasTarget": True,
+            "path": [
+                [1.0, 2.0, 3.0],
+                [1.0, 32.0, 3.0],
+                [1.0, 62.0, 3.0],
+            ],
+            "length": 60.0,
+        }
+    )
+    worker, frames, _ = _driving_worker(bng=BngStub(reply=reply))
+
+    worker._poll_once()
+
+    frame = frames[0]
+    assert frame.plan is not None
+    assert frame.route_points is not None
+    assert len(frame.route_points) >= 2
+    assert frame.plan.arc.route_speed_limit_mps is not None
+    assert worker._route_world_preview() is not None
+
+
 def test_no_destination_leaves_the_planner_without_a_hint() -> None:
     worker, frames, _ = _driving_worker(
         bng=BngStub(reply=json.dumps({"hasTarget": False}))
@@ -594,6 +620,186 @@ def test_no_destination_leaves_the_planner_without_a_hint() -> None:
     plan = frames[0].plan
     assert plan is not None
     assert plan.arc.nav_heading_rad is None
+
+
+def _route_cache_worker(run_lua, fresh_at: float) -> SimpleNamespace:
+    from beamng_lidar_bev.models import RouteHint
+
+    route = RouteHint(
+        path_world=np.asarray([[0.0, 0.0, 0.0], [0.0, 30.0, 0.0]]),
+        remaining_m=30.0,
+    )
+    return SimpleNamespace(
+        _route=route,
+        _route_fresh_at=fresh_at,
+        _last_nav_poll_at=0.0,
+        _run_lua=run_lua,
+    )
+
+
+def test_a_transient_nav_failure_keeps_the_route_within_grace(
+    monkeypatch,
+) -> None:
+    """One dropped Lua reply used to wipe a good route for a whole poll
+    interval; a transport failure now keeps the cache for the grace window."""
+
+    def broken(chunk: str) -> str:
+        raise RuntimeError("bridge dropped the reply")
+
+    now = {"t": 1000.0}
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: now["t"])
+    worker = _route_cache_worker(broken, fresh_at=999.0)
+
+    BeamNgWorker._poll_route(worker)  # type: ignore[arg-type]
+    assert worker._route is not None  # 1 s stale: inside the grace
+
+    now["t"] = 1004.0  # 5 s stale: past ROUTE_STALE_GRACE_S
+    BeamNgWorker._poll_route(worker)  # type: ignore[arg-type]
+    assert worker._route is None
+
+
+def test_an_explicit_no_target_clears_the_route_immediately(
+    monkeypatch,
+) -> None:
+    """The player cancelling the destination is data, not noise."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: now["t"])
+    worker = _route_cache_worker(
+        lambda chunk: json.dumps({"hasTarget": False}), fresh_at=999.9
+    )
+
+    BeamNgWorker._poll_route(worker)  # type: ignore[arg-type]
+
+    assert worker._route is None
+
+
+def test_memory_never_reaches_the_aeb_band(monkeypatch) -> None:
+    """
+    The planner's cloud gains the memory; AEB's must not -- a full-authority
+    brake on a remembered ghost is the unacceptable failure. Pinned by
+    IDENTITY: the AEB step receives the exact band array the extraction
+    produced, while the planner receives more points than that band holds.
+    """
+    planner_band = np.asarray([[0.5, 20.0]] * 5, dtype=np.float32)
+    aeb_band = np.asarray([[0.5, 30.0]] * 7, dtype=np.float32)
+    monkeypatch.setattr(
+        worker_module,
+        "geometric_obstacle_sets",
+        lambda *args, **kwargs: [planner_band, aeb_band],
+    )
+    seen_by_planner: list[int] = []
+    real_plan_arc = worker_module.plan_arc
+
+    def capture_plan(obstacles, *args, **kwargs):
+        seen_by_planner.append(len(obstacles))
+        return real_plan_arc(obstacles, *args, **kwargs)
+
+    monkeypatch.setattr(worker_module, "plan_arc", capture_plan)
+
+    worker, _, _ = _driving_worker()
+    worker._aeb_enabled = True
+    seen_by_aeb: list[object] = []
+    real_compute_aeb = worker._compute_aeb
+
+    def capture_aeb(system, obstacles, *args, **kwargs):
+        seen_by_aeb.append(obstacles)
+        return real_compute_aeb(system, obstacles, *args, **kwargs)
+
+    worker._compute_aeb = capture_aeb  # type: ignore[method-assign]
+
+    # Seed the memory with believed cells near the ego so the merge is
+    # guaranteed to add points this tick.
+    seed = np.asarray([[2.0] * 6, [10.0] * 6], dtype=np.float32).T
+    for tick in range(3):
+        worker._memory.update(
+            np.asarray((1.0, 2.0, 3.0)),
+            np.asarray((1.0, 0.0, 0.0)),
+            np.asarray((0.0, 1.0, 0.0)),
+            seed,
+            np.empty((0, 2), np.float32),
+            np.empty((0, 2), np.float32),
+            0.01 * tick,
+        )
+
+    worker._poll_once()
+
+    assert seen_by_planner and seen_by_planner[0] > len(planner_band)
+    assert seen_by_aeb and seen_by_aeb[0] is aeb_band
+
+
+def test_a_blind_tick_plans_blocked_even_with_a_full_memory() -> None:
+    """Sensor outage still reads as blocked: memory must never unblind."""
+    worker, frames = _armed_worker([EmptyLidarStub() for _ in range(4)])
+    worker._vehicle = VehicleStub(gear="P")  # type: ignore[assignment]
+    worker.set_self_driving(True)
+    seed = np.asarray([[2.0, 10.0]] * 6, dtype=np.float32)
+    for tick in range(3):
+        worker._memory.update(
+            np.asarray((1.0, 2.0, 3.0)),
+            np.asarray((1.0, 0.0, 0.0)),
+            np.asarray((0.0, 1.0, 0.0)),
+            seed,
+            np.empty((0, 2), np.float32),
+            np.empty((0, 2), np.float32),
+            0.01 * tick,
+        )
+
+    worker._poll_once()
+
+    plan = frames[0].plan
+    assert plan is not None
+    assert plan.arc.free_distance_m == 0.0
+    assert plan.command.mode == "BLOCKED"
+
+
+def test_a_sparse_road_mask_builds_no_grid() -> None:
+    """An unannotated map (or a near-empty tick) drops the bonus entirely."""
+    few = np.asarray([[0.0, 5.0]] * 10, dtype=np.float32)
+
+    grid = worker_module.build_road_grid(few, np.empty((0, 2), np.float32))
+
+    assert grid is None
+
+
+def test_a_dense_road_mask_builds_a_bounded_grid() -> None:
+    xs, ys = np.meshgrid(np.arange(-3.0, 3.0, 0.4), np.arange(0.0, 30.0, 0.4))
+    points = np.column_stack((xs.ravel(), ys.ravel())).astype(np.float32)
+
+    grid = worker_module.build_road_grid(points, np.empty((0, 2), np.float32))
+
+    assert grid is not None
+    assert grid.occupancy.shape == (40, 40)
+    assert int(grid.occupancy.sum()) >= 40
+
+
+def test_arrival_survives_the_game_clearing_the_route() -> None:
+    """
+    groundMarkers drops its target at the marker, so the route vanishes at
+    the exact moment the arrival hold depends on it. The worker's latch must
+    keep the speed limit at zero until a NEW destination appears.
+    """
+    reply = json.dumps(
+        {
+            "hasTarget": True,
+            # A destination ~7 m ahead: inside ROUTE_ARRIVAL_LATCH_M.
+            "path": [[1.0, 2.0, 3.0], [1.0, 9.0, 3.0]],
+            "length": 7.0,
+        }
+    )
+    bng = BngStub(reply=reply)
+    worker, frames, _ = _driving_worker(bng=bng)
+
+    worker._poll_once()
+    assert worker._arrived_hold is True
+
+    # The game clears the target; force an immediate re-poll.
+    bng._reply = json.dumps({"hasTarget": False})
+    worker._last_nav_poll_at = 0.0
+    worker._poll_once()
+
+    plan = frames[-1].plan
+    assert plan is not None
+    assert plan.arc.route_speed_limit_mps == 0.0
 
 
 # --- emergency braking -------------------------------------------------------

@@ -70,6 +70,21 @@ at engage, the slope allowance at the 40 km/h cap on a hilly map (see `SLOPE_ALL
 the steering gain settling near a per-vehicle constant while cornering, and a corner approach
 that visibly brakes to the bend's entry speed rather than toward a stop.
 
+The **route-following upgrade (2026-08-10) has not been live-checked at all**, and its checklist
+is: the `Route check:` line on setting a destination (whether `radius`/`linkCount` actually
+arrive on this BeamNG version — the chunk defaults them rather than failing, so only this line
+can tell); the car keeping the commanded branch at a junction and holding right-of-centre; a 90°
+bend approached at the cap braking EARLY and smoothly to entry speed (the preview's doing, not
+the free-distance collapse); a turning junction slowing to ~25 km/h while a straight-through
+crossroads does not brake; arrival stopping ~5 m short of the marker and HOLDING without creep
+(`Route check: arrived` logs; a new destination resumes); behaviour with no destination set being
+indistinguishable from before; the `Memory check:` line staying bounded and free distance staying
+steady past an occluding parked car, with nothing braking for the old map after a teleport; a
+nose-in pocket escaping along an arc (`Reverse check:` line) with rear AEB still firing on a wall
+mid-reverse; and one spot check that the AEB metric never leaves ARMED on the standard phantom
+drive with everything engaged — its inputs are untouched by construction (memory never reaches
+it), so this is a confirmation, not a checklist re-run.
+
 AEB has its own live checklist, and the phantom-braking half of it is the part the offline suite
 cannot reach. Two of its cases now have dedicated geometry behind them and both need re-proving on
 a real map: **a gradient** (drive a hill at 40–70 km/h and reverse up a driveway ramp — the vertical
@@ -972,14 +987,17 @@ a comment saying it might.
 ### Self-driving
 
 `planner` (pure geometry) → `controller` (state machine) → `worker` actuation, with
-`navigation` supplying an optional turn hint. All three are Qt-free and BeamNGpy-free.
+`navigation` + `route_model` supplying the reference path (see "Route following" below) and
+`planning_map` supplying the planner-only obstacle memory. All of them are Qt-free and
+BeamNGpy-free.
 
 The planner is **geometric, not semantic** — a deliberate choice, not an oversight. Drivable
 means "no return in the obstacle height band", so flat grass and car parks read as drivable and
 the car will explore them; on a kerbed road the 0.20 m mount sees the kerb face and that is what
-keeps it on the tarmac. `classify_road_points` is display-only. If this needs tightening, add a
-road-coverage *bonus* to the cost function — the semantic mask is already computed for the
-display — rather than swapping the input.
+keeps it on the tarmac. The road-coverage *bonus* this section always named as the upgrade path
+now exists (`COST_ROAD_BONUS`, see the planning-memory section below) and is exactly that — a
+bonus over unchanged geometric authority, never a swapped input, and it vanishes on unannotated
+maps.
 
 Two filters stand between the raw cloud and that height band, and both were added because the
 arc scan takes the **nearest** blocking point per arc, so anything spurious ends an arc on its
@@ -1431,7 +1449,146 @@ first and vanished into the road points.
 `tostring(<first return value>)`, so the chunk **must** `return jsonEncode(...)` or a table
 arrives as the literal `"table: 0x..."`; and `response=True` is required or only an ACK comes
 back. It is polled at `NAV_POLL_INTERVAL_MS`, never per tick — it is a blocking round-trip and
-the route only changes when the player sets a destination. Every failure degrades to "no hint".
+the route only changes when the player sets a destination. Every failure degrades gracefully —
+but transport failure and "no target" degrade DIFFERENTLY now: a parseable no-target clears the
+cache immediately (the player cancelling is data), an exception keeps the last good route for
+`ROUTE_STALE_GRACE_S`, because one dropped reply used to wipe a perfectly good route for a full
+poll interval. The chunk also reads `distToTarget`, `linkCount` and the navgraph `radius` per
+node, each total-function with -1/0 defaults so a game version lacking a field degrades that
+field rather than the route — the `Route check:` line reports which actually arrived, which is
+the live-only fact the offline suite cannot prove.
+
+### Route following: the route became a reference path (2026-08-10)
+
+**The route is now a path to follow, and guidance still never becomes authority.** `route_model`
+(imports config/models/geometry/numpy — navigation's exact footprint; the planner never imports
+it) turns the cached route into a `models.RoutePath` per tick: projected into the ego frame,
+RESAMPLED at `ROUTE_SAMPLE_STEP_M` before any curvature is measured (navgraph spacing is tens of
+metres on straights — curvature from raw chords is meaningless), smoothed over
+`ROUTE_CURVATURE_SMOOTH_M` (sized against a 90° junction encoded as ONE vertex: smearing π/2
+over 9 m reads k≈0.17 → a ~4 m/s creep, conservative because over-reading curvature under-reads
+speed), with junction flags (`linkCount > 2` AND the heading actually turns — degree alone brakes
+at every straight-through crossroads, curvature alone misses single-vertex turns) and a backward
+speed pass at `COMFORT_DECEL_MPS2` folding corners, junctions and the destination into ONE
+value.
+
+Five things there are load-bearing:
+
+- **When a route is present it REPLACES nav-heading and keep-right entirely** (the gate in
+  `plan_arc`). Two lateral targets fighting — kerb band versus route centreline — is the failure
+  the gate avoids, and the kerb band measures a STRAIGHT slice that degrades on exactly the
+  bends the route tangent is strongest on. With no route (or fewer than two usable nodes ahead)
+  the legacy terms run byte-identically — pinned.
+- **Conformance is the MEAN priced deviation over samples along each candidate's composite path**
+  (`ROUTE_MATCH_SAMPLES`), each matched to its NEAREST route sample — never at one fixed arc
+  distance. One endpoint cannot measure a path through a bend: a shallow arc that cuts a 90°
+  corner lands its endpoint ON the ribbon at the apex and priced there it read as perfect —
+  measured 7.4 m inside the bend in the closed loop. The tangent term matches each EXACT
+  endpoint to its nearest sample and rides `COST_NAV_HEADING`'s normalisation so the tuned rank
+  carries over. Both terms are one rule for every family: no deferral discount enters here.
+- **The speed preview reaches the controller as `ArcPlan.route_speed_limit_mps` and the
+  controller only ever takes `min()` with it** — the sanctioned anticipation channel, same
+  category as `next_curvature`. The value is the backward pass sampled `ROUTE_PREVIEW_LEAD_S` of
+  travel DOWN the path, not at the ego: the speed loop is a proportional law behind a low-pass
+  and carries a standing error of decel·(1/KV + τ) ≈ 3.9 m/s against a ramping target — measured
+  arriving at a R=15 corner at 7.9 against 6.5 m/s and overshooting the destination by 8 m. The
+  lead cancels exactly that; on a flat stretch of the pass it changes nothing.
+- **Arrival is an explicit branch, then a latch.** At a zero target the throttle path serves the
+  trim integrator (wound to 0.35 on the drive there) and the coast band hands the last metres to
+  engine drag — measured 6.7 m of idle-creep past the marker. So below `HOLD_TAPER_SPEED_MPS`
+  with the limit at ~0, `_drive` brakes gently to rest (`ROUTE_ARRIVAL_DECEL_MPS2`, bypassing
+  the coast band — against a permanently-zero target there is no chatter to prevent) and holds at
+  rest, mode still DRIVING. And because groundMarkers CLEARS the route at the marker (and a
+  consumed polyline is too short to build a path from), the worker latches inside
+  `ROUTE_ARRIVAL_LATCH_M`: the hold survives the route disappearing, and only a route with more
+  than that left — a new destination — releases it. Without the latch the car got its full speed
+  cap back right at the destination.
+- **The 40 km/h cap is a target, not a promise**: the preview modulates below it for corners,
+  junctions and arrival; nothing was changed about the cap itself.
+
+### Planning memory: the planner remembers, AEB never does (2026-08-10)
+
+`planning_map.PlanningMemory` (imports config+numpy only, worker-thread confined — the
+controller's confinement argument, not the scene stores' pool-thread contract) accumulates the
+planner band's obstacle output as world-anchored 0.4 m cells: per-cell newest per-tick MEAN
+position (the cell centre quantises by up to 0.28 m, which eats the 0.35 m clearance margin),
+cumulative support, odometer stamp, vehicle wall-clock stamp. Static cells are forgotten by the
+METRE (`MEMORY_DISTANCE_M`) and vehicle-classified cells by the WALL CLOCK
+(`MEMORY_VEHICLE_TTL_S`) — the WORLD stores' two-clocks design, for the same reasons — with the
+same 25 m teleport guard. The query re-projects surviving cells into the current BEV frame and
+withholds cells under `MEMORY_MIN_SUPPORT`.
+
+Three rules are load-bearing and pinned:
+
+- **AEB never reads it.** The merged cloud feeds `plan_arc` and `rear_free_distance` only;
+  `aeb_obstacles` production and both `_compute_aeb` calls are byte-untouched. A full-authority
+  brake on a remembered ghost is the unacceptable failure, so its checklists did not need
+  re-running — `test_memory_never_reaches_the_aeb_band` pins it by IDENTITY.
+- **Memory can never unblind a blind tick.** The merge sits inside `had_returns`; a sensor
+  outage still plans `_BLIND_ARC` and brakes.
+- **Merged points, not a soft cost term**: a real remembered kerb must be able to block, and a
+  weight that could be outbid would let it be driven through. The accepted consequence is that a
+  static ghost can hard-block for up to 20 m of travel — and while parked the odometer stalls, so
+  its designed escape is the reverse recovery, which moves the car and expires it.
+
+A fourth rule was added from adversarial review: **seeing the GROUND somewhere outranks
+remembering an obstacle there.** The vehicle TTL hangs on the semantic mark, and unannotated
+maps never produce one — a crossing car's returns entered as static scenery and painted a
+believed phantom wall across the lane, which a then-parked ego could never expire. Any
+remembered cell that this tick's road-classified returns cover with `MEMORY_MIN_SUPPORT` hits
+while contributing no obstacle return is evicted; the geometric road fallback classifies
+vacated tarmac as road on any map, and it keeps re-sampling while parked. An occluded kerb gets
+neither kind of return and persists; a visible kerb face gets obstacle returns and is
+protected. The same review also gave marked cells WORLD's wall-clock semantics — ANY
+observation refreshes the stamp, so a once-marked cell still being observed never expires
+mid-observation.
+
+The same store keeps strided road-mask cells for the **road-coverage BONUS** — the upgrade path
+the geometric-planner note always named. `worker.build_road_grid` scatters road returns (+ the
+remembered cells) into a coarse `models.RoadGrid`; `plan_arc` subtracts
+`COST_ROAD_BONUS · coverage` sampled along each composite path over min(free, lookahead). A
+bonus, never authority: the free term alone reaches 0.35 at 18.6 m so a pinched arc always
+outranks full coverage, and under `ROAD_BONUS_MIN_CELLS` occupied cells (an unannotated map) the
+grid is not built and the term vanishes exactly as nav/keep-right do.
+
+### The steered reverse (2026-08-10)
+
+The recovery no longer backs up dead straight. When BLOCKED-and-stopped or REVERSING, the worker
+runs `plan_arc` on `mirror_points(merged)` with the mirrored geometry — exactly as rear AEB
+mirrors its corridor; rotation preserves handedness so every helper applies unchanged. **The
+mirror is a curvature-domain negation**: for front-frame curvature k_f, reversing yaw is
+v_signed·k_f with v_signed < 0, so travel-frame curvature k_m = −k_f — `previous_curvature`
+enters negated and `_reverse` steers `−reverse_arc.curvature`, before `STEERING_SIGN`, so the
+one-place-reconciles rule survives. Pinned by a hand-derived sign test (obstacle behind-left →
+tail swings right → positive BeamNG steering, because a fixed-steering car traces the same circle
+forward and backward).
+
+**Reversing is a different REGIME and two forward weights were provably wrong for it**
+(`REVERSE_REQUIRED_FREE_M`, `REVERSE_COST_SMOOTHNESS`): free distance scored against the 40 km/h
+braking envelope made 5 m and 25 m of reverse room nearly indistinguishable, and smoothness at
+1.5 made the recovery choose a blocked straight over an open diagonal every time — "steer least"
+at 2 m/s is a tie-break, not passenger comfort. Entry and abort both read the ARC's own free
+distance: the arc is what will actually be driven, and gating on the straight-back corridor
+would refuse a recovery whose whole point is steering around what is straight behind. Rear AEB
+stays armed and unchanged underneath, on its own un-memoried band. keep-right, route and the
+road grid are all off in reverse; the winner is plan_arc's own argmin — the forward re-plan
+after recovery re-orients the car with the full cost stack, so there is deliberately no bespoke
+bi-level objective.
+
+### Route overlays
+
+The route reaches both views as data, never via a second computation: `BevFrame.route_points`
+carries the plan-tick `RoutePath.points` (dashed polyline under the plan arc; the nav spoke now
+prefers the route TANGENT over the legacy bearing-to-a-node), and
+`PerceptionSnapshot.route_world` carries the world polyline clipped to the preview — the
+`surface_materials` optional-field precedent, so WORLD's compose thread gets it through the
+frozen snapshot only and the two-rate confinement contract is untouched. WORLD draws it as a
+DASHED thin ribbon (`_route_ribbon`): deliberately unbridged dashes (a gap in guidance is a gap
+on purpose), subordinate to the plan path by CHROMA and ALPHA, never luminance
+(`WORLD_ROUTE_RGB` solved against `test_world_palette`'s CIELAB matrix, `WORLD_ROUTE_ALPHA`
+under the path's 1.0), 5 mm under the path's height so the plan wins where they overlap, and not
+depth-tinted for the path's own reason. Both overlays exist only while self-driving follows a
+route — the overlay disappearing when disengaged is the honest reading.
 
 ## Configuration gotchas
 
