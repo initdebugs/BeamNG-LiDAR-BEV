@@ -1,1 +1,4 @@
 /.claude
+# Runtime logs; the colour-probe dump beside them stays tracked as evidence.
+logs/*.log
+logs/*.log.*
