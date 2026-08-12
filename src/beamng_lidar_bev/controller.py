@@ -33,6 +33,7 @@ from .config import (
     MAX_RECOVERY_ATTEMPTS,
     MAX_SPEED_MPS,
     MIN_TURN_RADIUS_M,
+    RECOVERY_PROGRESS_M,
     RESUME_HYSTERESIS_M,
     REVERSE_DISTANCE_M,
     REVERSE_MIN_CLEARANCE_M,
@@ -183,6 +184,9 @@ class DrivingController:
         self._stalled_for = 0.0
         self._reversed_m = 0.0
         self._attempts = 0
+        # Forward travel since the last recovery. This is what makes the
+        # attempt counter reachable at all -- see RECOVERY_PROGRESS_M.
+        self._progress_m = 0.0
         self._forward_gear = AUTOMATIC_FORWARD_GEAR
         # A stall is not cleared by a clear-looking path, because the path
         # always looks clear when the car is kerbed or wedged. Without this the
@@ -324,6 +328,31 @@ class DrivingController:
         self._arrival_boost = 0.0
         self._arrival_last_speed = float("inf")
 
+        # Forward progress since the last recovery. This, not merely reaching
+        # DRIVING, is what clears the attempt counter -- see
+        # RECOVERY_PROGRESS_M, without which the counter never reached
+        # MAX_RECOVERY_ATTEMPTS and the reverse recovery ran for ever.
+        if speed > 0.0:
+            self._progress_m += speed * dt
+            if self._progress_m >= RECOVERY_PROGRESS_M:
+                self._attempts = 0
+
+        # Entered on ONE tick, deliberately and after trying the alternative.
+        # A confirmation window here (brake fully, but wait N ticks before
+        # engaging the recovery machine) is the obvious guard against a
+        # single-tick phantom, and it was built and measured: it does not
+        # change the pedal at all, only the PHASE of the reverse recovery --
+        # and that alone turned the `test_a_cornered_car_escapes_with_a_steered
+        # _reverse` pocket from an escape (92 m clear) into an exact limit
+        # cycle (0.8 m, STUCK). The recovery's geometry depends on where the
+        # car happens to be when the hold expires, so delaying it is not the
+        # neutral change it looks like.
+        #
+        # The phantom it was meant to catch is better attacked at the source,
+        # and has been: the gradient phantom that produced a PERSISTENT false
+        # block is gone with the cell-referenced band, and the sampling
+        # phantoms are gone with the cell reduction. What is left is genuinely
+        # rare and costs one tick of brake.
         if plan.free_distance_m <= STOP_MARGIN_M:
             return self._enter(
                 BLOCKED, plan, speed, dt, "Path blocked ahead"
@@ -448,7 +477,13 @@ class DrivingController:
         if mode in (DRIVING, REVERSING):
             self._blocked_by_stall = False
         if mode == DRIVING:
-            self._attempts = 0
+            # The attempt counter is deliberately NOT cleared here. Reaching
+            # DRIVING is not evidence that anything was recovered: a reverse
+            # recovery buys a tick of it on the way back every single time, so
+            # clearing it here made MAX_RECOVERY_ATTEMPTS unreachable and the
+            # car reversed for ever. `_drive` clears it on real forward
+            # progress instead.
+            self._progress_m = 0.0
             return self._drive(plan, speed, dt)
         if mode == REVERSING:
             return self._reverse(plan, speed, dt, REVERSE_MIN_CLEARANCE_M)

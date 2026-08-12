@@ -62,6 +62,9 @@ from .config import (
     WORLD_DEPTH_NEAR_M,
     WORLD_DEPTH_SCALE_M,
     WORLD_EDGE_FADE_M,
+    WORLD_GROUND_FIELD_CELL_M,
+    WORLD_GROUND_FIELD_FILL_CELLS,
+    WORLD_GROUND_FIELD_MAX_SPAN_CELLS,
     WORLD_MAX_BOUNDARY_POINTS,
     WORLD_MAX_COLUMNS,
     WORLD_MAX_ROAD_CELLS,
@@ -830,6 +833,362 @@ def world_to_render(
     )
 
 
+def horizontal_axes(
+    snapshot: PerceptionSnapshot,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    The render basis flattened into the world XY plane, renormalised.
+
+    `world_to_render` projects onto the full 3-D basis, so inverting it exactly
+    would need the vertical component back -- which a render vertex, whose Y is
+    the thing being computed, does not have. The horizontal projections are what
+    a BEV coordinate actually means anyway: a plan-view offset. Renormalising
+    leaves a pure yaw rotation (raw projections shrink by cos(pitch) on a grade
+    and would pull every sample toward the car), exact in yaw and second-order
+    small in grade -- 0.14% at 3 degrees of pitch, 2 cm over 15 m.
+    """
+    right, forward = _basis(snapshot)
+    right_xy = right[:2]
+    forward_xy = forward[:2]
+    return (
+        right_xy / max(float(np.hypot(*right_xy)), 1e-9),
+        forward_xy / max(float(np.hypot(*forward_xy)), 1e-9),
+    )
+
+
+def render_to_world_xy(
+    vertices: np.ndarray, snapshot: PerceptionSnapshot
+) -> np.ndarray:
+    """World XY under each render vertex. Render x is right, render z is -forward."""
+    right_xy, forward_xy = horizontal_axes(snapshot)
+    ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)[:2]
+    return (
+        ego
+        + vertices[:, 0:1].astype(np.float64) * right_xy
+        - vertices[:, 2:3].astype(np.float64) * forward_xy
+    )
+
+
+def _box3(values: np.ndarray) -> np.ndarray:
+    """3x3 box sum over a 2-D array, zero-padded. Pure slicing, no loop."""
+    padded = np.zeros(
+        (values.shape[0] + 2, values.shape[1] + 2), dtype=values.dtype
+    )
+    padded[1:-1, 1:-1] = values
+    total = padded[0:-2, 0:-2] + padded[0:-2, 1:-1] + padded[0:-2, 2:]
+    total = total + padded[1:-1, 0:-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:]
+    return total + padded[2:, 0:-2] + padded[2:, 1:-1] + padded[2:, 2:]
+
+
+def _box3_mean(values: np.ndarray) -> np.ndarray:
+    """
+    3x3 mean with EDGE padding, for smoothing a height field.
+
+    Edge rather than zero padding, and the distinction is not cosmetic: these
+    are world Z values that can be hundreds of metres, so a zero-padded border
+    would drag the outermost cells toward sea level and the drape with them.
+    """
+    padded = np.pad(values, 1, mode="edge")
+    total = padded[0:-2, 0:-2] + padded[0:-2, 1:-1] + padded[0:-2, 2:]
+    total = total + padded[1:-1, 0:-2] + padded[1:-1, 1:-1] + padded[1:-1, 2:]
+    total = total + padded[2:, 0:-2] + padded[2:, 1:-1] + padded[2:, 2:]
+    return total / 9.0
+
+
+def _pyramid_fill(total: np.ndarray, count: np.ndarray) -> np.ndarray:
+    """
+    Fill an incompletely observed raster with a smooth estimate, everywhere.
+
+    A pull-push (image-pyramid) fill rather than an iterative dilation: a hole
+    is filled from the coarsest level that covers it, so the cost is O(cells)
+    regardless of how big the hole is, where dilation costs one pass per cell of
+    radius. Observed cells keep their own mean EXACTLY -- only holes take the
+    coarse estimate -- so the drape is the measured surface wherever the surface
+    was measured, and merely plausible where it was not.
+
+    The push is SMOOTHED rather than a nearest-neighbour repeat, which matters
+    because a hole is exactly where the smoothing shows. Repeating gives every
+    cell of a hole the same coarse block mean -- a plateau, so a ribbon crossing
+    a 6 m occlusion shadow on a gradient steps onto a flat shelf and off again
+    rather than running through. One 3x3 mean per level turns the plateau into a
+    ramp between the hole's own rims, and costs a fraction of the level it runs
+    on because the levels halve.
+    """
+    stack: list[tuple[np.ndarray, np.ndarray]] = []
+    level_total, level_count = total, count
+    while level_total.shape[0] > 1 or level_total.shape[1] > 1:
+        stack.append((level_total, level_count))
+        rows, cols = level_total.shape
+        pad = ((0, rows % 2), (0, cols % 2))
+        level_total = np.pad(level_total, pad)
+        level_count = np.pad(level_count, pad)
+        rows, cols = level_total.shape
+        level_total = level_total.reshape(rows // 2, 2, cols // 2, 2).sum(
+            axis=(1, 3)
+        )
+        level_count = level_count.reshape(rows // 2, 2, cols // 2, 2).sum(
+            axis=(1, 3)
+        )
+    filled = level_total / np.maximum(level_count, 1.0)
+    for level_total, level_count in reversed(stack):
+        rows, cols = level_total.shape
+        coarse = np.repeat(np.repeat(filled, 2, axis=0), 2, axis=1)[
+            :rows, :cols
+        ]
+        observed = level_count > 0.0
+        fine = level_total / np.maximum(level_count, 1.0)
+        # Smooth the coarse estimate, then let observations overwrite it. The
+        # blur runs before the overwrite so a measured cell is never softened
+        # by its neighbours -- only the inference between them is.
+        filled = np.where(observed, fine, _box3_mean(coarse))
+    return filled
+
+
+@dataclass(frozen=True)
+class GroundField:
+    """
+    The drawn ground surface as a world-anchored height raster, for draping.
+
+    The overlays -- both AEB corridors, the planned path, the navigation route
+    -- are statements ABOUT the road, and they were all drawn in one flat plane
+    at the ego's own ground height. A road is not flat: on any gradient, crest,
+    dip or camber the drawn surface rises through the overlay and the guidance
+    disappears under it. This is the surface to lift them onto, sampled from
+    exactly the cells `_ground_mesh` draws, so an overlay can never sink below a
+    surface that was built from the same evidence.
+
+    Built in `refresh` and carried inside `_MeshCache`, which is what keeps the
+    two-rate confinement contract intact: `compose` reads one immutable object
+    committed in a single attribute assignment and never touches a store. It
+    goes stale by at most the refresh cadence, which for a height under a
+    ribbon is metres of travel and centimetres of error.
+
+    `confidence` is separate from `heights` and both matter. `heights` is
+    defined everywhere (see `_pyramid_fill`); `confidence` says where that is a
+    measurement rather than an inference, and decays smoothly so a vertex
+    leaving the observed region FADES back to the ego plane instead of stepping
+    off a rim -- the same reason the ground mesh dissolves at its own radius
+    rather than ending.
+    """
+
+    origin_xy: np.ndarray
+    """World XY of the low corner of cell (0, 0)."""
+    cell_m: float
+    heights: np.ndarray
+    """(rows, cols) float32 world Z. Rows index Y, columns index X."""
+    confidence: np.ndarray
+    """(rows, cols) float32 in [0, 1]: how much `heights` is worth believing."""
+
+    def sample(self, world_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Bilinear height and confidence at world XY positions.
+
+        Bilinear rather than nearest because the overlay is a long thin ribbon:
+        nearest sampling steps by a whole cell at every boundary, which on a
+        1 m raster is a visible stair down the middle of the path. Positions
+        outside the raster clamp to its edge, where the confidence has already
+        decayed to zero, so the caller's fallback takes over.
+        """
+        points = np.asarray(world_xy, dtype=np.float64).reshape(-1, 2)
+        rows, cols = self.heights.shape
+        # Cell CENTRES are the sample sites, hence the half-cell shift.
+        u = np.clip(
+            (points[:, 0] - self.origin_xy[0]) / self.cell_m - 0.5,
+            0.0,
+            cols - 1.0,
+        )
+        v = np.clip(
+            (points[:, 1] - self.origin_xy[1]) / self.cell_m - 0.5,
+            0.0,
+            rows - 1.0,
+        )
+        j0 = np.floor(u).astype(np.intp)
+        i0 = np.floor(v).astype(np.intp)
+        j1 = np.minimum(j0 + 1, cols - 1)
+        i1 = np.minimum(i0 + 1, rows - 1)
+        fx = u - j0
+        fy = v - i0
+        weights = (
+            (1.0 - fx) * (1.0 - fy),
+            fx * (1.0 - fy),
+            (1.0 - fx) * fy,
+            fx * fy,
+        )
+        corners = ((i0, j0), (i0, j1), (i1, j0), (i1, j1))
+        height = np.zeros(len(points))
+        confidence = np.zeros(len(points))
+        for weight, (row, col) in zip(weights, corners):
+            height += weight * self.heights[row, col]
+            confidence += weight * self.confidence[row, col]
+        return height, np.clip(confidence, 0.0, 1.0)
+
+
+def build_ground_field(
+    cells_xy: np.ndarray,
+    heights: np.ndarray,
+    reference_z: float = 0.0,
+    cell_m: float = WORLD_GROUND_FIELD_CELL_M,
+) -> GroundField | None:
+    """
+    Rasterise the drawn ground cells into a sampleable height field.
+
+    ``cells_xy`` are WORLD_CELL_SIZE_M cell indices (the ground mesh's own
+    grid) and ``heights`` their world Z. The field is deliberately COARSER --
+    see WORLD_GROUND_FIELD_CELL_M -- and each field cell takes the MEAN of the
+    ground cells inside it, which is the right reduction for a surface: a
+    minimum would hug the gutter and a maximum would ride the kerb.
+
+    ``reference_z`` is the ego's own ground plane in world Z, and it is used
+    for exactly one thing: choosing between STACKED surfaces at the same XY.
+    See the layer note in the body.
+
+    Returns None when there is nothing to build from, which is the signal for
+    every caller to keep drawing exactly as it did before this existed.
+    """
+    cells = np.asarray(cells_xy)
+    values = np.asarray(heights, dtype=np.float64).reshape(-1)
+    if not len(cells) or len(values) != len(cells):
+        return None
+
+    # Which coarse cell each ground cell lands in. INTEGER division wherever
+    # the two grids are commensurate, which at 1.0 over 0.25 they are: the
+    # float route (centre in metres, divide, floor, cast) is four passes of
+    # float64 over half a million rows and measured 14 ms of a 15 ms build,
+    # against ~2 for a floor-divide on the int32 keys the store already holds.
+    # Identical answers -- floor((c + 0.5) / k) == c // k for integer c and k.
+    ratio = int(round(cell_m / WORLD_CELL_SIZE_M))
+    if ratio >= 1 and abs(ratio * WORLD_CELL_SIZE_M - cell_m) < 1e-9:
+        col = np.floor_divide(cells[:, 0], ratio)
+        row = np.floor_divide(cells[:, 1], ratio)
+    else:
+        col = np.floor(
+            (cells[:, 0].astype(np.float64) + 0.5) * WORLD_CELL_SIZE_M / cell_m
+        ).astype(np.int64)
+        row = np.floor(
+            (cells[:, 1].astype(np.float64) + 0.5) * WORLD_CELL_SIZE_M / cell_m
+        ).astype(np.int64)
+    # A margin of never-observed cells all the way round, wide enough for the
+    # confidence decay below to reach zero INSIDE the raster. `sample` clamps
+    # out-of-range positions to the border, so without this a vertex beyond the
+    # surfaced ground -- the route ribbon runs to ROUTE_PREVIEW_M, well past
+    # WORLD_ROAD_RADIUS_M -- would take the edge cell's height at full
+    # confidence, which is the one way a drape can be badly wrong rather than
+    # merely unknown. With it, the border reads confidence 0 and the caller's
+    # fallback takes over smoothly.
+    pad = int(max(WORLD_GROUND_FIELD_FILL_CELLS, 0)) + 4
+    col_min, col_max = int(col.min()) - pad, int(col.max()) + pad
+    row_min, row_max = int(row.min()) - pad, int(row.max()) + pad
+    cols = col_max - col_min + 1
+    rows = row_max - row_min + 1
+    if (
+        cols > WORLD_GROUND_FIELD_MAX_SPAN_CELLS
+        or rows > WORLD_GROUND_FIELD_MAX_SPAN_CELLS
+    ):
+        # The stores are culled to WORLD_ROAD_RADIUS_M, so this cannot happen
+        # from a big map -- only from a store that failed to expire. Refusing
+        # to build is the safe answer: the overlays fall back to flat.
+        return None
+
+    flat = (row.astype(np.intp) - row_min) * cols + (
+        col.astype(np.intp) - col_min
+    )
+    size = rows * cols
+
+    # ONE surface per cell, and this is the single place the field deliberately
+    # diverges from the mesh it is built beside. `_ground_cells` keys on
+    # (x, y, LAYER), so an overpass and the road beneath it are two legitimate
+    # rows at the same XY and the mesh correctly draws both. A height field has
+    # to answer a narrower question -- how high is the ground the car is on --
+    # and averaging a deck 4 m up with the road under it answers neither: the
+    # overlay would jump into mid-air for the length of the bridge and drop
+    # back off the far end.
+    #
+    # Resolved toward the EGO'S OWN GROUND PLANE rather than by taking the
+    # lowest, because both directions really happen: driving under a bridge the
+    # road below is right, driving over it the deck is. A tie-break, not a
+    # filter -- where only one surface exists (everywhere that is not a bridge)
+    # every source cell survives, so a hill climbing 8 m is untouched.
+    nearest = np.full(size, np.inf)
+    np.minimum.at(nearest, flat, np.abs(values - float(reference_z)))
+    on_surface = (
+        np.abs(values - float(reference_z)) <= nearest[flat] + _GROUND_LAYER_M
+    )
+    flat = flat[on_surface]
+    values = values[on_surface]
+
+    total = np.bincount(flat, weights=values, minlength=size).reshape(
+        rows, cols
+    )
+    count = np.bincount(flat, minlength=size).reshape(rows, cols).astype(
+        np.float64
+    )
+    observed = count > 0.0
+
+    filled = _pyramid_fill(total, count)
+
+    # Confidence: full inside the observed region and for a few cells around
+    # it, then a smooth decay. The dilation is what stops a real hole -- the
+    # occlusion shadow behind a kerb, a patch the rings skipped -- putting a
+    # notch in a ribbon that crosses it; the blur after it is what makes the
+    # boundary a fade rather than an edge.
+    confidence = observed.astype(np.float64)
+    for _ in range(max(int(WORLD_GROUND_FIELD_FILL_CELLS), 0)):
+        confidence = np.minimum(_box3(confidence), 1.0)
+    for _ in range(2):
+        confidence = _box3(confidence) / 9.0
+    confidence[observed] = 1.0
+
+    return GroundField(
+        origin_xy=np.asarray(
+            (col_min * cell_m, row_min * cell_m), dtype=np.float64
+        ),
+        cell_m=float(cell_m),
+        heights=np.ascontiguousarray(filled, dtype=np.float32),
+        confidence=np.ascontiguousarray(confidence, dtype=np.float32),
+    )
+
+
+def drape(
+    vertices: np.ndarray,
+    snapshot: PerceptionSnapshot,
+    field: GroundField | None,
+    fallback_render_y: np.ndarray | float | None = None,
+) -> np.ndarray:
+    """
+    Lift render vertices onto the ground surface, in place.
+
+    The vertices arrive carrying their LIFT ABOVE THE GROUND in Y -- 2 cm for a
+    corridor rail, 1.6 m for the top of a threat marker -- and leave carrying a
+    render height. That split is what lets one pass drape a flat band and a
+    standing panel together: the panel's base and top are the same XY, so they
+    take the same surface height and the panel stays upright and the right size,
+    which draping "the mesh" naively rather than "the lift" would not give.
+
+    ``fallback_render_y`` is where a vertex sits when the surface under it was
+    never observed; None means the ego's own ground plane, which is exactly the
+    flat behaviour this replaces. The blend is by confidence, so the fallback is
+    reached by a fade and never by a step.
+    """
+    if not len(vertices):
+        return vertices
+    if fallback_render_y is None:
+        fallback = np.float64(snapshot.vehicle_geometry.ground_z_vehicle)
+    else:
+        fallback = np.asarray(fallback_render_y, dtype=np.float64)
+    if field is None:
+        vertices[:, 1] += np.asarray(fallback, dtype=np.float32)
+        return vertices
+    height, confidence = field.sample(render_to_world_xy(vertices, snapshot))
+    # Render Y is the gravity-relative height ABOVE THE EGO'S OWN world Z --
+    # see `world_to_render`, which takes offsets[:, 2] -- so the surface has to
+    # be referenced the same way or the whole overlay sits at a map altitude.
+    surface = height - float(np.asarray(snapshot.ego_pos_world)[2])
+    vertices[:, 1] += (
+        confidence * surface + (1.0 - confidence) * fallback
+    ).astype(np.float32)
+    return vertices
+
+
 @dataclass(frozen=True)
 class WorldMesh:
     """
@@ -860,17 +1219,24 @@ _EMPTY_WORLD_MESH = WorldMesh(_EMPTY_VERTICES, _EMPTY_RGB, _EMPTY_INDICES)
 @dataclass(frozen=True)
 class _MeshCache:
     """
-    The three cached world meshes plus the ego pose they were built at.
+    The three cached world meshes, the height field under them, and the ego
+    pose they were all built at.
 
     Immutable and committed to `_mesh_cache` as one assignment, which is what
     lets `compose` read it from another thread without a lock. The anchor is
     what `compose`'s teleport guard measures against.
+
+    The field rides here rather than in a second attribute for exactly that
+    reason: two assignments are two things a compose tick can catch half-done,
+    and a height field from before a teleport draped over a mesh from after it
+    would be worse than either alone.
     """
 
     ground: WorldMesh
     boundary: WorldMesh
     vehicle: WorldMesh
     anchor: np.ndarray
+    ground_field: GroundField | None = None
 
 
 def present_world_mesh(
@@ -1716,10 +2082,16 @@ class WorldSceneAssembler:
             surface_height,
             surface_material,
         ) = self._column_runs(snapshot)
+        # The ground mesh and the height field the overlays drape on are one
+        # answer, not two: both describe the surface this refresh decided is
+        # there, and building the field from anything else -- the raw stores,
+        # the current cloud -- would let an overlay sit at a height the drawn
+        # road never had.
+        ground, ground_field = self._ground_mesh(
+            snapshot, surface_keys, surface_height, surface_material
+        )
         self._mesh_cache = _MeshCache(
-            self._ground_mesh(
-                snapshot, surface_keys, surface_height, surface_material
-            ),
+            ground,
             *self._solid_meshes(
                 snapshot,
                 hazard_keys,
@@ -1728,6 +2100,7 @@ class WorldSceneAssembler:
                 hazard_classes,
             ),
             anchor=np.asarray(snapshot.ego_pos_world, dtype=np.float64),
+            ground_field=ground_field,
         )
 
     def compose(self, snapshot: PerceptionSnapshot) -> WorldFrame:
@@ -1759,8 +2132,14 @@ class WorldSceneAssembler:
                 cache.boundary,
                 cache.vehicle,
             )
+            # Dropped with the meshes on a teleport, deliberately: a field from
+            # the old map would drape the overlays onto terrain that is no
+            # longer under them, and the flat fallback is the honest answer
+            # until the next refresh rebuilds both together.
+            ground_field = cache.ground_field
         else:
             ground_mesh = boundary_mesh = vehicle_mesh = _EMPTY_WORLD_MESH
+            ground_field = None
 
         alert = self._alert(snapshot.aeb, snapshot.rear_aeb)
         road_vertices, road_colors, road_indices = present_world_mesh(
@@ -1775,11 +2154,15 @@ class WorldSceneAssembler:
         (
             (aeb_vertices, aeb_colors, aeb_indices),
             (marker_vertices, marker_colors, marker_indices),
-        ) = self._aeb_meshes(snapshot)
+        ) = self._aeb_meshes(snapshot, ground_field)
         uncertain, uncertain_colors = self._uncertain_points(snapshot)
         actors = self._update_actors(snapshot)
-        path_vertices, path_colors, path_indices = self._planned_path(snapshot, alert)
-        route_vertices, route_colors, route_indices = self._route_ribbon(snapshot)
+        path_vertices, path_colors, path_indices = self._planned_path(
+            snapshot, alert, ground_field
+        )
+        route_vertices, route_colors, route_indices = self._route_ribbon(
+            snapshot, ground_field
+        )
         camera_position, camera_euler = self._camera(snapshot, alert)
         plan = snapshot.plan
 
@@ -2065,7 +2448,7 @@ class WorldSceneAssembler:
         surface_keys: np.ndarray,
         surface_height: np.ndarray,
         surface_material: np.ndarray,
-    ) -> WorldMesh:
+    ) -> tuple[WorldMesh, GroundField | None]:
         """
         Mesh the ground cells as a CONTINUOUS surface with shared corners.
 
@@ -2094,7 +2477,7 @@ class WorldSceneAssembler:
             snapshot, surface_keys, surface_height, surface_material
         )
         if not len(cells):
-            return _EMPTY_WORLD_MESH
+            return _EMPTY_WORLD_MESH, None
 
         # Captured BEFORE bridging and corner averaging, both of which exist to
         # smooth the surface and are exactly what made paint blurry: a corner
@@ -2182,11 +2565,25 @@ class WorldSceneAssembler:
             )
         # World coordinates out, not render: the projection and the tint are
         # per-snapshot work and belong to `present_world_mesh`.
-        return WorldMesh(
-            world,
-            colours,
-            np.ascontiguousarray(indices),
-            limits_out,
+        #
+        # The height field is built from the BRIDGED cells rather than from the
+        # store, so it covers exactly the surface that gets drawn -- including
+        # the cells bridging invented, which is the point: an overlay crossing
+        # a bridged gap must ride the surface the viewer can see, not fall into
+        # a hole only the store knows about.
+        return (
+            WorldMesh(
+                world,
+                colours,
+                np.ascontiguousarray(indices),
+                limits_out,
+            ),
+            build_ground_field(
+                cells,
+                values[:, 0],
+                float(np.asarray(snapshot.ego_pos_world)[2])
+                + snapshot.vehicle_geometry.ground_z_vehicle,
+            ),
         )
 
     def _update_boundary_columns(self, snapshot: PerceptionSnapshot) -> None:
@@ -2665,6 +3062,7 @@ class WorldSceneAssembler:
     @staticmethod
     def _aeb_meshes(
         snapshot: PerceptionSnapshot,
+        field: GroundField | None = None,
     ) -> tuple[
         tuple[np.ndarray, np.ndarray, np.ndarray],
         tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -2684,10 +3082,21 @@ class WorldSceneAssembler:
         Returned as two meshes because a wash and a wall cannot share an
         opacity -- at one value either the corridor hides the road under it or
         the marker is too faint to read as an impact.
+
+        Every element is built carrying its LIFT ABOVE THE GROUND in Y and is
+        draped onto `field` at the end, in ONE pass over each finished buffer.
+        Draping last rather than per element is what keeps the panel, its two
+        posts and its lintel agreeing about where the road is: they share a
+        chord, so they sample the same XY and take the same surface height, and
+        the reticle stays a rectangle standing on the surface instead of shearing
+        with the gradient. It is also why the drape happens AFTER
+        `_aeb_bev_to_render` -- the rear system reasons in a 180-degree-rotated
+        frame, and sampling the terrain in that frame would drape the rear
+        corridor with the geometry in front of the car.
         """
         corridor: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         markers: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        ground = snapshot.vehicle_geometry.ground_z_vehicle + WORLD_AEB_GROUND_OFFSET_M
+        ground = WORLD_AEB_GROUND_OFFSET_M
         detail = ground + WORLD_AEB_DETAIL_OFFSET_M
 
         for state in (snapshot.aeb, snapshot.rear_aeb):
@@ -2798,7 +3207,10 @@ class WorldSceneAssembler:
                     ),
                 )
             )
-        return _combine(corridor), _combine(markers)
+        combined = (_combine(corridor), _combine(markers))
+        for vertices, _, _ in combined:
+            drape(vertices, snapshot, field)
+        return combined
 
     def _uncertain_points(
         self, snapshot: PerceptionSnapshot
@@ -2907,6 +3319,7 @@ class WorldSceneAssembler:
     @staticmethod
     def _route_ribbon(
         snapshot: PerceptionSnapshot,
+        field: GroundField | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         The navigation route as a DASHED thin ribbon, subordinate to the plan
@@ -2918,6 +3331,17 @@ class WorldSceneAssembler:
         as a second opinion rather than a reference. Like the path it is not
         depth-tinted -- guidance, not percept -- and it sits 5 mm under the
         path's height so the plan always wins where they overlap.
+
+        This one has a SECOND height source and it is the better one where it
+        reaches: every navgraph node carries a real world Z (see the Lua chunk
+        in `navigation`, which reads node.pos.z), so the route already knows
+        its own elevation and the old code threw it away -- it projected the
+        nodes, kept only the plan-view (x, -z), and flattened the lot onto the
+        ego's ground plane. The node Z is therefore the FALLBACK, used wherever
+        the sensors have not surfaced the ground; the measured field wins where
+        they have, because the drawn surface is what the ribbon must not sink
+        beneath. It also carries the route out past the end of the store, where
+        no field exists at all and the old code drew a level line into a hill.
         """
         route = snapshot.route_world
         if route is None or len(route) < 2:
@@ -2938,6 +3362,7 @@ class WorldSceneAssembler:
                 _EMPTY_INDICES.copy(),
             )
         pieces: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        node_heights: list[np.ndarray] = []
         period = WORLD_ROUTE_DASH_M + WORLD_ROUTE_GAP_M
         start = 0.0
         while start < total:
@@ -2955,17 +3380,31 @@ class WorldSceneAssembler:
                     (len(vertices), 1),
                 )
                 pieces.append((vertices, colours, indices))
+                # `path_ribbon` emits the two edge vertices of each sample
+                # adjacently, so the per-sample node height repeats twice and
+                # lines up with the concatenation `_combine` is about to do.
+                node_heights.append(
+                    np.repeat(np.interp(span, along, render[:, 1]), 2)
+                )
             start += period
         combined = _combine(pieces)
         vertices = combined[0]
         # path_ribbon builds at y = 0.03; drop the route 5 mm so the plan
         # ribbon renders over it wherever the two coincide.
-        vertices[:, 1] += snapshot.vehicle_geometry.ground_z_vehicle - 0.005
+        vertices[:, 1] -= 0.005
+        drape(
+            vertices,
+            snapshot,
+            field,
+            np.concatenate(node_heights) if node_heights else 0.0,
+        )
         return combined
 
     @staticmethod
     def _planned_path(
-        snapshot: PerceptionSnapshot, alert: str
+        snapshot: PerceptionSnapshot,
+        alert: str,
+        field: GroundField | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         plan = snapshot.plan
         if plan is None:
@@ -2997,7 +3436,11 @@ class WorldSceneAssembler:
             points,
             snapshot.vehicle_geometry.width_m * 0.5 + 0.18,
         )
-        vertices[:, 1] += snapshot.vehicle_geometry.ground_z_vehicle
+        # `path_ribbon` builds at y = 0.03, which is now read as a LIFT above
+        # the surface rather than an absolute height: the path follows the road
+        # over crests and into dips instead of shooting through them, which on
+        # a gradient is the difference between a visible plan and none at all.
+        drape(vertices, snapshot, field)
         # Deliberately NOT depth-tinted, and the one surface that is not. The
         # path is a guidance overlay rather than something perceived -- hazing
         # its far end would fade out exactly the part that says where the car is

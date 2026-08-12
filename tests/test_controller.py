@@ -504,10 +504,16 @@ def test_throttle_ramps_at_the_slew_limit_from_rest() -> None:
 
 
 def test_an_emergency_stop_brakes_immediately_and_fully() -> None:
+    """
+    A blocked path is a full brake on the very first tick, and the recovery
+    state machine engages on that same tick. A confirmation window between
+    the two was tried and removed -- see `controller._drive`.
+    """
     command = DrivingController().step(_plan(free_distance_m=1.0), 8.0, DT)
 
     assert command.mode == "BLOCKED"
     assert command.brake == 1.0
+    assert command.throttle == 0.0
 
 
 def test_the_brake_relaxes_to_a_hold_once_stopped() -> None:

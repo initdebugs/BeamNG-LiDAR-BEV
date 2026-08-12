@@ -1748,7 +1748,14 @@ def test_the_route_ribbon_is_built_only_from_a_snapshot_route() -> None:
 def test_the_route_ribbon_is_visually_subordinate_to_the_path() -> None:
     """Chroma and alpha are the route's channels: it ships translucent under
     the fully-opaque plan ribbon, and sits 5 mm beneath its height so the
-    plan wins wherever they overlap."""
+    plan wins wherever they overlap.
+
+    The height is measured against the DRAWN ROAD, not against the ego's
+    ground plane. This test used to assert `ground_z_vehicle + 0.025` and so
+    pinned the defect: in this scene the road mesh sits at render y = 0 while
+    the ego plane is at -0.5, i.e. the ribbon was drawn half a metre UNDER the
+    surface it describes.
+    """
     route = np.asarray(
         [[0.0, 0.0, 0.0], [0.0, 30.0, 0.0]], dtype=np.float32
     )
@@ -1759,11 +1766,8 @@ def test_the_route_ribbon_is_visually_subordinate_to_the_path() -> None:
     assert float(frame.route_colors[:, 3].max()) == pytest.approx(
         config.WORLD_ROUTE_ALPHA
     )
-    np.testing.assert_allclose(
-        frame.route_vertices[:, 1],
-        GEOMETRY.ground_z_vehicle + 0.025,
-        atol=1e-6,
-    )
+    road_y = float(frame.road_vertices[:, 1].max())
+    np.testing.assert_allclose(frame.route_vertices[:, 1], road_y + 0.025, atol=1e-6)
 
 
 def _arc(curvature: float = 0.0, free: float = 20.0) -> ArcPlan:
@@ -1806,3 +1810,304 @@ def test_a_reverse_plan_draws_the_reverse_path() -> None:
     assert len(frame.path_vertices)
     assert float(frame.path_vertices[:, 2].min()) >= -1e-5
     assert float(frame.path_vertices[:, 2].max()) > 4.0
+
+
+# --- draping the overlays onto the road ---------------------------------------
+#
+# Every overlay -- both AEB corridors, the planned path, the navigation route --
+# is a statement ABOUT the road, and all of them used to be drawn in one flat
+# plane at the ego's own ground height. A road is not flat, so on any gradient
+# the drawn surface rose straight through the guidance and hid it.
+
+
+def _ramp_points(
+    grade: float, *, reach_m: float = 60.0, half_width_m: float = 5.0
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[int, ...]]:
+    """A road climbing at `grade`, sampled densely enough to surface."""
+    points: list[tuple[float, float, float]] = []
+    for forward in np.arange(1.0, reach_m, 0.5):
+        for lateral in np.arange(-half_width_m, half_width_m + 0.01, 0.5):
+            points.append((float(lateral), float(forward), float(forward * grade)))
+    return tuple(points), tuple([int(SCENE_ROAD)] * len(points))
+
+
+def _driving_plan(free: float = 30.0) -> DrivingPlan:
+    return DrivingPlan(
+        arc=_arc(free=free),
+        command=ControlCommand(
+            steering=0.0,
+            throttle=0.3,
+            brake=0.0,
+            gear=2,
+            mode="DRIVING",
+            target_speed_mps=10.0,
+            reason="Clear",
+        ),
+        forward_speed_mps=10.0,
+    )
+
+
+def test_the_ground_field_measures_where_seen_and_infers_where_not() -> None:
+    """The field is the surface the mesh draws: exact on observed cells, and
+    filled -- never merely zero -- across the holes a ribbon has to cross."""
+    cells = []
+    heights = []
+    for x in range(-40, 41):
+        for y in range(-40, 41):
+            # A 5 m square hole in an otherwise 3% plane, which is roughly what
+            # the occlusion shadow behind a kerb looks like.
+            if 0 <= x < 20 and 0 <= y < 20:
+                continue
+            cells.append((x, y, 0))
+            heights.append(0.03 * y * config.WORLD_CELL_SIZE_M)
+    field = world_scene.build_ground_field(
+        np.asarray(cells, dtype=np.int32), np.asarray(heights)
+    )
+    assert field is not None
+
+    height, confidence = field.sample(np.asarray([[-5.0, -5.0]]))
+    assert confidence[0] == pytest.approx(1.0)
+    assert height[0] == pytest.approx(-0.15, abs=0.05)
+
+    # ...and the middle of the hole is filled with a plausible height rather
+    # than a zero, so a ribbon crossing it cannot develop a notch.
+    hole_height, hole_confidence = field.sample(np.asarray([[2.5, 2.5]]))
+    assert hole_confidence[0] > 0.9
+    assert hole_height[0] == pytest.approx(0.075, abs=0.15)
+
+
+def test_far_outside_the_measured_ground_the_field_stops_claiming_to_know() -> None:
+    """Confidence is what lets the fallback be a FADE rather than an edge."""
+    cells = np.asarray(
+        [(x, y, 0) for x in range(-8, 9) for y in range(-8, 9)], dtype=np.int32
+    )
+    field = world_scene.build_ground_field(cells, np.zeros(len(cells)))
+    assert field is not None
+
+    _, near = field.sample(np.asarray([[0.0, 0.0]]))
+    _, far = field.sample(np.asarray([[400.0, 400.0]]))
+    assert near[0] == pytest.approx(1.0)
+    assert far[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_drape_takes_the_road_under_a_bridge_and_not_the_deck_above_it() -> None:
+    """
+    The ground store keys on (x, y, LAYER), so a deck and the road beneath it
+    are two legitimate rows at one XY and the MESH correctly draws both. The
+    field cannot: averaging them puts the overlay in mid-air for the length of
+    the bridge. Resolved toward the ego's own ground plane, so driving under
+    the bridge takes the road and driving over it would take the deck.
+    """
+    points: list[tuple[float, float, float]] = []
+    groups: list[int] = []
+    for forward in np.arange(1.0, 50.0, 0.5):
+        for lateral in np.arange(-4.0, 4.01, 0.5):
+            points.append((float(lateral), float(forward), -0.5))
+            groups.append(int(SCENE_ROAD))
+            if 20.0 <= forward <= 26.0:
+                # A deck four metres up, road-classified like an overpass.
+                points.append((float(lateral), float(forward), 4.0))
+                groups.append(int(SCENE_ROAD))
+
+    assembler = WorldSceneAssembler()
+    assembler.update(_snapshot(tuple(points), tuple(groups)))
+    field = assembler._mesh_cache.ground_field
+    assert field is not None
+
+    under = field.sample(np.asarray([[0.0, 23.0]]))[0][0]
+    assert under == pytest.approx(-0.5, abs=0.25), (
+        "the drape averaged the deck into the road under it"
+    )
+    clear = field.sample(np.asarray([[0.0, 12.0]]))[0][0]
+    assert clear == pytest.approx(-0.5, abs=0.25)
+
+
+def test_a_ribbon_crossing_an_occlusion_shadow_gets_no_notch() -> None:
+    """
+    A pull-push fill hands every cell of a hole the same coarse block mean, so
+    on a gradient a ribbon crossing an occlusion shadow would step onto a flat
+    shelf and off again. Smoothing the push makes it a ramp between the hole's
+    own rims instead.
+    """
+    grade = 0.06
+    points: list[tuple[float, float, float]] = []
+    for forward in np.arange(1.0, 60.0, 0.5):
+        for lateral in np.arange(-5.0, 5.01, 0.5):
+            # An 8 m disc of missing returns 22 m ahead: the shadow behind a
+            # parked car, which is precisely where a ribbon runs.
+            if (lateral - 0.0) ** 2 + (forward - 22.0) ** 2 < 16.0:
+                continue
+            points.append((float(lateral), float(forward), float(forward * grade)))
+    groups = tuple([int(SCENE_ROAD)] * len(points))
+
+    snapshot = _snapshot(tuple(points), groups, plan=_driving_plan(free=40.0))
+    frame = WorldSceneAssembler().update(snapshot)
+
+    # ONE edge of the ribbon: `path_ribbon` emits left and right adjacently at
+    # the same reach, so stepping through every vertex would read half the
+    # gaps as zero and make the scale below meaningless.
+    edge = frame.path_vertices[0::2]
+    order = np.argsort(-edge[:, 2])
+    height = edge[order, 1]
+    reach = -edge[order, 2]
+    step = np.abs(np.diff(height))
+    # The clean-grade step between consecutive ribbon samples, for scale.
+    expected = grade * float(np.median(np.abs(np.diff(reach))))
+    assert expected > 0.0
+    assert float(step.max()) < 3.0 * expected, (
+        f"the ribbon stepped {step.max():.3f} m against a {expected:.3f} m "
+        "clean-grade step"
+    )
+    # ...and it stays on the grade through the hole rather than shelving.
+    crossing = (reach > 19.0) & (reach < 25.0)
+    assert crossing.any()
+    deviation = np.abs(height[crossing] - (reach[crossing] * grade))
+    assert float(deviation.max()) < 0.15
+
+
+def test_every_overlay_climbs_a_hill_with_the_road_instead_of_through_it() -> None:
+    """The headline defect, all four overlays at once: on an 8% climb the road
+    is 1.6 m up at 20 m, and a flat overlay is 1.6 m underground there."""
+    points, groups = _ramp_points(0.08)
+    route = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 40.0, 40.0 * 0.08]], dtype=np.float32
+    )
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            points,
+            groups,
+            plan=_driving_plan(free=40.0),
+            route_world=route,
+            aeb=_aeb_state(ARMED, threat_m=25.0),
+            speed_mps=10.0,
+        )
+    )
+
+    for name, vertices in (
+        ("path", frame.path_vertices),
+        ("route", frame.route_vertices),
+        ("aeb", frame.aeb_vertices),
+        ("marker", frame.aeb_marker_vertices),
+    ):
+        assert len(vertices), name
+        forward = -vertices[:, 2]
+        far = forward > 20.0
+        assert far.any(), name
+        assert float(vertices[far, 1].min()) > 1.0, name
+
+    # The three overlays that RUN ALONG the road must also track the grade
+    # rather than merely be offset by a constant. The threat marker is
+    # excluded on purpose: it stands at one distance, so its height varies by
+    # its own 1.6 m and not with reach -- that is what the upright test below
+    # measures instead.
+    for name, vertices in (
+        ("path", frame.path_vertices),
+        ("route", frame.route_vertices),
+        ("aeb", frame.aeb_vertices),
+    ):
+        forward = -vertices[:, 2]
+        far = forward > 20.0
+        correlation = float(np.corrcoef(forward[far], vertices[far, 1])[0, 1])
+        assert correlation > 0.9, f"{name} correlation {correlation}"
+
+
+def test_an_overlay_lies_just_above_the_road_it_describes() -> None:
+    """Draped, not merely lifted: the clearance over the surface is
+    centimetres everywhere, not metres at one end and negative at the other."""
+    points, groups = _ramp_points(0.06)
+    snapshot = _snapshot(points, groups, plan=_driving_plan(), speed_mps=10.0)
+    assembler = WorldSceneAssembler()
+    frame = assembler.update(snapshot)
+    cache = assembler._mesh_cache
+    assert cache is not None and cache.ground_field is not None
+
+    vertices = frame.path_vertices
+    assert len(vertices)
+    surface, confidence = cache.ground_field.sample(
+        world_scene.render_to_world_xy(vertices, snapshot)
+    )
+    # Not 1.0 at the very first samples, and correctly so: the ground directly
+    # under the car is the one patch the sensors never see (the ego bounding
+    # box is dropped from the cloud), so the path's first metre rides the
+    # dilated edge of the observed region rather than a measurement.
+    assert float(confidence.min()) > 0.9
+    clearance = vertices[:, 1] - surface
+    # The claim is about the surface that is actually DRAWN, which is exactly
+    # the fully-confident region -- elsewhere the overlay is blending back to
+    # the ego plane and there is no road there for it to sink beneath.
+    measured = confidence >= 0.999
+    assert measured.any()
+    assert float(clearance[measured].min()) > 0.0
+    assert float(clearance[measured].max()) < 0.10
+    # And nowhere does the blend put it meaningfully under even the inferred
+    # surface, which is the gross-regression guard.
+    assert float(clearance.min()) > -0.05
+
+
+def test_without_surfaced_ground_the_overlays_stay_exactly_where_they_were() -> None:
+    """No field, no change: the flat ego-plane placement is the fallback, so a
+    map the sensors have not surfaced yet degrades to the old behaviour rather
+    than to a missing or wildly misplaced overlay."""
+    frame = WorldSceneAssembler().update(
+        _snapshot(plan=_driving_plan(free=20.0), aeb=_aeb_state(ARMED, threat_m=None))
+    )
+
+    assert len(frame.path_vertices)
+    np.testing.assert_allclose(
+        frame.path_vertices[:, 1],
+        GEOMETRY.ground_z_vehicle + 0.03,
+        atol=1e-6,
+    )
+
+
+def test_the_rear_corridor_drapes_on_the_ground_behind_the_car() -> None:
+    """The rear system reasons in a 180-degree-ROTATED frame, so draping it
+    before the un-rotation would sample the terrain IN FRONT of the car and
+    hang the rear corridor at the wrong height -- on a hill, by metres."""
+    # Ground climbing ahead of the car and falling away behind it, so the two
+    # directions cannot be confused for one another.
+    points: list[tuple[float, float, float]] = []
+    for forward in np.arange(-40.0, 40.0, 0.5):
+        for lateral in np.arange(-4.0, 4.01, 0.5):
+            points.append((float(lateral), float(forward), float(forward * 0.08)))
+    groups = tuple([int(SCENE_ROAD)] * len(points))
+
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            tuple(points),
+            groups,
+            rear_aeb=_aeb_state(ARMED, threat_m=None, rearward=True),
+            speed_mps=4.0,
+        )
+    )
+
+    vertices = frame.aeb_vertices
+    assert len(vertices)
+    # Render z is -forward, so the rear corridor lies at POSITIVE z, where the
+    # ground is BELOW the ego. Draped correctly the corridor descends with it.
+    behind = vertices[:, 2] > 10.0
+    assert behind.any()
+    assert float(vertices[behind, 1].max()) < -0.5
+
+
+def test_the_threat_marker_stands_on_the_slope_at_its_full_height() -> None:
+    """Draping the LIFT rather than the mesh is what keeps a marker upright:
+    its base and top share an XY, so they take the same surface height and the
+    reticle stays the size it was built at instead of being flattened."""
+    points, groups = _ramp_points(0.10)
+    frame = WorldSceneAssembler().update(
+        _snapshot(
+            points,
+            groups,
+            aeb=_aeb_state(BRAKING, threat_m=20.0),
+            speed_mps=12.0,
+        )
+    )
+
+    vertices = frame.aeb_marker_vertices
+    assert len(vertices)
+    # The marker is WORLD_AEB_MARKER_HEIGHT_M tall and stands on ground rising
+    # 2 m over the 20 m to the threat, so the mesh spans roughly the sum -- and
+    # never less than the marker's own height, which is the flattening case.
+    span = float(vertices[:, 1].max() - vertices[:, 1].min())
+    assert span > config.WORLD_AEB_MARKER_HEIGHT_M

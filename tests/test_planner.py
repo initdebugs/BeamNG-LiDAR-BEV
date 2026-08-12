@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pytest
 
+from beamng_lidar_bev import planner
 from beamng_lidar_bev.config import (
     AEB_MIN_VERTICAL_EXTENT_M,
     AEB_OBSTACLE_MIN_HEIGHT_M,
@@ -1232,3 +1233,340 @@ def test_the_shape_tests_stay_inside_the_tick() -> None:
 
     assert len(bev) > 40_000, "the timing scene stopped being a worst case"
     assert elapsed_ms < 18.0, f"both bands cost {elapsed_ms:.1f} ms of a 40 ms tick"
+
+
+# --- the planner's band is cell-referenced, and what that costs and buys ------
+#
+# The slope cone bounds the ground estimate at SLOPE_ALLOWANCE_PER_M = 1.5%/m,
+# so on any road steeper than 1.5% the surface climbed into the planner's own
+# obstacle band. That is "it brakes for hills", and because the controller
+# blocks at STOP_MARGIN_M and then reverses, it is most of "it keeps reversing"
+# too. The band is now referenced to each cell's own base, exactly as AEB's is.
+
+_PLANNER_CELL_BAND = ObstacleBand(
+    OBSTACLE_MIN_HEIGHT_M,
+    PLANNER_HORIZON_M,
+    cell_referenced=True,
+    reduce_to_cells=True,
+)
+
+
+def _stripe_sampled_scene(
+    grade: float = 0.0,
+    *,
+    soffit_at: float | None = None,
+    wall_at: float | None = None,
+    kerb_at: float | None = None,
+    kerb_height: float = 0.12,
+    ground_z: float = -0.30,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Ground laid down the way the sensors really lay it down.
+
+    Rings are dense radially and azimuth STRIPES are `r * 2.45 deg` apart --
+    0.81 m at 19 m, twice `OBSTACLE_CELL_M`. That anisotropy is not a detail
+    here: it is the whole reason a cell can hold an overhead surface and no
+    ground return, which is what the coarse ceiling exists for.
+    """
+    points: list[tuple[float, float, float]] = []
+    for forward in np.arange(1.0, 36.0, 0.12):
+        step = max(0.05, float(np.radians(2.45) * forward))
+        for lateral in np.arange(-5.0, 5.01, step):
+            points.append((float(lateral), float(forward), grade * float(forward)))
+    if soffit_at is not None:
+        for forward in np.arange(soffit_at, soffit_at + 1.0, 0.04):
+            for lateral in np.arange(-5.0, 5.01, 0.04):
+                for height in np.arange(2.4, 3.0, 0.05):
+                    points.append(
+                        (float(lateral), float(forward), grade * forward + height)
+                    )
+    if wall_at is not None:
+        # Wider than the ground on purpose. The fan can reach 14 m of lateral
+        # offset at a 30 m lookahead, so a wall that stopped where the sampled
+        # ground stops would leave "drive off the edge of the test scene" as a
+        # free path, and the scene rather than the planner would be what the
+        # assertion measured.
+        for forward in np.arange(wall_at, wall_at + 0.3, 0.05):
+            for lateral in np.arange(-20.0, 20.01, 0.05):
+                for height in np.arange(0.0, 2.5, 0.05):
+                    points.append(
+                        (float(lateral), float(forward), grade * forward + height)
+                    )
+    if kerb_at is not None:
+        for forward in np.arange(1.0, 36.0, 0.06):
+            for side in (-1.0, 1.0):
+                for height in np.arange(0.0, kerb_height + 1e-9, 0.02):
+                    points.append(
+                        (
+                            side * kerb_at,
+                            float(forward),
+                            grade * forward + float(height),
+                        )
+                    )
+    array = np.asarray(points)
+    return (
+        array[:, :2].astype(np.float32),
+        (array[:, 2] + ground_z).astype(np.float32),
+    )
+
+
+def _planner_free(bev: np.ndarray, heights: np.ndarray) -> float:
+    obstacles = geometric_obstacle_sets(
+        bev, heights, -0.30, (_PLANNER_CELL_BAND,)
+    )[0]
+    return float(plan_arc(obstacles, GEOMETRY).free_distance_m)
+
+
+@pytest.mark.parametrize("grade", [0.0, 0.02, 0.03, 0.05, 0.08, 0.12, 0.20, 0.30])
+def test_an_empty_graded_road_is_not_an_obstacle_at_any_ordinary_grade(
+    grade: float,
+) -> None:
+    """
+    The headline hill fix. Against the slope cone this collapsed at a 2% grade
+    -- free distance 35.0 m to 6.0 m, and by 3% to exactly STOP_MARGIN_M, which
+    is the blocked entry and then the reverse recovery.
+    """
+    bev, heights = _stripe_sampled_scene(grade)
+
+    assert _planner_free(bev, heights) == pytest.approx(PLANNER_HORIZON_M)
+
+
+def test_a_kerb_still_blocks_a_swerve_into_it_on_a_hill() -> None:
+    """
+    Grade-proofing must not cost kerb detection -- the kerb face is the only
+    thing keeping the car on the tarmac on an unannotated map. It does not: the
+    cone had itself begun swallowing kerbs on grades, so this improves.
+    """
+    for grade in (0.0, 0.05, 0.12):
+        bev, heights = _stripe_sampled_scene(grade, kerb_at=3.5)
+        obstacles = geometric_obstacle_sets(
+            bev, heights, -0.30, (_PLANNER_CELL_BAND,)
+        )[0]
+        near_kerb = np.count_nonzero(
+            np.abs(np.abs(obstacles[:, 0]) - 3.5) < 0.3
+        )
+        assert near_kerb > 20, f"the kerb vanished at a {grade:.0%} grade"
+
+
+def test_the_car_drives_under_a_bridge_rather_than_braking_for_the_soffit() -> None:
+    """
+    The cost of cell-referencing, and what the COARSE ceiling pays it with. A
+    fine cell need not contain the ground under it -- azimuth stripes are 0.81 m
+    apart at 19 m against a 0.4 m cell -- so referencing the ceiling to the fine
+    base makes a soffit its own floor and reads 2.4-3.0 m of bridge as 0.6 m of
+    solid wall. Measured before the coarse reference: free distance 19.0 m.
+    """
+    for grade in (0.0, 0.08):
+        bev, heights = _stripe_sampled_scene(grade, soffit_at=19.0)
+
+        assert _planner_free(bev, heights) == pytest.approx(PLANNER_HORIZON_M), (
+            f"braked for an overhead bridge at a {grade:.0%} grade"
+        )
+
+
+def test_a_wall_still_blocks_on_a_steep_hill() -> None:
+    """The other side of the coarse ceiling: it must not let a real wall through
+    just because the hill it stands on is high above the ego's own plane."""
+    for grade in (0.0, 0.20):
+        bev, heights = _stripe_sampled_scene(grade, wall_at=19.0)
+
+        free = _planner_free(bev, heights)
+        assert free < 20.0, f"missed a wall at a {grade:.0%} grade (free {free})"
+
+
+def test_the_planner_drives_through_a_bush_and_round_a_post() -> None:
+    """
+    Roadside vegetation is a thing to IGNORE, not a thing to steer around. The
+    planner's band was deliberately built without the porosity veto on the
+    reasoning that "the planner should steer around a bush even if AEB should
+    not brake for one", and in practice that made the car flinch at every verge
+    and refuse gaps that were actually open.
+
+    The discriminator is geometric, not semantic, and it is the same one AEB
+    uses: an object of height a at range r hides the ground behind it for
+    r*a/(h - a), so ground returns inside that shadow mean the rays went
+    THROUGH it. A post of the same height as a bush is still an obstacle.
+    """
+    band = ObstacleBand(
+        OBSTACLE_MIN_HEIGHT_M,
+        PLANNER_HORIZON_M,
+        cell_referenced=True,
+        reduce_to_cells=True,
+        porosity=True,
+    )
+    roof = 1.6
+
+    def occupied(bev: np.ndarray, heights: np.ndarray) -> int:
+        found = geometric_obstacle_sets(
+            bev, heights, -0.30, (band,), sensor_height_m=roof
+        )[0]
+        return len(found)
+
+    # Ground the rays get through, plus a see-through clump at 15 m.
+    ground: list[tuple[float, float, float]] = []
+    for forward in np.arange(1.0, 36.0, 0.12):
+        step = max(0.05, float(np.radians(2.45) * forward))
+        for lateral in np.arange(-6.0, 6.01, step):
+            ground.append((float(lateral), float(forward), 0.0))
+    bush = [
+        (float(x), float(y), float(z))
+        for x in np.arange(-0.7, 0.71, 0.06)
+        for y in np.arange(15.0, 15.7, 0.06)
+        for z in np.arange(0.15, 0.65, 0.05)
+        if hash((round(float(x), 2), round(float(y), 2), round(float(z), 2))) % 3
+    ]
+    porous = np.asarray(ground + bush)
+    assert (
+        occupied(
+            porous[:, :2].astype(np.float32),
+            (porous[:, 2] - 0.30).astype(np.float32),
+        )
+        == 0
+    ), "the planner still treats a see-through bush as solid"
+
+    # The same height, but SOLID: it shadows the ground behind it, so the
+    # evidence that vetoed the bush simply is not there.
+    shadow_to = 15.0 + 15.0 * 0.6 / (roof - 0.6)
+    solid = [
+        p
+        for p in ground
+        if not (15.0 < p[1] < shadow_to and abs(p[0]) < 0.4)
+    ] + [
+        (float(x), float(y), float(z))
+        for x in np.arange(-0.15, 0.16, 0.03)
+        for y in np.arange(15.0, 15.31, 0.03)
+        for z in np.arange(0.0, 0.61, 0.03)
+    ]
+    post = np.asarray(solid)
+    assert (
+        occupied(
+            post[:, :2].astype(np.float32),
+            (post[:, 2] - 0.30).astype(np.float32),
+        )
+        > 0
+    ), "a solid post of bush height stopped being an obstacle"
+
+
+def test_reducing_to_cells_keeps_every_place_something_is_standing() -> None:
+    """
+    `PLANNER_MAX_OBSTACLE_POINTS` bounded POINTS over a cloud whose information
+    is CELLS, so the sample landed on a fraction of the occupied cells and
+    overstated free distance -- the unsafe direction. The reduction is complete
+    by construction: one point per occupied cell, and no cell lost.
+    """
+    bev, heights = _stripe_sampled_scene(0.0, wall_at=19.0, kerb_at=3.5)
+    plain = ObstacleBand(
+        OBSTACLE_MIN_HEIGHT_M, PLANNER_HORIZON_M, cell_referenced=True
+    )
+    full, reduced = geometric_obstacle_sets(
+        bev, heights, -0.30, (plain, _PLANNER_CELL_BAND)
+    )
+
+    capped = np.unique(planner._cell_keys(full, OBSTACLE_CELL_M))
+    cells = np.unique(planner._cell_keys(reduced, OBSTACLE_CELL_M))
+
+    # One point per occupied cell, and every cell exactly once.
+    assert len(reduced) == len(cells), "a cell survived twice"
+    # NOTHING the point cap kept is lost -- the reduction is a superset.
+    assert not np.setdiff1d(capped, cells).size, "the reduction dropped a cell"
+    # ...and it recovers the places the cap had deleted. This is the defect,
+    # measured on this very scene: the cap spent 4,000 points covering 127
+    # distinct cells where 218 are occupied, so 42% of the places the planner
+    # knew something was standing were simply absent from the arc scan.
+    assert len(cells) > len(capped), "the cap was not losing anything here"
+    assert len(reduced) < len(full), "the reduction saved nothing"
+
+
+# --- guidance yields to sensing when its own line is blocked ------------------
+#
+# CLAUDE.md has always promised that "guidance never becomes authority ... a
+# blocked arc is never chosen just because the route asked for it -- LiDAR
+# always wins". It was not true. Both lateral terms SATURATE at 2.0 m of error
+# while passing a 1.8 m car needs 2.3-3.0 m of offset, so every way round paid
+# the full weight as a flat toll with no gradient at all -- and against that,
+# the free-distance term can only offer the difference between two clipped
+# values. Measured, with a destination set the planner would not leave the lane
+# at ANY obstacle distance: it drove at the car until free distance crossed
+# STOP_MARGIN_M, then blocked, then reversed.
+
+
+def _open_road_with_a_parked_car(
+    gap_m: float | None, *, road_half: float = 5.5, car_x: float = 1.8
+) -> np.ndarray:
+    """
+    Kerbs 11 m apart and a stopped car in the ego's lane.
+
+    The gap from the car's near flank to the far kerb is 6.4 m against the
+    2.6 m the ego needs, so a pass is unambiguously available -- if the cost
+    stack will let the planner take it.
+    """
+    points: list[tuple[float, float]] = []
+    for forward in np.arange(0.5, 50.0, 0.10):
+        for side in (-1.0, 1.0):
+            points.append((side * road_half, float(forward)))
+    if gap_m is not None:
+        for lateral in np.arange(car_x - 0.9, car_x + 0.9 + 1e-9, 0.08):
+            for forward in np.arange(gap_m, gap_m + 4.5, 0.08):
+                points.append((float(lateral), float(forward)))
+    return np.asarray(points, dtype=np.float32)
+
+
+def _straight_route(count: int = 40, step: float = 3.0) -> RoutePath:
+    return _route([(0.0, index * step) for index in range(count)], half_width=5.5)
+
+
+def test_a_route_still_holds_the_lane_on_a_clear_road() -> None:
+    """
+    The identity guard. The taper is multiplicative and is exactly 1.0 while
+    the reference line is clear, so nothing about ordinary route following
+    changes -- if this fails, the authority is being read off the wrong
+    candidate and lane discipline has been given away.
+    """
+    clear = _open_road_with_a_parked_car(None)
+    # A route 2.5 m to the LEFT of the car, on an ordinary 6 m road. The lane
+    # rule sits the ego 1.5 m right of that centreline, so the target is 1.0 m
+    # left of where the car is now and it must steer for it.
+    offset = _route([(-2.5, index * 3.0) for index in range(40)], half_width=3.0)
+
+    plan = plan_arc(clear, GEOMETRY, lookahead_m=30.0, route=offset)
+
+    assert plan.curvature > 1e-3, "the route stopped pulling the car to its lane"
+    assert plan.free_distance_m == pytest.approx(PLANNER_HORIZON_M)
+
+
+def test_a_stopped_car_in_the_lane_is_passed_even_with_a_route_set() -> None:
+    """
+    The headline. Before the taper this held the lane at every gap and drove
+    into the car; the route's flat 0.9 cross-track toll simply outbid the
+    whole free-distance term.
+    """
+    route = _straight_route()
+
+    for gap in (20.0, 15.0):
+        plan = plan_arc(
+            _open_road_with_a_parked_car(gap),
+            GEOMETRY,
+            lookahead_m=30.0,
+            route=route,
+        )
+        assert plan.free_distance_m > gap + 6.0, (
+            f"drove at the car instead of round it with a {gap:.0f} m gap "
+            f"(free {plan.free_distance_m:.1f} m)"
+        )
+        # ...and it went round the OPEN side, not into the kerb.
+        assert plan.curvature > 0.0
+
+
+def test_keep_right_also_yields_when_its_own_line_is_blocked() -> None:
+    """The same defect without a destination set: keep-right saturates at
+    KEEP_RIGHT_SCALE_M too, so it was the term vetoing the detour."""
+
+    plan = plan_arc(
+        _open_road_with_a_parked_car(15.0),
+        GEOMETRY,
+        lookahead_m=30.0,
+    )
+
+    assert plan.free_distance_m > 21.0
+
+

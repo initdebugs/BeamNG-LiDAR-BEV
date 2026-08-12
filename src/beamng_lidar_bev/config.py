@@ -364,6 +364,33 @@ WORLD_SURFACE_RADIUS_M = 55.0
 # WORLD_RADIUS_M. A hard rim reads as a cliff -- a drawn edge where there is
 # only the end of what the sensors measured.
 WORLD_EDGE_FADE_M = 14.0
+# --- The ground height field the overlays drape on ----------------------------
+#
+# Every overlay -- the AEB corridors, the planned path, the navigation route --
+# used to be drawn at ONE height, the ego's own ground plane extended flat, so
+# on any gradient, crest, dip or camber the drawn road rose straight through it
+# and the guidance vanished under the surface it is guidance ABOUT. The field is
+# a world-anchored raster of the surface actually being drawn, built in the
+# store refresh beside the ground mesh and carried in `_MeshCache`, so `compose`
+# can lift each overlay vertex onto it without touching a store.
+#
+# COARSER than WORLD_CELL_SIZE_M (0.25) on purpose, and by a factor of four.
+# This is a height LOOKUP, not geometry: a road's height varies smoothly at the
+# metre scale (2% camera is 5 cm across a lane) and the overlay only has to
+# clear the surface, so the extra resolution would buy nothing and cost 16x the
+# raster. At 1 m the whole WORLD_ROAD_RADIUS_M disc is ~200x200 cells.
+WORLD_GROUND_FIELD_CELL_M = 1.0
+# How far the field is trusted beyond the cells that were actually observed.
+# Ground returns thin with range and the surface has real holes (occlusion, the
+# shadow behind a kerb), and a ribbon crossing one must not develop a notch --
+# so observation is dilated by this many cells before it decays, and the decay
+# itself is smoothed. Past it the overlay blends back to the ego's ground plane,
+# which is exactly today's behaviour: the fallback is a fade, never an edge.
+WORLD_GROUND_FIELD_FILL_CELLS = 3
+# A guard on the raster, not a tuning knob. The stores are already culled to
+# WORLD_ROAD_RADIUS_M, so a field wider than this means a store bug rather than
+# a big map, and allocating for it would be the wrong answer either way.
+WORLD_GROUND_FIELD_MAX_SPAN_CELLS = 512
 WORLD_POSE_JUMP_RESET_M = 25.0
 WORLD_ACTOR_REGISTRY_INTERVAL_S = 1.0
 WORLD_ACTOR_STATE_INTERVAL_S = 0.1
@@ -962,6 +989,26 @@ GROUND_SAMPLE_STRIDE = 4
 # only genuinely isolated points and never a thing the car could hit.
 OBSTACLE_CELL_M = 0.4
 OBSTACLE_MIN_SUPPORT = 2
+# The neighbourhood a cell-referenced band measures its CEILING from, which is
+# a different question from the floor and cannot share the floor's cell.
+#
+# The floor asks "how high is this return above the ground under it" and wants
+# the tightest local reference there is. The ceiling asks "is this thing
+# overhead", and answering that from the same 0.4 m cell assumes the cell holds
+# a ground return -- which at range it does not. The ground units' azimuth
+# stripes are 0.8-1.2 m apart at 19 m, so a cell can hold a dense overhead
+# surface and no floor at all; its base is then the soffit, and a bridge,
+# gantry, tunnel mouth or tree canopy reads as a 0.6 m solid wall. Measured, a
+# soffit at 2.4-3.0 m with its face at 19 m took the planner's free distance
+# from 35.0 m to 19.0 m.
+#
+# 2.0 m is comfortably wider than the widest stripe spacing inside the
+# planner's horizon, so the neighbourhood catches the ground BESIDE the
+# structure. Larger would start reaching across a whole road and flattening
+# real terrain into the reference; smaller stops being grade-proof for the
+# ceiling and re-opens the "a wall on a steep hill is discarded as overhead"
+# failure the fine cell base was introduced to fix.
+OBSTACLE_COARSE_CELL_M = 2.0
 
 # Added to the ego half-width when testing whether an arc is blocked.
 CLEARANCE_MARGIN_M = 0.35
@@ -1179,6 +1226,24 @@ STEERING_SIGN = -1.0
 # Recovery. Blocked holds first in case the obstruction moves (traffic), and
 # only then reverses.
 BLOCKED_HOLD_S = 1.5
+# Forward travel in DRIVING that counts as "the recovery worked" and resets the
+# attempt counter.
+#
+# Without it MAX_RECOVERY_ATTEMPTS is unreachable and the car reverses for
+# ever. `_enter` reset the counter on every entry to DRIVING, and every reverse
+# recovery buys at least one tick of DRIVING on the way back -- backing 6 m
+# recovers free distance to about 8.5 m, comfortably past
+# STOP_MARGIN_M + RESUME_HYSTERESIS_M -- so the counter was cleared before it
+# could ever reach 3. The recovery is open-loop (a fixed REVERSE_DISTANCE_M
+# back, then the same approach from the same offset at the same heading), so
+# what that produced was an exact limit cycle with zero net progress: reverse,
+# creep forward, block, reverse, for ever, which is the "constantly reversing"
+# complaint in its purest form.
+#
+# 15 m is further than one recovery can hand back (REVERSE_DISTANCE_M is 6),
+# so it cannot be satisfied by the recovery itself -- only by actually getting
+# somewhere.
+RECOVERY_PROGRESS_M = 15.0
 REVERSE_DISTANCE_M = 6.0
 REVERSE_SPEED_MPS = 2.0
 # Reversing needs its own room behind, or the recovery is just a slower crash.

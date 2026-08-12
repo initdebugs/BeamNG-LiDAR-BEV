@@ -48,6 +48,7 @@ from .config import (
     MAX_CORRIDOR_HALF_WIDTH_M,
     MIN_TURN_RADIUS_M,
     OBSTACLE_CELL_M,
+    OBSTACLE_COARSE_CELL_M,
     OBSTACLE_MAX_HEIGHT_M,
     OBSTACLE_MIN_HEIGHT_M,
     OBSTACLE_MIN_SUPPORT,
@@ -95,18 +96,80 @@ class ObstacleBand:
     but the ground underneath them is one measurement, so they are built
     together.
 
-    The two shape tests default OFF, so a band that names only a floor and a
-    horizon behaves exactly as it did before they existed. That is the planner's
-    band: it *should* steer around bushes and kerbs. Only the full-authority
-    brake gets pickier.
+    Every option defaults OFF, so a band that names only a floor and a horizon
+    behaves exactly as it did before any of them existed.
+
+    `cell_referenced` and `min_vertical_extent_m` are DIFFERENT questions and
+    were one flag until it emerged they answer to different consumers.
+    Cell-referencing asks *what is this return standing on* and is what makes a
+    band grade-proof; the extent test asks *how tall is the thing standing
+    there* and is a filter on top. The planner wants the first and not the
+    second -- it should still steer around a kerb and a bush -- while AEB wants
+    both. Note the extent test is provably INERT at any threshold at or below
+    `min_height_m`: a return `min_height_m` above its own cell base puts at
+    least that much spread in the cell, so the floor implies the extent.
     """
 
     min_height_m: float
     horizon_m: float
+    cell_referenced: bool = False
+    """
+    Whether heights are measured from each 0.4 m cell's OWN base rather than
+    from the range-ring ground estimate clamped into the slope cone.
+
+    This is the grade-proofing, and the cone cannot be tuned into it: the clamp
+    is `SLOPE_ALLOWANCE_PER_M` = 1.5%/m, so on ANY road steeper than 1.5% the
+    measured ground rises faster than the floor is allowed to follow and the
+    road surface itself climbs into the obstacle band. Measured on ring-sampled
+    ground, the planner's own band: at a 2% grade the flat empty road produced
+    4000 obstacle returns (the decimation cap) and collapsed free distance from
+    35.0 m to 6.0 m; at 3% to 4.0 m, which IS `STOP_MARGIN_M`, so the controller
+    blocked and reversed; at 5% and beyond, 2.7 m. Referenced to the cell base
+    the same scenes produce zero obstacle returns out to a 20% grade, and kerb
+    detection IMPROVES rather than degrades (1104 kerb returns against 659 at
+    5%, 1880 against 563 at 12%) because the cone had begun swallowing the kerb
+    along with the hill.
+
+    The honest limit, and it is a limit rather than a proof: a cell spans
+    `OBSTACLE_CELL_M * grade` of height along the slope and up to `sqrt(2)`
+    times that across its diagonal, so a steep enough road puts one cell's own
+    spread past `OBSTACLE_MIN_HEIGHT_M` and phantoms return. The arithmetic
+    puts that near 21%; ring-sampled ground measured clean all the way to 30%,
+    because returns inside one cell cluster at similar ranges rather than
+    spanning the full diagonal. Somewhere past there it breaks again -- but the
+    cone broke at 1.5%.
+    """
     min_vertical_extent_m: float = 0.0
     """How tall the thing standing in a cell must be. 0 disables the test."""
     porosity: bool = False
     """Whether see-through candidates are vetoed. See `_porous`."""
+    reduce_to_cells: bool = False
+    """
+    Collapse each occupied cell to its mean instead of sampling POINTS.
+
+    `PLANNER_MAX_OBSTACLE_POINTS` bounds a quantity the cloud does not measure
+    in. A realistic street puts 65,664 returns of the planner's band into 1,922
+    distinct `OBSTACLE_CELL_M` cells -- 34 returns per cell saying the same
+    thing -- and `np.linspace` over the POINTS keeps 4,000 of them landing on
+    just 917 of those cells. So the cap was not thinning a dense cloud, it was
+    deleting **half the places the planner knows something is standing**, and
+    keeping two redundant returns in each of the survivors.
+
+    It fails in the unsafe direction, which is what makes it more than
+    inefficiency. Where a corridor edge cuts a densely populated cell only some
+    of that cell's returns are inside the corridor; keeping one in sixteen by
+    index misses them with high probability and `_scan_arcs` then reports the
+    arc clear to the next blocker. Every error measured was an OVERSTATEMENT of
+    free distance, by up to 17.4 m.
+
+    And it is not a trade against cost -- reducing to cells is *cheaper*, since
+    1,922 cell means are fewer points than the 4,000 the cap allowed.
+
+    Off by default so the AEB band keeps its array byte-identical: AEB counts
+    the `AEB_MIN_HITS`-th nearest return in its corridor, so reducing its cloud
+    to cells changes what its trigger counts and that belongs to its own live
+    checklist, not to this change.
+    """
 
 
 def _as_bev(points: np.ndarray) -> np.ndarray:
@@ -120,6 +183,8 @@ def despeckle(
     points: np.ndarray,
     cell_m: float = OBSTACLE_CELL_M,
     min_support: int = OBSTACLE_MIN_SUPPORT,
+    *,
+    collapse: bool = False,
 ) -> np.ndarray:
     """
     Drop returns with no neighbours, which the arc scan cannot tolerate.
@@ -132,10 +197,26 @@ def despeckle(
 
     Counting is a ``bincount`` over flattened cell indices plus a nine-term box
     sum, so it stays vectorized and runs on the full pre-decimation cloud.
+
+    ``collapse`` additionally reduces every surviving cell to ONE point, its
+    mean. That is a reduction to what the cloud actually knows: the cloud's
+    information content is which 0.4 m cells are occupied, and it carries tens
+    of returns per cell to say so. Reducing here rather than by a point count
+    downstream is what makes the reduction complete instead of a sample -- see
+    the caller. It reuses the grid this function has already built, so it costs
+    three more bincounts over the survivors and no sort at all.
+
+    The mean rather than a representative return: the returns in a cell lie on
+    a SURFACE (a kerb face, a car flank, a wall), so their mean lies on that
+    surface too, and the quantisation error is the spread of the returns across
+    the cell rather than the cell's half-diagonal. A cell holding one return
+    reduces to that return exactly.
     """
     array = np.asarray(points, dtype=np.float32).reshape((-1, 2))
     if len(array) < min_support or min_support <= 1:
-        return array if min_support <= 1 else array[:0]
+        if min_support > 1:
+            return array[:0]
+        return _collapse_cells(array, cell_m) if collapse else array
 
     ix = np.floor(array[:, 0] / cell_m).astype(np.intp)
     iy = np.floor(array[:, 1] / cell_m).astype(np.intp)
@@ -145,9 +226,10 @@ def despeckle(
     height = int(iy.max()) + 1
     # One cell of halo on every side, so the box sum is pure slicing.
     stride = width + 2
-    counts = np.bincount(
-        (iy + 1) * stride + (ix + 1), minlength=(height + 2) * stride
-    ).reshape((height + 2, stride))
+    flat = (iy + 1) * stride + (ix + 1)
+    counts = np.bincount(flat, minlength=(height + 2) * stride).reshape(
+        (height + 2, stride)
+    )
     box = (
         counts[0:height, 0:width]
         + counts[0:height, 1 : width + 1]
@@ -159,7 +241,47 @@ def despeckle(
         + counts[2 : height + 2, 1 : width + 1]
         + counts[2 : height + 2, 2 : width + 2]
     )
-    return array[box[iy, ix] >= min_support]
+    survived = box[iy, ix] >= min_support
+    if not collapse:
+        return array[survived]
+
+    # The grid is already indexed, so the collapse is a bincount over the
+    # survivors' own flat cell indices -- no second floor, no sort.
+    size = (height + 2) * stride
+    kept = flat[survived]
+    occupancy = np.bincount(kept, minlength=size)
+    sum_x = np.bincount(kept, weights=array[survived, 0], minlength=size)
+    sum_y = np.bincount(kept, weights=array[survived, 1], minlength=size)
+    occupied = occupancy > 0
+    return np.column_stack(
+        (
+            sum_x[occupied] / occupancy[occupied],
+            sum_y[occupied] / occupancy[occupied],
+        )
+    ).astype(np.float32)
+
+
+def _collapse_cells(array: np.ndarray, cell_m: float) -> np.ndarray:
+    """`despeckle(collapse=True)` for the degenerate no-support-test case."""
+    if not len(array):
+        return array
+    ix = np.floor(array[:, 0] / cell_m).astype(np.intp)
+    iy = np.floor(array[:, 1] / cell_m).astype(np.intp)
+    ix -= ix.min()
+    iy -= iy.min()
+    stride = int(ix.max()) + 1
+    flat = iy * stride + ix
+    size = (int(iy.max()) + 1) * stride
+    occupancy = np.bincount(flat, minlength=size)
+    sum_x = np.bincount(flat, weights=array[:, 0], minlength=size)
+    sum_y = np.bincount(flat, weights=array[:, 1], minlength=size)
+    occupied = occupancy > 0
+    return np.column_stack(
+        (
+            sum_x[occupied] / occupancy[occupied],
+            sum_y[occupied] / occupancy[occupied],
+        )
+    ).astype(np.float32)
 
 
 def ground_rise(ranges: np.ndarray, above_ego: np.ndarray) -> np.ndarray:
@@ -204,6 +326,30 @@ def ground_rise(ranges: np.ndarray, above_ego: np.ndarray) -> np.ndarray:
     ).astype(np.intp)
     centres = (np.flatnonzero(valid) + 0.5) * GROUND_BIN_M
     return np.interp(ranges, centres, sorted_heights[picks].astype(np.float64))
+
+
+def priced_offset(error_m: np.ndarray, scale_m: float) -> np.ndarray:
+    """
+    Price a lateral error, bounded at 1 but never FLAT.
+
+    Both lateral guidance terms used ``clip((e/s)**2, 0, 1)``, which reaches 1
+    at one scale of error and stays there. Everything past that point costs the
+    same, so the optimiser gets no signal at all distinguishing 2.2 m of
+    deviation from 3.6 m -- and the manoeuvres that matter live entirely out
+    there: passing a 1.8 m car needs 2.3-3.0 m, and recovering a lane after one
+    needs however far it has drifted. Traced in the closed loop, that is
+    exactly how the car stalled: the keep-right target correctly moved to the
+    open side of a parked car and the car, 3.6 m away from it, felt a constant
+    force and never converged.
+
+    ``e^2 / (e^2 + s^2)`` is the same bound and the same near-field shape -- for
+    e << s it IS ``(e/s)^2`` to first order, so ordinary lane discipline is
+    unchanged -- but it approaches its bound asymptotically, so the gradient
+    survives at every offset. Half cost at exactly one scale, against the old
+    form's full cost.
+    """
+    squared = np.square(np.asarray(error_m, dtype=np.float64) / float(scale_m))
+    return squared / (squared + 1.0)
 
 
 def geometric_obstacles(
@@ -335,7 +481,49 @@ def _cell_profile(
             np.bincount(index, weights=points[:, 1], minlength=len(starts)),
         )
     ) / counts[:, None]
-    return index, lows, highs - lows, centre
+    return index, lows, highs - lows, centre, unique_cells
+
+
+def _coarse_base(
+    unique_cells: np.ndarray, lows: np.ndarray, cell_m: float, coarse_m: float
+) -> np.ndarray:
+    """
+    Per fine cell, the lowest return anywhere in its COARSE neighbourhood.
+
+    The ceiling's reference, and it has to be a different question from the
+    floor's. Referencing the ceiling to the fine cell's own base assumes the
+    cell contains the ground under it -- and at range it does not: the ground
+    units' azimuth stripes are 0.8-1.2 m apart at 19 m against a 0.4 m cell, so
+    a cell can hold a dense overhead surface and no ground at all. Its base is
+    then the SOFFIT, everything above reads as 0.0-0.6 m of solid object, and a
+    bridge, a gantry, a tunnel mouth or a tree canopy becomes a wall across the
+    road. Measured on ring-and-stripe-sampled ground, a soffit 2.4-3.0 m up
+    with its face at 19 m took the planner's free distance from 35.0 m to
+    19.0 m; the same scene reads 35.0 m again against the coarse reference.
+
+    A coarse cell is wide enough to catch the ground BESIDE the structure, so
+    the soffit measures its true 2.4 m and falls outside `OBSTACLE_MAX_HEIGHT_M`
+    as it should. It is still local, so a wall standing on a steep hill keeps
+    the property the fine base was introduced for -- its neighbourhood ground
+    is the hillside, not the ego's plane.
+
+    Derived from the fine profile rather than from a second pass over the
+    cloud: it is a minimum over `unique_cells`, of which a street scene holds a
+    couple of thousand against a hundred thousand returns.
+    """
+    if not len(unique_cells):
+        return lows
+    half = _CELL_FIELD >> 1
+    ix = unique_cells // _CELL_FIELD - half
+    iy = unique_cells % _CELL_FIELD - half
+    ratio = max(int(round(coarse_m / cell_m)), 1)
+    coarse_key = np.floor_divide(ix, ratio) * _CELL_FIELD + np.floor_divide(
+        iy, ratio
+    )
+    _, inverse = np.unique(coarse_key, return_inverse=True)
+    floor = np.full(int(inverse.max()) + 1, np.inf)
+    np.minimum.at(floor, inverse, lows)
+    return floor[inverse]
 
 
 def _porous(
@@ -506,24 +694,41 @@ def geometric_obstacle_sets(
     # makes them independent of the slope clamp in both directions -- see
     # `_cell_profile`.
     cell = None
-    if any(band.min_vertical_extent_m > 0.0 for band in bands):
+    coarse = None
+    if any(
+        band.cell_referenced or band.min_vertical_extent_m > 0.0
+        for band in bands
+    ):
         cell = _cell_profile(points, above)
 
     sets: list[np.ndarray] = []
     for band in bands:
-        if band.min_vertical_extent_m > 0.0 and cell is not None:
-            index, cell_base, cell_extent, cell_centre = cell
-            # Heights measured from the CELL's own base rather than from the
-            # clamped ground estimate, so a gradient moves the floor and the
-            # ceiling together and neither can be fooled by one.
+        cell_path = (
+            band.cell_referenced or band.min_vertical_extent_m > 0.0
+        ) and cell is not None
+        if cell_path:
+            index, cell_base, cell_extent, cell_centre, unique_cells = cell
+            # The FLOOR is measured from the cell's own base, so a gradient
+            # moves it with the road and no cone has to guess how steep the
+            # road is allowed to be.
             local = above - cell_base[index]
-            tall_enough = cell_extent >= band.min_vertical_extent_m
+            # The CEILING is measured from a COARSE neighbourhood's base, which
+            # is a different question and needs a different answer -- see
+            # `_coarse_base`. A fine cell need not contain the ground under it,
+            # and where it does not, referencing the ceiling to it turns every
+            # overhead structure into a wall.
+            if coarse is None:
+                coarse = _coarse_base(
+                    unique_cells, cell_base, OBSTACLE_CELL_M, OBSTACLE_COARSE_CELL_M
+                )
+            overhead = above - coarse[index]
             selected = (
                 (ranges <= band.horizon_m)
-                & tall_enough[index]
                 & (local >= band.min_height_m)
-                & (local <= OBSTACLE_MAX_HEIGHT_M)
+                & (overhead <= OBSTACLE_MAX_HEIGHT_M)
             )
+            if band.min_vertical_extent_m > 0.0:
+                selected &= (cell_extent >= band.min_vertical_extent_m)[index]
             # Both shape tests only ever REMOVE candidates, so neither can
             # invent an obstacle. That is what makes them safe to add under a
             # full-authority brake, and why the live checklist only has to
@@ -562,8 +767,14 @@ def geometric_obstacle_sets(
             )
         # Despeckled before decimation: decimating first would thin real
         # surfaces toward the support threshold and make the filter's verdict
-        # depend on the cloud size.
-        obstacles = despeckle(points[selected])
+        # depend on the cloud size. The cell collapse rides inside the same
+        # call for the same reason, and reuses the grid it has already built.
+        obstacles = despeckle(
+            points[selected], collapse=band.reduce_to_cells
+        )
+        # Still a backstop after the collapse, not the primary bound: a cell
+        # reduction over a 35 m band lands near two thousand points, so this
+        # only fires on a band far larger than any consumer asks for.
         if len(obstacles) > PLANNER_MAX_OBSTACLE_POINTS:
             # Evenly spaced indices, matching the decimation the display uses:
             # an integer stride would halve the output the moment the count
@@ -986,13 +1197,19 @@ def plan_arc(
             else:
                 x1, y1, theta1 = ends[index]
                 cos_t, sin_t = np.cos(theta1), np.sin(theta1)
-                # Half-decimated cloud for the deferred scans: kerb and wall
-                # returns arrive as dense lines, so every second point still
-                # samples them far finer than the collision corridor is wide.
-                # The immediate family keeps the full cloud.
-                sparse = scan_points[::2]
-                dx = sparse[:, 0] - np.float32(x1)
-                dy = sparse[:, 1] - np.float32(y1)
+                # The deferred families scan the SAME cloud the immediate one
+                # does. They used to take every second point, which was
+                # affordable when the cloud was a 4,000-point sample of the
+                # returns; against a cell-reduced cloud it is a second stride
+                # through a set where every point is a distinct occupied cell,
+                # so it would delete half the places something is standing --
+                # and it would do it to precisely the candidates that decide
+                # "the turn comes later", which is corner-entry braking and
+                # gap commitment, the weakest possible place for the weakest
+                # evidence. The reduction already made the cloud smaller than
+                # the old half-decimated one, so this costs nothing.
+                dx = scan_points[:, 0] - np.float32(x1)
+                dy = scan_points[:, 1] - np.float32(y1)
                 # Rotate by -theta1: express the cloud in segment A's endpoint
                 # frame so segment B is a plain arc scan again.
                 local = np.column_stack(
@@ -1032,39 +1249,6 @@ def plan_arc(
                 float(MAX_CORRIDOR_HALF_WIDTH_M),
             )
 
-    required_free = (
-        REQUIRED_FREE_DISTANCE_M
-        if required_free_m is None
-        else float(required_free_m)
-    )
-    smoothness = (
-        COST_SMOOTHNESS if smoothness_weight is None else float(smoothness_weight)
-    )
-    # Free distance is scored against what the braking envelope actually needs,
-    # not against the horizon: 20 m of clear road is not worse than 35 m, and
-    # treating it as worse is what makes a planner refuse to ever turn.
-    cost = COST_FREE_DISTANCE * np.clip(
-        1.0 - free_all / required_free, 0.0, 1.0
-    )
-    cost = cost + COST_CLEARANCE * (
-        1.0
-        - np.clip(
-            (clear_all - collision_half_width) / DESIRED_CLEARANCE_M, 0.0, 1.0
-        )
-    )
-    # Smoothness scores the eventual curvature change identically in every
-    # family. A deferral discount would make "turn later" always cheaper than
-    # "turn now", and under per-tick re-planning "later" never arrives -- so
-    # deferral must win on geometry (an immediate turn collides, a deferred one
-    # does not), never on comfort. Also the tie-break that keeps an empty scene
-    # pointing straight ahead: ties resolve to the first row, the immediate fan.
-    cost = cost + smoothness * (
-        ((curvatures - k0) / MAX_CURVATURE) ** 2
-    )[None, :]
-    # The deferral tie-break: near-equal plans act now rather than promising a
-    # turn that per-tick re-planning would keep postponing.
-    cost = cost + COST_TRANSITION * (d1_array / max(d1_array[-1], 1.0))[:, None]
-
     def _family_offsets() -> np.ndarray:
         """
         Candidate lateral offsets at the lookahead, per family.
@@ -1100,37 +1284,115 @@ def plan_arc(
             * np.maximum(lookahead - d1_array, 0.0)[:, None]
         )
 
-    def _family_endpoints() -> tuple[np.ndarray, np.ndarray]:
+    def _pose_at(d1: float, distance_m: float) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray
+    ]:
         """
-        EXACT composite-path endpoints at the lookahead, per family.
+        EXACT composite-path pose ``(x, y, heading)`` after `distance_m`, for
+        one family, per candidate.
 
         The route terms need real positions, not the small-angle offsets:
         matching an approximated endpoint against a curved reference is what
         let candidates cut a 90-degree bend by seven metres in the closed
         loop, because at a mid-corner lookahead the straight-line model
-        cannot represent where a curved path actually ends up.
+        cannot represent where a curved path actually ends up. The third
+        segment needs the same thing at its own distances.
         """
+        if d1 >= distance_m:
+            # Still on segment A: one pose for the whole row.
+            ax, ay, atheta = _arc_endpoint(k0, distance_m)
+            return (
+                np.full(arc_count, ax),
+                np.full(arc_count, ay),
+                np.full(arc_count, atheta),
+            )
+        remaining = distance_m - d1
+        local_x = -(1.0 - np.cos(safe * remaining)) / safe
+        local_y = np.sin(safe * remaining) / safe
+        if d1 <= 0.0:
+            return local_x, local_y, curvatures * remaining
+        x1, y1, theta1 = ends[families.index(d1)]
+        cos_t, sin_t = np.cos(theta1), np.sin(theta1)
+        return (
+            x1 + cos_t * local_x - sin_t * local_y,
+            y1 + sin_t * local_x + cos_t * local_y,
+            theta1 + curvatures * remaining,
+        )
+
+    def _family_endpoints() -> tuple[np.ndarray, np.ndarray]:
+        """The composite endpoints at the lookahead, per family."""
         end_x = np.empty((len(families), arc_count))
         end_y = np.empty((len(families), arc_count))
         for index, d1 in enumerate(families):
-            if d1 >= lookahead:
-                # Still on segment A at the lookahead: one point per row.
-                ax, ay, _ = _arc_endpoint(k0, lookahead)
-                end_x[index] = ax
-                end_y[index] = ay
-                continue
-            remaining = lookahead - d1
-            local_x = -(1.0 - np.cos(safe * remaining)) / safe
-            local_y = np.sin(safe * remaining) / safe
-            if d1 <= 0.0:
-                end_x[index] = local_x
-                end_y[index] = local_y
-            else:
-                x1, y1, theta1 = ends[index]
-                cos_t, sin_t = np.cos(theta1), np.sin(theta1)
-                end_x[index] = x1 + cos_t * local_x - sin_t * local_y
-                end_y[index] = y1 + sin_t * local_x + cos_t * local_y
+            end_x[index], end_y[index], _ = _pose_at(d1, lookahead)
         return end_x, end_y
+
+    required_free = (
+        REQUIRED_FREE_DISTANCE_M
+        if required_free_m is None
+        else float(required_free_m)
+    )
+    smoothness = (
+        COST_SMOOTHNESS if smoothness_weight is None else float(smoothness_weight)
+    )
+
+    # Free distance is scored against what the braking envelope actually needs,
+    # not against the horizon: 20 m of clear road is not worse than 35 m, and
+    # treating it as worse is what makes a planner refuse to ever turn.
+    cost = COST_FREE_DISTANCE * np.clip(
+        1.0 - free_all / required_free, 0.0, 1.0
+    )
+    cost = cost + COST_CLEARANCE * (
+        1.0
+        - np.clip(
+            (clear_all - collision_half_width) / DESIRED_CLEARANCE_M, 0.0, 1.0
+        )
+    )
+    # Smoothness scores the eventual curvature change identically in every
+    # family. A deferral discount would make "turn later" always cheaper than
+    # "turn now", and under per-tick re-planning "later" never arrives -- so
+    # deferral must win on geometry (an immediate turn collides, a deferred one
+    # does not), never on comfort. Also the tie-break that keeps an empty scene
+    # pointing straight ahead: ties resolve to the first row, the immediate fan.
+    cost = cost + smoothness * (
+        ((curvatures - k0) / MAX_CURVATURE) ** 2
+    )[None, :]
+    # The deferral tie-break: near-equal plans act now rather than promising a
+    # turn that per-tick re-planning would keep postponing.
+    cost = cost + COST_TRANSITION * (d1_array / max(d1_array[-1], 1.0))[:, None]
+
+    def _guidance_authority(reference: int) -> float:
+        """
+        How much say the lateral GUIDANCE gets, given how blocked its own line
+        is. 1.0 when the reference line is clear; 0.0 when it is a wall.
+
+        This is what makes CLAUDE.md's standing promise -- "guidance never
+        becomes authority ... a blocked arc is never chosen just because the
+        route asked for it, LiDAR always wins" -- true rather than merely
+        intended. It was measurably false. Both lateral terms saturate: the
+        route cross-track clips at ROUTE_XTRACK_SCALE_M (2.0 m) and keep-right
+        at KEEP_RIGHT_SCALE_M (2.0 m), while passing a 1.8 m car needs 2.3-3.0 m
+        of offset. So every way round sat in the clipped region, paid the full
+        weight, and -- worse -- got NO GRADIENT: 2.2 m of offset and 3.5 m of
+        offset cost exactly the same. Against that flat toll the free-distance
+        term can only ever offer the difference between two clipped values.
+
+        Measured on a 7.2 m kerbed road with a stopped car in the lane and the
+        left lane empty: with no destination set the planner went round at
+        every gap from 10 to 20 m (free 35.0 m); with a straight route down the
+        lane it went round at NO gap at all -- it drove at the car until free
+        distance crossed STOP_MARGIN_M, then blocked, then reversed. That one
+        table is "navigate around objects", "go for the clear paths" and a good
+        share of "constantly reversing".
+
+        The reference line is the candidate that best obeys the guidance, so
+        the question asked is exactly "is the line you are being told to hold
+        actually open?". Multiplicative and exactly 1.0 while that line is
+        clear, so a clear road is scored bit-for-bit as before.
+        """
+        return float(
+            np.clip(free_all[0, reference] / max(required_free, 1e-6), 0.0, 1.0)
+        )
 
     keep_right_target: float | None = None
     route_heading_out: float | None = None
@@ -1167,9 +1429,7 @@ def plan_arc(
             cross = (px - route_pts[nearest, 0]) * np.cos(theta_n) + (
                 py - route_pts[nearest, 1]
             ) * np.sin(theta_n)
-            return np.clip(
-                ((cross - lane) / ROUTE_XTRACK_SCALE_M) ** 2, 0.0, 1.0
-            )
+            return priced_offset(cross - lane, ROUTE_XTRACK_SCALE_M)
 
         # Conformance is the MEAN priced deviation over samples along each
         # candidate's composite path. One endpoint cannot measure a path
@@ -1206,7 +1466,14 @@ def plan_arc(
                     px = x1 + cos_t * local_x - sin_t * local_y
                     py = y1 + sin_t * local_x + cos_t * local_y
                 ribbon[index] += _priced_deviation(px, py)
-        cost = cost + COST_ROUTE_XTRACK * ribbon / ROUTE_MATCH_SAMPLES
+        ribbon = ribbon / ROUTE_MATCH_SAMPLES
+        # The reference line is the immediate-family candidate that conforms
+        # best -- the one the route is effectively asking for. Both route terms
+        # take the same authority, because they are two halves of one
+        # instruction ("be on the ribbon, pointing along it") and tapering only
+        # one would leave the other vetoing the detour on its own.
+        authority = _guidance_authority(int(np.argmin(ribbon[0])))
+        cost = cost + authority * COST_ROUTE_XTRACK * ribbon
 
         # The tangent term: each candidate's EXACT endpoint matched to its
         # nearest route sample, compared there -- never at one fixed arc
@@ -1217,7 +1484,7 @@ def plan_arc(
         dx = end_x[..., None] - route_pts[None, None, :, 0]
         dy = end_y[..., None] - route_pts[None, None, :, 1]
         nearest_end = np.argmin(dx * dx + dy * dy, axis=-1)
-        cost = cost + COST_ROUTE_HEADING * (
+        cost = cost + authority * COST_ROUTE_HEADING * (
             (_composite_headings() - route_theta[nearest_end])
             / (MAX_CURVATURE * lookahead)
         ) ** 2
@@ -1237,11 +1504,13 @@ def plan_arc(
                     target, left_edge + half_width + KEEP_RIGHT_MARGIN_M
                 )
             keep_right_target = float(target)
-            cost = cost + COST_KEEP_RIGHT * np.clip(
-                ((_family_offsets() - keep_right_target) / KEEP_RIGHT_SCALE_M)
-                ** 2,
-                0.0,
-                1.0,
+            offsets = _family_offsets()
+            priced = priced_offset(offsets - keep_right_target, KEEP_RIGHT_SCALE_M)
+            # Tapered by the same rule as the route terms, and for the same
+            # reason: keep-right saturates at KEEP_RIGHT_SCALE_M too, so with
+            # no destination set it is the term that vetoes a detour.
+            cost = cost + _guidance_authority(int(np.argmin(priced[0]))) * (
+                COST_KEEP_RIGHT * priced
             )
 
     if nav_heading_rad is not None and route is None:

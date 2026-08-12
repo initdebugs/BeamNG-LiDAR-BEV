@@ -448,7 +448,13 @@ def test_engaging_self_driving_actuates_the_vehicle() -> None:
 
 
 def test_it_brakes_rather_than_driving_blind_when_no_returns_arrive() -> None:
-    """An empty cloud looks exactly like a clear road. It must not be trusted."""
+    """
+    An empty cloud looks exactly like a clear road. It must not be trusted.
+
+    What this pins is the safety property itself: a blind tick plans zero
+    free distance, lifts off and brakes. The MODE it reports is the
+    controller's business and is pinned in test_controller.
+    """
     worker, frames = _armed_worker([EmptyLidarStub() for _ in range(4)])
     worker.set_self_driving(True)
 
@@ -456,9 +462,10 @@ def test_it_brakes_rather_than_driving_blind_when_no_returns_arrive() -> None:
 
     plan = frames[0].plan
     assert plan is not None
-    assert plan.command.mode == "BLOCKED"
+    assert plan.arc.free_distance_m == 0.0
     assert plan.command.throttle == 0.0
     assert plan.command.brake > 0.0
+    assert plan.command.mode == "BLOCKED"
 
 
 def test_engaging_is_refused_without_an_attached_vehicle() -> None:
@@ -749,7 +756,8 @@ def test_a_blind_tick_plans_blocked_even_with_a_full_memory() -> None:
     plan = frames[0].plan
     assert plan is not None
     assert plan.arc.free_distance_m == 0.0
-    assert plan.command.mode == "BLOCKED"
+    assert plan.command.throttle == 0.0
+    assert plan.command.brake > 0.0
 
 
 def test_a_sparse_road_mask_builds_no_grid() -> None:

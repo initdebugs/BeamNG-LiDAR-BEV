@@ -514,3 +514,142 @@ def test_a_ninety_degree_corner_is_driven_without_blocking(
     assert result["distance_m"] > 280.0
     assert result["closest_m"] > 1.0  # never scraping the kerb
     assert result["peak_lateral"] <= MAX_LATERAL_ACCEL_MPS2
+
+
+# --- getting past something in the lane --------------------------------------
+
+
+def _drive_past_a_parked_car(
+    seconds: float, *, road_half: float = 4.0, car_x: float = 1.4
+) -> dict[str, object]:
+    """
+    A stopped car in the ego's lane on an 8 m road, and enough room to pass.
+
+    Closed loop rather than a single `plan_arc`, because committing to a pass
+    is a decision the planner has to keep MAKING: the free-distance reward, the
+    guidance taper and the per-tick re-plan all interact, and a planner that
+    commits and then changes its mind on the next tick reads as a swerve rather
+    than an overtake.
+    """
+    world = _kerbs_at(road_half, 400.0)
+    car = np.asarray(
+        [
+            (x, y)
+            for x in np.arange(car_x - 0.9, car_x + 0.9 + 1e-9, 0.08)
+            for y in np.arange(60.0, 64.5, 0.08)
+        ]
+    )
+    world = np.concatenate((world, car))
+
+    controller = DrivingController()
+    pos = np.zeros(2)
+    psi = np.pi / 2
+    speed = 0.0
+    modes: list[str] = []
+    closest = np.inf
+    for _ in range(int(seconds / _DT)):
+        forward = np.asarray((np.cos(psi), np.sin(psi)))
+        right = np.asarray((np.sin(psi), -np.cos(psi)))
+        rel = world - pos
+        bev = np.column_stack((rel @ right, rel @ forward))
+        obstacles = bev[np.hypot(bev[:, 0], bev[:, 1]) <= 35.0]
+
+        plan = plan_arc(
+            obstacles,
+            GEOMETRY,
+            previous_curvature=controller.current_curvature,
+            lookahead_m=min(30.0, max(16.0, 2.8 * abs(speed))),
+        )
+        command = controller.step(
+            plan,
+            speed,
+            _DT,
+            rear_free_distance_m=rear_free_distance(obstacles, GEOMETRY),
+            reported_gear="D",
+            heading_rad=psi,
+        )
+        curvature = (command.steering / STEERING_SIGN) * _K_MAX
+        speed = max(
+            0.0, speed + (command.throttle * 3.5 - command.brake * 6.0 - 0.1) * _DT
+        )
+        psi += speed * curvature * _DT
+        pos = pos + np.asarray((np.cos(psi), np.sin(psi))) * speed * _DT
+        modes.append(command.mode)
+        if len(car):
+            closest = min(closest, float(np.hypot(*(car - pos).T).min()))
+    return {
+        "modes": modes,
+        "position": pos,
+        "closest_m": closest,
+        "speed": speed,
+    }
+
+
+def _kerbs_at(half_road: float, length_m: float) -> np.ndarray:
+    ys = np.arange(0.0, length_m, 0.5)
+    return np.concatenate(
+        [
+            np.column_stack((np.full_like(ys, -half_road), ys)),
+            np.column_stack((np.full_like(ys, half_road), ys)),
+        ]
+    )
+
+
+def test_a_parked_car_is_driven_around_rather_than_reversed_away_from() -> None:
+    """
+    Four of the user's six complaints meet here: navigating round an object,
+    going for the clear path, not reversing, and using the evidence rather
+    than a 4,000-point sample of it. Before this work the car drove up to the
+    parked car, blocked, and began the reverse recovery -- and with a
+    destination set it did that at EVERY obstacle distance, because the
+    saturated route cross-track term outbid the whole free-distance term.
+
+    A wide road on purpose. The narrow case is a separate, still-open defect
+    and has its own xfail below; keeping them apart is what stops this test
+    silently becoming a test of the candidate model rather than of the cost
+    stack.
+    """
+    result = _drive_past_a_parked_car(30.0, road_half=5.5, car_x=4.4)
+
+    assert set(result["modes"]) == {"DRIVING"}
+    # The car sits at 60-64.5 m; this is well past it and still going.
+    assert float(result["position"][1]) > 200.0
+    assert float(result["speed"]) > 8.0
+    # ...and it did not scrape by: the ego half-width is 0.9 m.
+    assert float(result["closest_m"]) > 1.5
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "The candidate model cannot represent a lane change: every candidate is "
+        "hold-then-bend with the bend held to the horizon, so on a 7 m road the "
+        "only line clearing a parked car is scored against the kerb it then runs "
+        "into (measured at a 24 m gap: in-lane blocked by the car at 24.3 m, the "
+        "clearing arc by the opposite kerb at 24.8 m). An S-curve family -- bend "
+        "out, bend back -- WAS built and measured: it fixes this case, and it "
+        "breaks the pocket escape below, taking it from 92.55 m clear to -4.61 m. "
+        "The sustained free distance quietly penalises a hard turn in a confined "
+        "space, and the S erases that; capping it removes the benefit instead. "
+        "Landing it safely needs the planner to COMMIT to the manoeuvre, because "
+        "under per-tick re-planning the car drives the outbound half for ever and "
+        "the return leg never arrives -- the deferred-family trap in a new place."
+    ),
+)
+def test_a_parked_car_on_an_ordinary_road_is_passed() -> None:
+    """
+    The narrow case, and the one the candidate model could not do at all.
+    Every candidate was hold-then-bend with the bend held to the horizon,
+    so on a 7 m road the only line clearing a parked car was scored against
+    the kerb it then ran into: measured at a 24 m gap, the in-lane arc was
+    blocked by the car at 24.3 m and the clearing arc by the opposite kerb
+    at 24.8 m. Nothing rewarded going round. What it takes is an S -- bend
+    out, bend back -- which is the manoeuvre a driver actually makes, and
+    which is not in the candidate set. See the xfail reason above for why the
+    S was built, measured, and not landed.
+    """
+    result = _drive_past_a_parked_car(30.0, road_half=3.5, car_x=2.4)
+
+    assert set(result["modes"]) == {"DRIVING"}
+    assert float(result["position"][1]) > 90.0
+    assert float(result["closest_m"]) > 1.1

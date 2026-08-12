@@ -1131,11 +1131,51 @@ class BeamNgWorker(QObject):
                             heights,
                             geometry.ground_z_vehicle,
                             (
-                                # The planner's band is unchanged, and the two
-                                # shape tests are deliberately off for it: it
-                                # SHOULD steer around a kerb and around a bush.
+                                # The planner is CELL-REFERENCED like AEB, and
+                                # for the same reason: the slope cone bounds
+                                # the ground estimate at 1.5%/m, so on any road
+                                # steeper than that the surface itself climbed
+                                # into the band -- measured, a 2% grade took
+                                # free distance from 35 m to 6 m and a 3% grade
+                                # to exactly STOP_MARGIN_M, which is the blocked
+                                # entry and then the reverse recovery. That is
+                                # most of "it brakes for hills" AND most of "it
+                                # keeps reversing", from one clamp.
+                                #
+                                # POROSITY IS ON for the planner too, which
+                                # reverses a deliberate old choice. The
+                                # reasoning was "the planner should steer
+                                # around a bush even though AEB should not
+                                # brake for one" -- but a bush is not a thing
+                                # to steer around, it is a thing to ignore, and
+                                # treating every roadside shrub and grass tuft
+                                # as a wall is what makes the car flinch at
+                                # verges and refuse gaps that are actually
+                                # open. The test is the same one AEB uses and
+                                # it is geometric, not semantic: an object of
+                                # height a at range r hides the ground behind
+                                # it for r*a/(h - a), so ground returns inside
+                                # that shadow mean the rays went THROUGH.
+                                #
+                                # Its safety property carries over unchanged
+                                # and is derived rather than imposed: a >= h
+                                # makes the shadow infinite and the evidence
+                                # window empty, so nothing as tall as the roof
+                                # unit can ever be vetoed. Kerbs, walls, cars
+                                # and people are untouched; only see-through
+                                # things are dropped. It can only ever REMOVE
+                                # candidates, so it cannot invent an obstacle.
+                                #
+                                # The extent test stays OFF -- it is provably
+                                # inert at or below OBSTACLE_MIN_HEIGHT_M, and
+                                # any value above that deletes kerbs, which are
+                                # what keep the car on the tarmac.
                                 ObstacleBand(
-                                    OBSTACLE_MIN_HEIGHT_M, PLANNER_HORIZON_M
+                                    OBSTACLE_MIN_HEIGHT_M,
+                                    PLANNER_HORIZON_M,
+                                    cell_referenced=True,
+                                    reduce_to_cells=True,
+                                    porosity=True,
                                 ),
                                 ObstacleBand(
                                     AEB_OBSTACLE_MIN_HEIGHT_M,

@@ -85,6 +85,48 @@ mid-reverse; and one spot check that the AEB metric never leaves ARMED on the st
 drive with everything engaged — its inputs are untouched by construction (memory never reaches
 it), so this is a confirmation, not a checklist re-run.
 
+The **2026-08-11 driving and overlay work has not been live-checked at all**, and its checklist is
+below. Everything in it was measured offline against synthetic clouds, which can pin arithmetic
+and cannot pin what the simulator actually returns.
+
+- **Hills, and this is the one to do first.** Drive a 3–10% grade with self-driving on. Before,
+  the road surface itself entered the planner's obstacle band above ~2% and free distance
+  collapsed to `STOP_MARGIN_M`, so the car braked, blocked and reversed on any real incline. It
+  should now hold the speed cap up a hill with `Drive:` reporting a free distance near the
+  horizon. **The one thing that could make this worse rather than better** is within-cell height
+  dispersion on genuinely flat tarmac: the floor is now measured from each 0.4 m cell's own base,
+  so if the real cloud carries more than a couple of centimetres of scatter inside one cell the
+  planner will start inventing obstacles on the flat. Watch the free distance on a flat empty
+  stretch before trusting the hill.
+- **Bridges, gantries and tunnel mouths.** Drive under one. The coarse ceiling
+  (`OBSTACLE_COARSE_CELL_M`) is what stops a soffit reading as a wall now that the floor is
+  cell-referenced, and it is the fix with the least offline evidence behind it because it depends
+  on the real azimuth stripe spacing at range. A wall must still stop the car, on a hill as well
+  as on the flat.
+- **Reversing.** The counter that ends the recovery was unreachable, so confirm that a genuinely
+  stuck car now reaches STUCK and hands back instead of cycling for ever — and, much more
+  importantly, that ordinary driving reverses far LESS often than it did, because the gradient
+  phantom that caused most of it is gone.
+- **Going round something.** Park a car in the lane and drive at it, with and without a
+  destination set. With a route set it previously would not leave the lane at any distance. On a
+  wide road it should now pass; on an ordinary 7 m road it is still expected to stop, which is a
+  known open defect in the candidate model, not a regression.
+- **Verges, grass and scrub.** Drive close to roadside vegetation. The planner now applies the
+  porosity veto, so a see-through bush should be driven past without a flinch while a post, a
+  kerb and a wall still block. The thing to watch for is the opposite failure: something solid
+  that the sensors happen to see past being ignored. Nothing as tall as the roof unit can be
+  vetoed at all, so the risk is confined to objects under ~1.6 m.
+- **The overlays.** On a hilly map with self-driving and both AEB systems engaged, confirm the
+  AEB rails, the brake-now bar, the threat reticle, the plan ribbon and the dashed route all lie
+  ON the road over a climb, a crest and a dip and through a corner's camber; that the reticle
+  stands upright and full height on a slope; that the rear corridor drapes on the ground BEHIND
+  while reversing up a ramp; and that the route dashes follow the terrain past the end of the
+  surfaced ground — that last one is the navgraph-Z fallback, the only part with no offline proof
+  that the node Z really is road-surface height on this BeamNG version.
+- **AEB is touched in exactly one way** — the coarse ceiling, which only ever removes candidates
+  — so its checklist below does not need re-running, but the confirmation that it still fires on a
+  wall and a stopped car does.
+
 AEB has its own live checklist, and the phantom-braking half of it is the part the offline suite
 cannot reach. Two of its cases now have dedicated geometry behind them and both need re-proving on
 a real map: **a gradient** (drive a hill at 40–70 km/h and reverse up a driveway ramp — the vertical
@@ -984,6 +1026,201 @@ into a real `WorldView`. Any claim about what the renderer does should be measur
 rather than reasoned about — the `Fog` block sat in the QML for a long time doing nothing, under
 a comment saying it might.
 
+### The planner's band is CELL-REFERENCED, and that is most of the hill fix (2026-08-11)
+
+**The slope cone bounds the ground estimate at 1.5%/m, so on any road steeper than 1.5% the road
+surface itself climbed into the planner's obstacle band.** `SLOPE_ALLOWANCE_PER_M` is 0.015, and
+`geometric_obstacle_sets` clamps the measured `ground_rise` into that cone — so the floor is only
+ever allowed to follow a 1.5% grade, and everything steeper reads as a wall standing on the road.
+Measured on ring-sampled ground, the planner's own band, free distance on an empty graded road:
+
+| grade | obstacle returns | free distance |
+|---|---|---|
+| 0% | 0 | 35.0 m (clear) |
+| **2%** | 4000 (the cap) | **6.0 m** |
+| **3%** | 4000 | **4.0 m — which IS `STOP_MARGIN_M`** |
+| 5–30% | 4000 | 2.7 m |
+
+At 3% the controller blocks, holds, and reverses. That is "it brakes for hills/inclines" AND a
+large share of "it constantly reverses", from one clamp — and `planning_map` then remembers the
+phantom, whose odometer cannot advance while the car sits braked in front of it.
+
+The planner band now sets `ObstacleBand.cell_referenced`, the same machinery that already made
+AEB grade-proof: heights are measured from each `OBSTACLE_CELL_M` cell's OWN base. The same
+scenes then produce **zero** obstacle returns to a 30% grade, and kerb detection *improves*
+(1104 kerb returns against 659 at 5%, 1880 against 563 at 12%) because the cone had begun
+swallowing the kerb along with the hill. `cell_referenced` is a separate field from
+`min_vertical_extent_m` because they answer to different consumers — the planner wants the
+grade-proofing and NOT the extent filter, since it should still steer around a kerb and a bush.
+Note the extent test is provably **inert** at any threshold at or below `min_height_m`: a return
+that high above its own cell base puts at least that much spread in the cell.
+
+**The ceiling needs a COARSER reference than the floor, and finding that out cost a regression.**
+Referencing the ceiling to the fine cell assumes the cell contains the ground under it, and at
+range it does not — the ground units' azimuth stripes are 0.8–1.2 m apart at 19 m against a 0.4 m
+cell. A cell can therefore hold a dense overhead surface and no floor at all, its base becomes the
+soffit, and a bridge reads as a 0.6 m wall across the road: measured, a soffit at 2.4–3.0 m with
+its face at 19 m took free distance from 35.0 m to **19.0 m**. `_coarse_base` reduces the fine
+profile to the lowest return in each `OBSTACLE_COARSE_CELL_M` (2.0 m) neighbourhood and the
+ceiling is measured from that. All four properties then hold at once, on flat ground and on a
+grade: drives under bridges, blocks for walls, ignores empty hills, keeps kerbs. **AEB gets this
+too** (its band is cell-referenced), which fixes the same latent false positive there — it only
+ever REMOVES candidates, so it cannot make AEB miss anything.
+
+### The planner is bounded by CELLS, not by points (2026-08-11)
+
+`PLANNER_MAX_OBSTACLE_POINTS` bounded a quantity the cloud does not measure in. A realistic
+street puts tens of thousands of band returns into a couple of thousand distinct
+`OBSTACLE_CELL_M` cells — dozens of returns per cell all saying the same thing — and
+`np.linspace` over the POINTS kept 4,000 of them landing on a fraction of the cells. Measured on
+a synthetic street, the cap covered **127 of 218 occupied cells**: it was not thinning a dense
+cloud, it was deleting 42% of the places the planner knew something was standing.
+
+It failed in the **unsafe** direction. Where a corridor edge cuts a densely populated cell only
+some of that cell's returns are inside the corridor; keeping one in sixteen by index misses them
+and `_scan_arcs` reports the arc clear to the next blocker.
+
+`ObstacleBand.reduce_to_cells` collapses each occupied cell to its MEAN inside `despeckle`,
+reusing the grid that function already builds. It is complete by construction, and it is
+*cheaper*: 512 points instead of 4,000 on the same scene took `plan_arc` from **10.3 ms to
+1.17 ms**. That headroom is what let the deferred families stop scanning `scan_points[::2]` —
+against a cell-reduced cloud that second stride would delete half the occupied cells, and do it
+to precisely the candidates that decide "the turn comes later". Off by default so **AEB's array
+stays byte-identical**: AEB counts the `AEB_MIN_HITS`-th nearest return, so reducing its cloud
+changes what its trigger counts and that belongs to its own live checklist.
+
+### Guidance yields to sensing when its own line is blocked (2026-08-11)
+
+CLAUDE.md promised that "guidance never becomes authority ... a blocked arc is never chosen just
+because the route asked for it — LiDAR always wins". **It was false, and measurably so.** Both
+lateral terms SATURATE — the route cross-track clips at `ROUTE_XTRACK_SCALE_M` (2.0 m) and
+keep-right at `KEEP_RIGHT_SCALE_M` (2.0 m) — while passing a 1.8 m car needs 2.3–3.0 m of offset.
+So every way round sat in the clipped region and paid the full weight as a flat toll, against
+which the free-distance term can only ever offer the difference between two clipped values.
+Measured on a kerbed road with a stopped car in the lane and the other lane empty: with no
+destination set the planner went round at every gap from 10 to 20 m; **with a route set it went
+round at no gap at all** — it drove at the car until free distance crossed `STOP_MARGIN_M`, then
+blocked, then reversed.
+
+Two changes, and they are different repairs to the same defect:
+
+- **`_guidance_authority`** scales `COST_ROUTE_XTRACK`, `COST_ROUTE_HEADING` and
+  `COST_KEEP_RIGHT` by how blocked the REFERENCE LINE is — the candidate that best obeys the
+  guidance — so the question asked is exactly "is the line you are being told to hold actually
+  open?". Multiplicative and exactly 1.0 while that line is clear, so **a clear road is scored
+  bit-for-bit as before** (verified by A/B: identical curvature and free distance). Measured, it
+  is what makes the car commit to the pass at a 20 m and a 15 m gap instead of driving into the
+  car.
+- **`priced_offset`** replaces `clip((e/s)², 0, 1)` with `e²/(e² + s²)`. Same bound, and for
+  e << s it IS the old form to first order so ordinary lane discipline is unchanged — but it
+  approaches its bound asymptotically, so the gradient survives at every offset. The clipped form
+  had none past one scale: traced in the closed loop, the keep-right target correctly moved to the
+  open side of a parked car and the car, 3.6 m away from it, felt a constant force and never
+  converged.
+
+**The free-distance denominator now follows the SPEED** (`required_free_distance`), rather than
+being the 40 km/h cap's envelope unconditionally. At 17 km/h the car needs 8.4 m and scoring an
+ample 8 m of junction box as 0.72 "blocked" tipped three decisions at once — a 90° turn at a
+crossroads (whose corridor runs into the far kerb of the receiving arm, so its free distance is
+8–9 m by construction), a detour, and any confined manoeuvre. Identical at the cap.
+`REQUIRED_FREE_FLOOR_M` exists because at a standstill the envelope collapses to `STOP_MARGIN_M`
+and would leave the argmin with no free-distance signal in exactly the situation that needs one.
+
+**A BUSH IS A THING TO IGNORE, NOT A THING TO STEER AROUND** (2026-08-11). The planner's band was
+built without the porosity veto on the reasoning that "the planner should steer around a bush even
+though AEB should not brake for one". That is wrong in practice: it makes the car flinch at every
+verge and refuse gaps that are open. Porosity is now ON for the planner band as well, and it is
+the same geometric test — an object of height `a` at range `r` hides the ground behind it for
+`r·a/(h − a)`, so ground returns inside that shadow mean the rays went through. Measured on
+stripe-sampled ground: a see-through clump at 15 m goes from 12 occupied cells to **0**, while a
+SOLID post of the same height keeps all 4, and a wall and a kerb are untouched. The safety
+property carries over unchanged and is derived rather than imposed: `a ≥ h` makes the shadow
+infinite and the evidence window empty, so nothing as tall as the roof unit can ever be vetoed.
+The extent test stays off — it is provably inert at or below `OBSTACLE_MIN_HEIGHT_M`, and any
+value above that deletes kerbs.
+
+**What is still NOT fixed, and it is the candidate model rather than any weight.** Every candidate
+is hold-then-bend with the bend held to the horizon, so a lane change is not in the set at all. On
+a 7 m road the only line that clears a parked car is scored against the kerb it then runs into:
+measured at a 24 m gap, the in-lane arc was blocked by the car at 24.3 m and the clearing arc by
+the opposite kerb at 24.8 m, so nothing rewarded going round. The pass therefore works today only
+where the road is wide enough that the swerve does not reach the far kerb inside the horizon
+(verified closed-loop on an 11 m road: 305 m driven, 1.74 m clearance, never leaves DRIVING) and
+`test_a_parked_car_on_an_ordinary_road_is_passed` is a **strict xfail** holding the narrow case.
+
+**An S-curve family was built, measured, and NOT landed, and the reason is worth keeping.** A
+straight third segment is not enough — a constant-curvature swerve arrives ~32° off, so
+straightening there just aims the car at the kerb — so it takes an S: bend out for `L`, bend back
+for `L`, which returns the heading exactly and leaves `k·L²` of offset. Implemented (a
+per-candidate-pose arc scan, since the return bend starts wherever the outbound bend finished) it
+**does fix the 7 m case**, driving past the parked car with 1.43 m of clearance. It also **breaks
+the pocket escape, from 92.55 m clear to −4.61 m**, and that is not a tuning problem:
+
+- The sustained free distance quietly carries real information — *a hard turn held to the horizon
+  does leave the road* — and in a confined space that shortfall is what stops the planner choosing
+  one. The S erases it: every curvature reads the same free distance, the free term stops
+  separating them, and the remaining terms pick a bend. Measured, the car left a recovery on a
+  26 m-radius arc and drove in a circle for the rest of the run.
+- Capping the S at `required_free` removes the circle **and the benefit with it**, because the free
+  term clips at that value anyway, so the cap changes no cost at all.
+- The root cause is the deferred-family trap in a new place: under per-tick re-planning the car
+  drives the OUTBOUND half and re-plans, and if nothing in the scene changed it re-picks the same
+  outbound half for ever — the promised return leg never arrives, exactly as a deferral discount
+  makes "turn later" never arrive. Landing it safely needs the planner to COMMIT to a manoeuvre it
+  has begun, which is trajectory state it does not have.
+
+### The reverse recovery does not ROTATE the car, and that is the real "it turns the wrong way"
+
+**The steering sign is correct.** It was doubted from the driver's seat and checked four
+independent ways — the bicycle model from scratch, the mirror-frame algebra, re-deriving both
+existing sign tests rather than trusting them, and a closed-loop sim on a plant that reads
+`command.steering` as BeamNG's raw "+1 = right" and never touches `STEERING_SIGN`. In every case
+where the recovery commands a turn, the tail swings toward the open space. The chain
+`previous_curvature = −current_curvature` → `plan_arc(mirror_points(...))` → `−k_m` →
+`STEERING_SIGN` is right end to end. Do not "fix" it.
+
+What is wrong is the OBJECTIVE. The reverse planner maximises room BEHIND and has no term for
+where the car ends up POINTING, so measured over 108 nose-in geometries with clear space behind
+it backed **dead straight in 108 of 108 — zero degrees of heading change** — and where the room
+behind was asymmetric it steered productively in only 2 of 6. The car therefore re-approaches the
+obstacle at the same angle it failed at, which from the driver's seat is indistinguishable from
+steering the wrong way. `MAX_RECOVERY_ATTEMPTS` now bounds that loop (see below) so it ends in
+STUCK instead of running for ever, but the loop itself is untouched.
+
+**The mechanism is that the reverse planner has nothing to decide WITH.** With open space behind,
+all 41 candidates report `free_distance = 35.0` (the horizon) and full clearance, so the free and
+clearance terms are identical across the entire fan and the total cost spread is *exactly*
+`REVERSE_COST_SMOOTHNESS` = 0.300. Only the smoothness tie-break separates them, and it always
+wins at k = 0. That is why it backs straight: not a bad choice among alternatives, but no
+alternatives at all.
+
+**The productive reverse is toward the side OPPOSITE the forward gap**, which is worth stating
+because it is counter-intuitive and is what makes a side-preference heuristic hard to get right.
+Reversing D metres at travel curvature k_m rotates the car by +D*k_m (measured: k_m = +0.10 over
+6 m gives +34.5 deg, nose LEFT, tail RIGHT). So to point the nose at a gap on the LEFT the car
+must reverse toward the behind-RIGHT. The planner instead picks whichever side has more room
+behind, which is uncorrelated: measured over (forward gap side) x (open-behind side), it was
+productive in 2 of 6.
+
+**The cheap fix does not work, and was measured.** Biasing the reverse plan's nav heading toward
+whichever side has more FORWARD room took the pocket escape from 92.55 m clear to 0.05 m and
+STUCK -- in a pocket the free distances behind are NOT tied, so a preference term worth 0.39
+overrides real geometry. The fix has to be the computation the heuristic was standing in for:
+score each candidate reverse arc by the forward freedom available from its PREDICTED END POSE
+(re-plan forward from each and take the best). Note also that even a productive reverse is partly
+handed back -- three recoveries gained +39.8 / +26.8 / +21.5 degrees and the forward re-plan
+immediately returned -28.8 / -23.2 / -10.2 -- so the end-pose score has to be what CHOOSES the
+arc, not a nudge applied to a choice made on other grounds.
+
+**Two things make correct behaviour look wrong from the driver's seat, and neither is a bug.**
+Nose and tail rotate OPPOSITE ways: at k_m = +0.08 the wheels go RIGHT, the tail moves +1.24 m
+right and the nose moves 0.02 m LEFT, so a driver reading "which way did it turn" off the nose
+sees the opposite of the wheel. And `camera_target` sets `yaw_deg = 180` while reversing, swinging
+the chase camera to the front of the car looking back along the direction of travel -- in that
+view the car's real right projects onto the screen's LEFT, so every reverse manoeuvre is
+left-right mirrored on screen. Combined with the 2-in-6 above, "it always turns the wrong way" is
+an entirely expected report from a system whose sign is correct.
+
 ### Self-driving
 
 `planner` (pure geometry) → `controller` (state machine) → `worker` actuation, with
@@ -1551,6 +1788,32 @@ bonus, never authority: the free term alone reaches 0.35 at 18.6 m so a pinched 
 outranks full coverage, and under `ROAD_BONUS_MIN_CELLS` occupied cells (an unannotated map) the
 grid is not built and the term vanishes exactly as nav/keep-right do.
 
+### MAX_RECOVERY_ATTEMPTS was unreachable, so the car reversed for ever (2026-08-11)
+
+`_enter` cleared `self._attempts` on every entry to DRIVING, and **every reverse recovery buys at
+least one tick of DRIVING on the way back** — backing `REVERSE_DISTANCE_M` recovers free distance
+well past `STOP_MARGIN_M + RESUME_HYSTERESIS_M` — so the counter was cleared before it could ever
+reach 3. `STUCK` was therefore only reachable when the path never cleared at all. Since the
+recovery is open-loop (a fixed distance back, then the same approach from the same offset at the
+same heading), what that produced was an exact limit cycle with zero net progress: reverse, creep
+forward, block, reverse, for ever. Measured on the pocket scene, forward progress per cycle was
+7.29 / 6.81 / 7.42 m with the car returning to where it started each time.
+
+The counter is now cleared by `RECOVERY_PROGRESS_M` (15 m) of forward travel in DRIVING, which is
+further than one recovery can hand back, so it cannot be satisfied by the recovery itself — only
+by actually getting somewhere.
+
+**A confirmation window on the BLOCKED entry was built and removed, and the reason is worth
+keeping.** Requiring N ticks of `free <= STOP_MARGIN_M` before engaging the recovery machine is
+the obvious guard against a single-tick phantom, and it does not change the pedal at all (the
+window commands the same full `_hold_brake`). It changes the PHASE of the recovery — and that
+alone turned the `test_a_cornered_car_escapes_with_a_steered_reverse` pocket from an escape (92 m
+clear) into an exact limit cycle (0.8 m, then STUCK), because the recovery's geometry depends on
+where the car happens to be when the hold expires. Delaying it is not the neutral change it looks
+like. The phantom it was meant to catch has been attacked at the source instead: the gradient
+phantom (which was PERSISTENT, so a window would not have caught it anyway) is gone with the
+cell-referenced band, and the sampling phantoms are gone with the cell reduction.
+
 ### The steered reverse (2026-08-10)
 
 The recovery no longer backs up dead straight. When BLOCKED-and-stopped or REVERSING, the worker
@@ -1574,6 +1837,66 @@ stays armed and unchanged underneath, on its own un-memoried band. keep-right, r
 road grid are all off in reverse; the winner is plan_arc's own argmin — the forward re-plan
 after recovery re-orients the car with the full cost stack, so there is deliberately no bespoke
 bi-level objective.
+
+### The overlays are DRAPED on the road, not laid in one flat plane (2026-08-11)
+
+Every overlay — both AEB corridors, the planned path, the navigation route — was drawn at ONE
+scalar height: `vehicle_geometry.ground_z_vehicle`, the ego's own ground plane, extended flat
+across the whole scene. Render Y is gravity-relative height measured from the ego's world Z (see
+`world_to_render`, which takes `offsets[:, 2]`), so on any gradient, crest, dip or camber the
+drawn road rises straight through the guidance and hides it. In the very test that pinned the
+route ribbon, the drawn road sat at render y = 0 and the ribbon at −0.475: **half a metre under
+the surface it describes.** That test was pinning the defect.
+
+`GroundField` is a world-anchored height raster of the surface actually being drawn, built in
+`refresh` beside the ground mesh from the same bridged cells, and carried **inside `_MeshCache`**
+— which is what keeps the two-rate confinement contract intact: `compose` reads one immutable
+object committed in a single attribute assignment and never touches a store. It rides in the
+cache rather than in a second attribute for a reason: two assignments are two things a compose
+tick can catch half-done, and a height field from before a teleport draped over a mesh from after
+it would be worse than either alone.
+
+`drape` then lifts each overlay. Six things are load-bearing:
+
+- **The vertices carry their LIFT above the ground in Y and leave carrying a height.** That split
+  is what lets one pass drape a flat band and a standing panel together: the threat marker's base
+  and top share an XY, so they take the same surface height and the reticle stays upright and
+  full-size. Draping "the mesh" rather than "the lift" would shear it with the gradient.
+- **It happens AFTER `_aeb_bev_to_render`.** The rear system reasons in a 180°-rotated frame, so
+  sampling the terrain in that frame would drape the rear corridor with the geometry in FRONT of
+  the car — on a hill, by metres.
+- **`confidence` is separate from `heights` and both matter.** Heights are defined everywhere
+  (`_pyramid_fill`); confidence says where that is a measurement rather than an inference, and
+  decays smoothly so a vertex leaving the observed region FADES back to the ego plane instead of
+  stepping off a rim. Where no field exists at all the behaviour is exactly the old flat
+  placement, which is the right fallback rather than a missing overlay.
+- **The raster is PADDED with never-observed cells.** `sample` clamps out-of-range positions to
+  the border, so without the margin a vertex beyond the surfaced ground — the route ribbon runs to
+  `ROUTE_PREVIEW_M`, well past `WORLD_ROAD_RADIUS_M` — would take the edge cell's height at full
+  confidence, which is the one way a drape can be badly wrong rather than merely unknown.
+- **The field resolves stacked ground layers toward the EGO's own plane.** `_ground_cells` keys on
+  `(x, y, layer)`, so a bridge deck and the road beneath it are two legitimate rows at one XY and
+  the mesh correctly draws both; a height field cannot, and averaging them puts the overlay in
+  mid-air for the length of the bridge. Resolved toward the ego rather than toward the lowest,
+  because both directions really happen — driving under a bridge the road below is right, driving
+  over it the deck is. This is the one place the field deliberately diverges from the mesh.
+- **The push is SMOOTHED.** A pull-push fill hands every cell of a hole the same coarse block
+  mean, so a ribbon crossing a 6 m occlusion shadow on a gradient would step onto a flat shelf and
+  off again. One 3×3 mean per pyramid level makes it a ramp between the hole's own rims, and it is
+  EDGE-padded — these are world Z values of hundreds of metres, so a zero-padded border would drag
+  the outermost cells toward sea level and the drape with them.
+
+**The route ribbon has a second, better height source and was throwing it away.** Every navgraph
+node carries a real `pos.z` (see `navigation.LUA_ROUTE_CHUNK`), so `snapshot.route_world` arrives
+with a true road-surface elevation per node; `_route_ribbon` projected it, kept only the plan view,
+and flattened the lot. The node Z is now the per-vertex FALLBACK, used wherever the sensors have
+not surfaced the ground — which also carries the route out past the end of the store, where the
+old code drew a level line into a hill.
+
+Cost: the field is 2.1 ms of a 43.4 ms build on the realistic worst case, inside the 60 ms budget.
+The index arithmetic is integer floor-division rather than metres-and-floor, which is worth 14 ms
+of a 15 ms build on half a million cells — the two grids are commensurate, and
+`floor((c + 0.5)/k) == c // k`.
 
 ### Route overlays
 
@@ -1657,10 +1980,39 @@ had a measured failure:
   (2.8, **comfort**, sets planned corner speeds). The gap is the tracking authority.
 - `COAST_DECEL_MPS2` (1.2, the band: *whether* to brake) vs `ENGINE_DRAG_MPS2` (0.3, the
   credit: *how hard* once braking). Over-crediting silently under-brakes.
-- `SLOPE_ALLOWANCE_PER_M` is now a **bound** on `planner.ground_rise`, not the estimate.
-  Raising it back into a standalone cone re-blinds the car to kerbs past ~12 m.
+- `SLOPE_ALLOWANCE_PER_M` is a **bound** on `planner.ground_rise`, not the estimate — and since
+  2026-08-11 **neither band uses it**: both are cell-referenced, so the cone survives only as the
+  fallback path for a band that asks for neither. Do not reach for it to fix a gradient problem;
+  it is the thing that CAUSED the gradient problem.
+- `AEB_POROSITY_*` are now shared by BOTH bands, not just AEB's. The planner uses the same
+  see-through veto, so loosening them to stop AEB braking for foliage also makes the PLANNER
+  ignore more, and vice versa. They were tuned for the brake; check both if you move them.
+- `OBSTACLE_CELL_M` (0.4, the FLOOR's reference) vs `OBSTACLE_COARSE_CELL_M` (2.0, the CEILING's).
+  Two different questions — how high is this above the ground under it, and is this thing
+  overhead — and they cannot share a cell. See the cell-referenced section.
+- `REQUIRED_FREE_DISTANCE_M` is FIXED at the 40 km/h envelope on purpose. A speed-scaled version
+  was built and removed: approaching an obstacle the speed law holds `free ~= v^2/(2a) + margin`
+  while the scaled requirement is `v^2/(2a) + STOP_MARGIN`, so the two track each other by
+  construction, the free term goes dead during the whole approach, and the planner concludes
+  "this way ends but I can stop, so it is fine" -- measured, it removed the entire reward for
+  going round a parked car.
+- `PLANNER_MAX_OBSTACLE_POINTS` is now a **backstop, not the primary bound** — the primary bound
+  is one point per occupied cell. Raising it does nothing; it never binds on a real band.
 - `LAT_JERK_MAX_MPS3 = 4.0`, up from 2.5: at the speed cap 2.5 allowed 0.020 /s, so winding on
   the 0.04 curvature of an ordinary 25 m bend took 2.0 s and 22 m — most of the 35 m horizon.
+- `RECOVERY_PROGRESS_M` (15) is what makes `MAX_RECOVERY_ATTEMPTS` reachable. It must stay
+  comfortably above `REVERSE_DISTANCE_M` or one recovery satisfies it and the limit cycle
+  returns.
+- `ROUTE_XTRACK_SCALE_M` / `KEEP_RIGHT_SCALE_M` are now the HALF-COST point of
+  `planner.priced_offset`, not the saturation point: `e²/(e² + s²)` reaches 0.5 at one scale and
+  approaches 1 asymptotically. The near-field shape is unchanged, so these keep their tuned
+  meaning for ordinary lane discipline; what changed is that there is a gradient past them.
+- `WORLD_GROUND_FIELD_CELL_M` (1.0) is deliberately four times `WORLD_CELL_SIZE_M`. This is a
+  height LOOKUP, not geometry: a road varies smoothly at the metre scale and the overlay only has
+  to clear the surface, so the extra resolution buys nothing and costs 16× the raster.
+  `WORLD_GROUND_FIELD_FILL_CELLS` is how far the field is trusted beyond what was observed, and
+  `WORLD_GROUND_FIELD_MAX_SPAN_CELLS` is a guard against a store that failed to expire, not a
+  tuning knob.
 
 `geometric_obstacle_sets` costs ~4.4 ms of the 40 ms tick for the planner's floor alone and
 ~5.1 ms for both floors, measured on a 60k-point worst case; AEB's corridor scan adds 0.05 ms.
