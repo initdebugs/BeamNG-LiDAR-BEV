@@ -282,10 +282,20 @@ load-bearing:
   teardown funnel (`_cleanup_sensors`) is the only path between rigs and a
   half-swapped set cannot exist. `sensor_mode_changed` is emitted before
   `sensors_ready` so the GUI knows which controls to enable.
-- **Self-driving and both AEBs refuse in vision mode** — they reason over the
-  LiDAR cloud, which rung 0 does not produce. The unprojection rung restores
-  them; until then the GUI doesn't offer the buttons and the worker refuses
-  anyway (belt and braces, worker wins).
+- **Self-driving, both AEBs and BOTH PARKING controls refuse in vision mode** —
+  they reason over the LiDAR cloud, which rung 0 does not produce. Parking is
+  in the same position for a slightly different reason: the bay scan reads the
+  SEMANTIC marking store, and the camera rig returns no points to classify, so
+  an armed scan would sit lit over a store that can never fill. The
+  unprojection rung restores the first three; parking additionally needs
+  whatever eventually classifies paint. Until then the GUI doesn't offer the
+  buttons and the worker refuses anyway (belt and braces, worker wins) — and
+  the worker's half is the load-bearing one, because a guard living only in
+  the window is one a queued signal, a restored setting or a mid-stream mode
+  switch walks straight past. No teardown change was needed for parking:
+  `_cleanup_sensors` already clears the scan, emits `parking_changed(False)`
+  and drops the marking store, so the re-attach `set_sensor_mode` triggers
+  disarms it through the one funnel.
 - **`stream_raw()` returns a memoryview of the LIVE shared buffer** — the
   simulator keeps writing into it — so `_poll_vision_once` copies exactly once
   before anything reads twice; `test_the_image_is_a_private_copy...` pins it.
