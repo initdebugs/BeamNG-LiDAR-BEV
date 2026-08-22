@@ -1,10 +1,15 @@
 # BeamNG LiDAR BEV
 
-A Windows desktop app for BeamNG.tech 0.37.6 that launches the simulator with
-the BeamNGpy communication bridge enabled, connects after the map and vehicle
-are loaded, attaches four semantic LiDAR sensors to the current player vehicle,
-and renders their combined output as a reconstructed autonomous-driving world
-or an EGO-fixed diagnostic bird's-eye view.
+A Windows desktop app for BeamNG.tech 0.39.x (via beamngpy 1.36) that launches
+the simulator with the BeamNGpy communication bridge enabled, connects after
+the map and vehicle are loaded, attaches a semantic LiDAR set — or, in Vision
+mode, a Tesla-style eight-camera rig — to the current player vehicle, and
+renders the output as a reconstructed autonomous-driving world, an EGO-fixed
+diagnostic bird's-eye view, or a live camera array.
+
+beamngpy 1.36 speaks bridge protocol v1.27, which is BeamNG.tech 0.39.x; it
+cannot connect to 0.38.x or earlier. The install path lives in
+`config.BEAMNG_EXE`.
 
 ## Start
 
@@ -39,10 +44,18 @@ The visualization header switches between:
   state.
 - **RAW BEV** — the original top-down semantic point cloud with range rings,
   planner candidates, sensor mounts, AEB corridors, and performance metrics.
+- **VISION** — the eight-camera rig (Tesla HW4 layout: windshield main + wide,
+  front bumper, two B-pillars, two fender repeaters, rear) streamed live as a
+  labelled grid. This is rung 0 of the vision-only ladder; see
+  `docs/VISION_MODE_SPEC.md`.
 
-Switching is instantaneous and does not restart sensors or change driving
-state. If Qt Quick 3D cannot initialize, the app falls back to RAW BEV while
-the sensor and control loops continue normally.
+Switching between WORLD and RAW BEV is instantaneous and does not restart
+sensors or change driving state. Switching to or from VISION swaps the
+instrument set on the car, so it re-attaches the sensors; self-driving and
+both AEB systems need the LiDAR point cloud and are unavailable in Vision
+mode at this rung. If Qt Quick 3D cannot initialize, the app falls back to
+RAW BEV while the sensor and control loops continue normally; VISION has no
+3D-renderer dependency and keeps working.
 
 ## Sensor Configuration
 
