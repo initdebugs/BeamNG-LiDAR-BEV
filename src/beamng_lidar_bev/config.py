@@ -5,7 +5,12 @@ from pathlib import Path
 APP_NAME = "BeamNG LiDAR BEV"
 APP_VERSION = "1.2.0"
 
-BEAMNG_EXE = Path(r"C:\Users\initd\Documents\BeamNG.tech.v0.38.5.0\BeamNG.tech.exe")
+# The 0.39 install. beamngpy 1.36 speaks bridge protocol v1.27, which is what
+# BeamNG.tech 0.39.x answers with -- against the 0.38.5 install the handshake
+# refuses outright (its bridge is v1.26), so the pin in requirements.txt and
+# this path move TOGETHER. Point this back at v0.38.5.0 only alongside
+# beamngpy 1.35.x.
+BEAMNG_EXE = Path(r"C:\Users\initd\Documents\BeamNG.tech.v0.39.4.0\BeamNG.tech.exe")
 BEAMNG_HOME = BEAMNG_EXE.parent
 BEAMNG_HOST = "127.0.0.1"
 BEAMNG_PORT = 64256
@@ -233,6 +238,45 @@ LIDAR_UPDATE_TIME_S = 1.0 / LIDAR_UPDATE_HZ
 # instead of by raising the sensor.
 SENSOR_HEIGHT_ABOVE_GROUND_M = 0.20
 SENSOR_BODY_CLEARANCE_M = 0.08
+
+# --- Vision mode: the eight-camera rig ------------------------------------------
+#
+# Rung 0 of the vision-only ladder (docs/VISION_MODE_SPEC.md): eight streaming
+# COLOUR cameras in a Tesla HW4-style layout, rendered as a live grid. Depth and
+# annotation channels stay off at this rung on purpose -- each extra channel has
+# a measured simulator cost (annotation is a second full geometry pass: 42 Hz ->
+# 33 Hz sim rate on the reference machine; depth roughly doubles the bytes
+# copied per read) and nothing consumes them yet. The unprojection rung turns
+# them on per-mount when it lands.
+#
+# Resolution is nearly free (measured: 8 cams 320x240 -> 1280x960 costs
+# 21 -> 16 Hz -- the cost is per-camera draw submission, not per-pixel), so this
+# is NOT the dial to reach for if the sim rate drops; drop a camera instead.
+CAMERA_RESOLUTION = (640, 480)
+# MUST be positive, and this is a trap, not a tuning choice: with
+# is_streaming=True and requested_update_time=0.0 every shared-memory buffer
+# stays zero-filled forever while the read loop happily spins -- a working rig
+# producing black frames, measured live on BeamNG 0.39.4 / beamngpy 1.36.
+# 0.05 asks for 20 Hz; measured delivery for 8 colour cameras at 640x480 is
+# ~18 Hz, so the request is not the bottleneck.
+CAMERA_UPDATE_TIME_S = 0.05
+CAMERA_NEAR_FAR_PLANES = (0.05, 300.0)
+# Per-mount horizontal FOVs. The Camera constructor takes a VERTICAL field of
+# view (field_of_view_y); geometry.camera_vertical_fov_deg derives it from
+# these and the aspect ratio, because the horizontal aperture is what the rig
+# is designed around. Wide rectilinear apertures sit on the same tan() cliff
+# the LiDAR's 179-degree sweep did, so nothing here goes past 110.
+CAMERA_FRONT_MAIN_HFOV_DEG = 50.0
+CAMERA_FRONT_WIDE_HFOV_DEG = 100.0
+CAMERA_FRONT_BUMPER_HFOV_DEG = 110.0
+CAMERA_PILLAR_HFOV_DEG = 80.0
+CAMERA_REPEATER_HFOV_DEG = 60.0
+CAMERA_REAR_HFOV_DEG = 110.0
+# B-pillar cameras look forward-outboard, repeaters (front fenders) look
+# rear-outboard -- the HW4 pattern. Yaw is measured from straight ahead
+# (pillars) and from straight behind (repeaters).
+CAMERA_PILLAR_YAW_DEG = 55.0
+CAMERA_REPEATER_YAW_DEG = 30.0
 
 DISPLAY_RADIUS_M = 105.0
 # poll_sensors("state") is a blocking round-trip measured at 32.7 ms (p95 35.3),
