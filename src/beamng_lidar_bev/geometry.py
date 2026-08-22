@@ -8,6 +8,15 @@ from typing import Any
 import numpy as np
 
 from .config import (
+    CAMERA_FRONT_BUMPER_HFOV_DEG,
+    CAMERA_FRONT_MAIN_HFOV_DEG,
+    CAMERA_FRONT_WIDE_HFOV_DEG,
+    CAMERA_PILLAR_HFOV_DEG,
+    CAMERA_PILLAR_YAW_DEG,
+    CAMERA_REAR_HFOV_DEG,
+    CAMERA_REPEATER_HFOV_DEG,
+    CAMERA_REPEATER_YAW_DEG,
+    CAMERA_RESOLUTION,
     LIDAR_FRONT_DENSITY,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
@@ -27,7 +36,7 @@ from .config import (
     SENSOR_BODY_CLEARANCE_M,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
 )
-from .models import SensorMount, VehicleGeometry
+from .models import CameraMount, SensorMount, VehicleGeometry
 
 
 def vec3(value: Any) -> np.ndarray:
@@ -210,6 +219,158 @@ def derive_vehicle_geometry(
         height_m=height,
         mounts=mounts,
     )
+
+
+# Fixed rig order, front row first, so the GUI grid and every log line agree
+# on which camera is which without consulting the worker.
+CAMERA_NAMES = (
+    "front_main",
+    "front_wide",
+    "front_bumper",
+    "pillar_left",
+    "pillar_right",
+    "repeater_left",
+    "repeater_right",
+    "rear",
+)
+
+
+def camera_vertical_fov_deg(
+    horizontal_fov_deg: float, resolution: tuple[int, int]
+) -> float:
+    """
+    The `field_of_view_y` that yields a designed HORIZONTAL aperture.
+
+    The Camera constructor takes only the vertical field of view and derives
+    the horizontal one from the aspect ratio, so the rig -- which is designed
+    around horizontal coverage exactly as the LiDAR wedges are -- has to run
+    the rectilinear projection backwards: tan(h/2) scales by height/width.
+    """
+    width, height = resolution
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Implausible camera resolution {resolution!r}")
+    half_h = math.radians(float(horizontal_fov_deg)) / 2.0
+    return math.degrees(2.0 * math.atan(math.tan(half_h) * height / width))
+
+
+def derive_camera_rig(
+    geometry: VehicleGeometry,
+    resolution: tuple[int, int] = CAMERA_RESOLUTION,
+    body_clearance_m: float = SENSOR_BODY_CLEARANCE_M,
+) -> dict[str, CameraMount]:
+    """
+    The eight-camera Vision rig, derived from the same live bounding box the
+    LiDAR mounts are (Tesla HW4 layout: windshield main + wide, front bumper,
+    two B-pillars looking forward-outboard, two fender repeaters looking
+    rear-outboard, one rear).
+
+    Same conventions as the LiDAR mounts: vehicle frame +X left, +Y rearward,
+    +Z up; FORWARD IS (0, -1, 0) -- the intuitive (0, 1, 0) renders the rear
+    seats -- and `pos.z` is measured from the vehicle ground plane, which the
+    simulator references sensor positions to (see derive_vehicle_geometry).
+
+    Mounts sit ON or just outside the body shell because there is no hide-ego
+    flag: a camera inside the glasshouse films the cabin (measured: a
+    windshield mount placed inboard came back 68% CAR). The stations are
+    plausible fractions of the bounding box, not measured body features -- a
+    later rung can refine the B-pillar station from the Mesh sensor's
+    per-part nodes. Some bodywork in frame is correct: a real bumper camera
+    sees bonnet.
+    """
+    height = geometry.height_m
+    windshield_z = 0.90 * height
+    pillar_z = 0.80 * height
+    repeater_z = 0.60 * height
+    bumper_z = max(0.45, 0.32 * height)
+    rear_z = 0.75 * height
+    # Just outside each surface, reusing the LiDAR body clearance.
+    front_y = -(geometry.front_m + body_clearance_m)
+    rear_y = geometry.rear_m + body_clearance_m
+    left_x = geometry.left_m + body_clearance_m
+    right_x = -(geometry.right_m + body_clearance_m)
+    # The windshield pair sits ahead of the reference node, roughly at the
+    # screen header; the repeaters ride the front fenders; the B-pillars sit
+    # slightly behind the node, mid-cabin.
+    windshield_y = -0.30 * geometry.front_m
+    repeater_y = -0.55 * geometry.front_m
+    pillar_y = 0.10 * geometry.rear_m
+
+    pillar_yaw = math.radians(CAMERA_PILLAR_YAW_DEG)
+    repeater_yaw = math.radians(CAMERA_REPEATER_YAW_DEG)
+    forward = (0.0, -1.0, 0.0)
+    rearward = (0.0, 1.0, 0.0)
+
+    def mount(
+        name: str,
+        position: tuple[float, float, float],
+        direction: tuple[float, float, float],
+        hfov: float,
+    ) -> CameraMount:
+        return CameraMount(
+            name=name,
+            position_vehicle=position,
+            direction_vehicle=direction,
+            horizontal_fov_deg=hfov,
+            vertical_fov_deg=camera_vertical_fov_deg(hfov, resolution),
+            resolution=resolution,
+        )
+
+    return {
+        # The windshield pair, offset either side of the mirror so the two
+        # never coincide. Main is the long-range narrow view, wide the
+        # context view.
+        "front_main": mount(
+            "front_main",
+            (0.08, windshield_y, windshield_z),
+            forward,
+            CAMERA_FRONT_MAIN_HFOV_DEG,
+        ),
+        "front_wide": mount(
+            "front_wide",
+            (-0.08, windshield_y, windshield_z),
+            forward,
+            CAMERA_FRONT_WIDE_HFOV_DEG,
+        ),
+        "front_bumper": mount(
+            "front_bumper",
+            (0.0, front_y, bumper_z),
+            forward,
+            CAMERA_FRONT_BUMPER_HFOV_DEG,
+        ),
+        # B-pillars: forward-outboard. +X is LEFT, so the left camera's
+        # direction gains a positive X component.
+        "pillar_left": mount(
+            "pillar_left",
+            (left_x, pillar_y, pillar_z),
+            (math.sin(pillar_yaw), -math.cos(pillar_yaw), 0.0),
+            CAMERA_PILLAR_HFOV_DEG,
+        ),
+        "pillar_right": mount(
+            "pillar_right",
+            (right_x, pillar_y, pillar_z),
+            (-math.sin(pillar_yaw), -math.cos(pillar_yaw), 0.0),
+            CAMERA_PILLAR_HFOV_DEG,
+        ),
+        # Fender repeaters: rear-outboard, the blind-spot view.
+        "repeater_left": mount(
+            "repeater_left",
+            (left_x, repeater_y, repeater_z),
+            (math.sin(repeater_yaw), math.cos(repeater_yaw), 0.0),
+            CAMERA_REPEATER_HFOV_DEG,
+        ),
+        "repeater_right": mount(
+            "repeater_right",
+            (right_x, repeater_y, repeater_z),
+            (-math.sin(repeater_yaw), math.cos(repeater_yaw), 0.0),
+            CAMERA_REPEATER_HFOV_DEG,
+        ),
+        "rear": mount(
+            "rear",
+            (0.0, rear_y, rear_z),
+            rearward,
+            CAMERA_REAR_HFOV_DEG,
+        ),
+    }
 
 
 # The ground-annulus units: every ray points below the horizon, so their reach

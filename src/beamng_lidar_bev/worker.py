@@ -42,6 +42,8 @@ from .config import (
     BEAMNG_HOME,
     BEAMNG_HOST,
     BEAMNG_PORT,
+    CAMERA_NEAR_FAR_PLANES,
+    CAMERA_UPDATE_TIME_S,
     CONTROL_INTERVAL_MS,
     DISPLAY_INTERVAL_MS,
     LIDAR_RANGE_M,
@@ -94,6 +96,7 @@ from .controller import (
     gear_is_engaged,
 )
 from .geometry import (
+    derive_camera_rig,
     derive_vehicle_geometry,
     vec3,
     vehicle_axes,
@@ -111,6 +114,7 @@ from .models import (
     AebState,
     ArcPlan,
     BevFrame,
+    CameraImage,
     ControlCommand,
     DrivingPlan,
     ParkingJob,
@@ -119,6 +123,7 @@ from .models import (
     RoadGrid,
     SensorMount,
     VehicleGeometry,
+    VisionFrame,
 )
 from .navigation import fetch_route_reply, parse_route, route_heading
 from .parking import (
@@ -162,6 +167,14 @@ from .semantics import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# Which instrument set attach_to_player builds. The worker owns this the way it
+# owns the driving toggles: the GUI requests, the worker confirms via
+# sensor_mode_changed, and the mode only takes physical effect at attach (a
+# switch mid-stream re-attaches through the same single funnel).
+SENSOR_MODE_LIDAR = "LIDAR"
+SENSOR_MODE_VISION = "VISION"
+
 UNKNOWN_SEMANTIC_RGB = np.asarray((1, 2, 3), dtype=np.uint8)
 _EMPTY_BEV = np.empty((0, 2), dtype=np.float32)
 _EMPTY_WORLD = np.empty((0, 3), dtype=np.float32)
@@ -205,6 +218,16 @@ _TELEMETRY_INTERVAL_S = 1.0
 # Cadence of the Memory check: line -- store sizes change slowly, and the line
 # exists to catch a runaway store or a map full of ghosts, not to trace it.
 _MEMORY_LOG_INTERVAL_S = 5.0
+# How long Vision mode waits for a first genuinely new camera frame before
+# warning. The known silent failure it exists for: requested_update_time=0.0
+# leaves every streaming buffer zero-filled while the read loop spins happily
+# -- a working rig producing black frames, which cost a full benchmark round
+# to diagnose live.
+_VISION_SILENCE_WARN_S = 5.0
+# Stride for the per-camera change digest. A prime, so the sampled bytes drift
+# across the frame instead of landing on one pixel column; ~600 bytes sampled
+# from a 1.2 MB buffer per camera per tick.
+_VISION_DIGEST_STRIDE = 4093
 
 
 def build_road_grid(
@@ -270,6 +293,8 @@ class BeamNgWorker(QObject):
     frame_ready = pyqtSignal(object)
     perception_ready = pyqtSignal(object)
     sensors_stopped = pyqtSignal()
+    vision_frame_ready = pyqtSignal(object)
+    sensor_mode_changed = pyqtSignal(str)
     self_driving_changed = pyqtSignal(bool)
     aeb_changed = pyqtSignal(bool)
     rear_aeb_changed = pyqtSignal(bool)
@@ -287,6 +312,15 @@ class BeamNgWorker(QObject):
         self._sensor_names: list[str] = []
         self._geometry: VehicleGeometry | None = None
         self._palette: SemanticPalette | None = None
+        # Vision mode. The digests detect genuinely NEW camera frames: the
+        # display tick re-reads the shared buffers faster than the cameras
+        # update, and counting re-reads would report the tick rate as the
+        # acquisition rate.
+        self._sensor_mode = SENSOR_MODE_LIDAR
+        self._camera_digests: dict[str, bytes] = {}
+        self._vision_streaming_since: float | None = None
+        self._logged_vision_check = False
+        self._logged_vision_silence = False
         self._frame_times: deque[float] = deque(maxlen=60)
         self._poll_failures = 0
         self._first_failure_at: float | None = None
@@ -528,6 +562,25 @@ class BeamNgWorker(QObject):
             vehicles = self._bng.vehicles.get_current(include_config=False)
             vehicle = vehicles.get(player_vid)
             if vehicle is None:
+                # beamngpy 1.36 SILENTLY drops vehicles whose ids fail its
+                # object-name validation (the reserved id "vehicle", a leading
+                # digit, a '/', a leading '%'), so a perfectly real player car
+                # can be missing from get_current. Ask the raw registry to
+                # tell "dropped by validation" apart from "not there at all",
+                # because the two need opposite advice.
+                try:
+                    known_ids = self._bng.vehicles.get_current_info(
+                        include_config=False
+                    )
+                except Exception:
+                    known_ids = {}
+                if player_vid in known_ids:
+                    raise RuntimeError(
+                        f"Player vehicle id {player_vid!r} is rejected by "
+                        "beamngpy's object-name validation (reserved name, "
+                        "leading digit, '/' or leading '%'). Rename the "
+                        "vehicle in the simulator and retry."
+                    )
                 raise RuntimeError(
                     f"Player vehicle '{player_vid}' is not available through BeamNGpy"
                 )
@@ -539,6 +592,39 @@ class BeamNgWorker(QObject):
             state = self._get_vehicle_state()
             geometry = derive_vehicle_geometry(state, vehicle.get_bbox())
             self._log_vehicle_check(geometry)
+
+            sensor_prefix = f"bev_{os.getpid()}_{int(time.monotonic() * 1000)}"
+            self._sensors = []
+            self._sensor_names = []
+
+            if self._sensor_mode == SENSOR_MODE_VISION:
+                # Rung 0 of the vision ladder: colour cameras only, so the
+                # semantic palette is not needed and not loaded.
+                mount_count = self._attach_camera_rig(
+                    vehicle, geometry, sensor_prefix
+                )
+                self._geometry = geometry
+                self._palette = None
+                self._frame_times.clear()
+                self._poll_failures = 0
+                self._first_failure_at = None
+                self._last_speed = 0.0
+                self._last_forward_speed = 0.0
+                self._camera_digests = {}
+                self._vision_streaming_since = time.perf_counter()
+                self._logged_vision_check = False
+                self._logged_vision_silence = False
+                self.status_changed.emit(
+                    "STREAMING", f"{mount_count} cameras active on {player_vid}"
+                )
+                self.sensor_mode_changed.emit(SENSOR_MODE_VISION)
+                self.sensors_ready.emit(player_vid, geometry)
+                self._poll_timer.start()
+                # Deliberately NO self-driving and NO AEB arming: both reason
+                # over the LiDAR point cloud, and Vision mode does not produce
+                # one yet. The unprojection rung is what restores them.
+                return
+
             annotations = self._load_annotations()
             palette = SemanticPalette.from_annotations(annotations)
             # Every paint-ish class by its palette colour, INCLUDING the ones
@@ -552,9 +638,6 @@ class BeamNgWorker(QObject):
                 in (MARKING_CLASSES | {"DRIVING_INSTRUCTIONS", "SPEED_BUMP"})
             }
 
-            sensor_prefix = f"bev_{os.getpid()}_{int(time.monotonic() * 1000)}"
-            self._sensors = []
-            self._sensor_names = []
             mount_count = len(geometry.mounts)
             bbox_z = self._bbox_bottom(vehicle)
             for index, mount in enumerate(geometry.mounts.values()):
@@ -625,6 +708,9 @@ class BeamNgWorker(QObject):
         self.status_changed.emit(
             "STREAMING", f"{mount_count} LiDAR sensors active on {player_vid}"
         )
+        # Before sensors_ready, so the GUI knows which instrument set it is
+        # enabling controls for when that signal lands.
+        self.sensor_mode_changed.emit(SENSOR_MODE_LIDAR)
         self.sensors_ready.emit(player_vid, geometry)
         self._poll_timer.start()
         # Both emergency brakes arm themselves. They are protective rather than
@@ -635,10 +721,42 @@ class BeamNgWorker(QObject):
         self._set_aeb(True, rearward=False)
         self._set_aeb(True, rearward=True)
 
+    @pyqtSlot(str)
+    def set_sensor_mode(self, mode: str) -> None:
+        """
+        Choose which instrument set the next attach builds.
+
+        Owned by the worker like the driving toggles: the GUI requests, this
+        confirms via sensor_mode_changed. A switch while sensors are live
+        re-attaches immediately through the one funnel `attach_to_player`
+        already is -- it stops the timer and pushes the old set through
+        `_cleanup_sensors`, so a half-swapped rig cannot exist.
+        """
+        mode = str(mode).upper()
+        if mode not in (SENSOR_MODE_LIDAR, SENSOR_MODE_VISION):
+            LOGGER.warning("Ignoring unknown sensor mode %r", mode)
+            return
+        if mode == self._sensor_mode:
+            return
+        self._sensor_mode = mode
+        LOGGER.info("Sensor mode set to %s", mode)
+        self.sensor_mode_changed.emit(mode)
+        if self._sensors:
+            self.attach_to_player()
+
     @pyqtSlot(bool)
     def set_self_driving(self, enabled: bool) -> None:
         if not enabled:
             self._disengage_self_driving("Self-driving disengaged")
+            return
+        if self._sensor_mode == SENSOR_MODE_VISION:
+            # Both control systems reason over the LiDAR point cloud, which
+            # Vision mode does not produce yet (rung 0 streams images only).
+            self.self_driving_changed.emit(False)
+            self.status_changed.emit(
+                "STREAMING" if self._sensors else "READY",
+                "Self-driving needs the LiDAR set; switch out of Vision mode",
+            )
             return
         if (
             self._vehicle is None
@@ -741,6 +859,15 @@ class BeamNgWorker(QObject):
         drops the accumulated paint as well as the bays, so re-arming starts
         from what the sensors can see now rather than from a stale lot.
         """
+        if enabled and self._sensor_mode == SENSOR_MODE_VISION:
+            # The bay scan reads the SEMANTIC marking store, which only the
+            # LiDAR set fills; the camera rig produces no returns to classify.
+            self.parking_changed.emit(False)
+            self.status_changed.emit(
+                "STREAMING" if self._sensors else "READY",
+                "Parking needs the LiDAR set; switch out of Vision mode",
+            )
+            return
         if enabled and not self._sensor_set_is_complete():
             self.parking_changed.emit(False)
             self.status_changed.emit(
@@ -789,6 +916,16 @@ class BeamNgWorker(QObject):
             self._logged_park_phase = ""
             if was:
                 self.parking_drive_changed.emit(False)
+            return
+        if self._sensor_mode == SENSOR_MODE_VISION:
+            # Reached only if a bay somehow survived the mode switch; the scan
+            # itself is already refused above. Say which system is missing
+            # rather than "select a bay", which would be unactionable here.
+            self.parking_drive_changed.emit(False)
+            self.status_changed.emit(
+                "STREAMING" if self._sensors else "READY",
+                "Parking needs the LiDAR set; switch out of Vision mode",
+            )
             return
         matched = (
             None
@@ -909,6 +1046,13 @@ class BeamNgWorker(QObject):
         label = "Reverse AEB" if rearward else "Emergency braking"
         if not enabled:
             self._disengage_aeb(f"{label} disabled", rearward=rearward)
+            return
+        if self._sensor_mode == SENSOR_MODE_VISION:
+            changed.emit(False)
+            self.status_changed.emit(
+                "STREAMING" if self._sensors else "READY",
+                f"{label} needs the LiDAR set; switch out of Vision mode",
+            )
             return
         if (
             self._vehicle is None
@@ -1142,6 +1286,9 @@ class BeamNgWorker(QObject):
 
     @pyqtSlot()
     def _poll_once(self) -> None:
+        if self._sensor_mode == SENSOR_MODE_VISION:
+            self._poll_vision_once()
+            return
         if (
             self._bng is None
             or self._vehicle is None
@@ -1667,33 +1814,225 @@ class BeamNgWorker(QObject):
             # touch a socket again until the next tick joins this future.
             self._prefetch_vehicle_state()
         except Exception as exc:
-            now = time.perf_counter()
-            if self._first_failure_at is None:
-                self._first_failure_at = now
-            self._poll_failures += 1
-            failing_for = now - self._first_failure_at
-            LOGGER.warning(
-                "LiDAR polling failed (%d attempts over %.1fs): %s",
-                self._poll_failures,
-                failing_for,
-                exc,
+            self._note_poll_failure(exc, "LiDAR")
+
+    def _note_poll_failure(self, exc: Exception, what: str) -> None:
+        """
+        One failed tick against the continuous-failure budget.
+
+        Shared by both sensor modes: the budget's semantics -- time-based, so a
+        map load survives, and a teardown that emits sensors_stopped so no dead
+        frame stays on screen -- predate Vision mode and must not fork.
+        """
+        now = time.perf_counter()
+        if self._first_failure_at is None:
+            self._first_failure_at = now
+        self._poll_failures += 1
+        failing_for = now - self._first_failure_at
+        LOGGER.warning(
+            "%s polling failed (%d attempts over %.1fs): %s",
+            what,
+            self._poll_failures,
+            failing_for,
+            exc,
+        )
+        if failing_for >= _POLL_FAILURE_GRACE_S:
+            self._poll_timer.stop()
+            self._cleanup_sensors()
+            if self._bng is not None:
+                try:
+                    self._bng.disconnect()
+                except Exception:
+                    LOGGER.debug("Disconnect after poll failure", exc_info=True)
+            self._bng = None
+            self._first_failure_at = None
+            self.status_changed.emit("ERROR", "BeamNG.tech connection was lost")
+            # Without this the stale frame stays on screen behind the dialog.
+            self.sensors_stopped.emit()
+            self.fatal_error.emit(
+                f"{what} streaming stopped after repeated connection errors: {exc}"
             )
-            if failing_for >= _POLL_FAILURE_GRACE_S:
-                self._poll_timer.stop()
-                self._cleanup_sensors()
-                if self._bng is not None:
-                    try:
-                        self._bng.disconnect()
-                    except Exception:
-                        LOGGER.debug("Disconnect after poll failure", exc_info=True)
-                self._bng = None
-                self._first_failure_at = None
-                self.status_changed.emit("ERROR", "BeamNG.tech connection was lost")
-                # Without this the stale frame stays on screen behind the dialog.
-                self.sensors_stopped.emit()
-                self.fatal_error.emit(
-                    f"LiDAR streaming stopped after repeated connection errors: {exc}"
+
+    def _attach_camera_rig(
+        self, vehicle: Vehicle, geometry: VehicleGeometry, sensor_prefix: str
+    ) -> int:
+        """
+        Build the eight-camera Vision rig on the connected vehicle.
+
+        Colour channel only at this rung: annotation is a second full geometry
+        pass (measured 42 -> 33 Hz sim rate) and depth doubles the copied
+        bytes, and nothing consumes either yet. Streaming shared memory is the
+        only viable transport -- the poll path was measured at 204 ms per
+        8-camera frame, ~150x slower.
+        """
+        from beamngpy.sensors import Camera
+
+        rig = derive_camera_rig(geometry)
+        for index, mount in enumerate(rig.values()):
+            self.status_changed.emit(
+                "ATTACHING",
+                f"Attaching {mount.name} camera ({index + 1}/{len(rig)})",
+            )
+            sensor = Camera(
+                f"{sensor_prefix}_{mount.name}",
+                self._bng,
+                vehicle,
+                requested_update_time=CAMERA_UPDATE_TIME_S,
+                update_priority=0.0,
+                pos=mount.position_vehicle,
+                dir=mount.direction_vehicle,
+                up=(0.0, 0.0, 1.0),
+                resolution=mount.resolution,
+                field_of_view_y=mount.vertical_fov_deg,
+                near_far_planes=CAMERA_NEAR_FAR_PLANES,
+                is_using_shared_memory=True,
+                is_render_colours=True,
+                is_render_annotations=False,
+                is_render_instance=False,
+                is_render_depth=False,
+                is_visualised=False,
+                is_streaming=True,
+                is_static=False,
+                is_snapping_desired=False,
+                is_force_inside_triangle=False,
+                is_dir_world_space=False,
+            )
+            self._sensor_names.append(mount.name)
+            self._sensors.append(sensor)
+        LOGGER.info(
+            "Vision rig: %d cameras at %dx%d, update %.0f ms, colour only | %s",
+            len(rig),
+            rig[next(iter(rig))].resolution[0],
+            rig[next(iter(rig))].resolution[1],
+            CAMERA_UPDATE_TIME_S * 1000.0,
+            ", ".join(
+                f"{m.name} hfov {m.horizontal_fov_deg:.0f} z "
+                f"{m.position_vehicle[2]:.2f}"
+                for m in rig.values()
+            ),
+        )
+        return len(rig)
+
+    def _poll_vision_once(self) -> None:
+        """
+        The Vision-mode display tick: stream every camera, emit one frame.
+
+        Mirrors `_poll_once`'s honesty rules rather than its body: a frame is
+        emitted on every tick (an all-black grid with live metrics, never a
+        frozen one), the acquisition rate counts genuinely new frames only,
+        and failures run against the same time-based budget.
+        """
+        if (
+            self._bng is None
+            or self._vehicle is None
+            or self._geometry is None
+            or not self._sensor_set_is_complete()
+        ):
+            return
+        started = time.perf_counter()
+        try:
+            state = self._take_vehicle_state()
+            velocity = vec3(state.get("vel", (0.0, 0.0, 0.0)))
+            self._last_speed = float(np.linalg.norm(velocity))
+            forward_axis = vehicle_axes(state)[1]
+            self._last_forward_speed = float(velocity @ forward_axis)
+
+            images: list[CameraImage] = []
+            any_fresh = False
+            for index, camera in enumerate(self._sensors):
+                name = (
+                    self._sensor_names[index]
+                    if index < len(self._sensor_names)
+                    else str(index)
                 )
+                raw = camera.stream_raw().get("colour")
+                if raw is None or len(raw) == 0:
+                    continue
+                # stream_raw hands back a memoryview of the LIVE shared
+                # buffer -- the simulator is still writing into it -- so it is
+                # copied exactly once, here, before anything reads it twice.
+                pixels = np.frombuffer(raw, dtype=np.uint8).copy()
+                width, height = camera.resolution
+                if pixels.size != width * height * 4:
+                    continue
+                digest = pixels[::_VISION_DIGEST_STRIDE].tobytes()
+                if digest != self._camera_digests.get(name):
+                    self._camera_digests[name] = digest
+                    any_fresh = True
+                images.append(
+                    CameraImage(
+                        name=name, rgba=pixels.reshape((height, width, 4))
+                    )
+                )
+
+            finished = time.perf_counter()
+            stale = (
+                self._frame_times
+                and finished - self._frame_times[-1] > _ACQUISITION_STALE_S
+            )
+            if stale:
+                self._frame_times.clear()
+            if any_fresh:
+                self._frame_times.append(finished)
+            self._watch_vision_liveness(finished, any_fresh, images)
+
+            frame = VisionFrame(
+                images=tuple(images),
+                acquisition_fps=self._calculate_fps(),
+                poll_ms=(finished - started) * 1000.0,
+                speed_mps=self._last_speed,
+            )
+            self._poll_failures = 0
+            self._first_failure_at = None
+            self.vision_frame_ready.emit(frame)
+            # Same contract as the LiDAR tick: last statement, after the last
+            # socket use, so the prefetch thread never overlaps one.
+            self._prefetch_vehicle_state()
+        except Exception as exc:
+            self._note_poll_failure(exc, "Camera")
+
+    def _watch_vision_liveness(
+        self, now: float, any_fresh: bool, images: list[CameraImage]
+    ) -> None:
+        """
+        One line when the rig comes alive, one warning if it never does.
+
+        The silent failure this exists for was measured live: with
+        requested_update_time=0.0 every streaming buffer stays zero-filled
+        while the read loop spins -- a "working" rig of black frames. The
+        offline suite cannot reach it, so it is a check line, like the mount
+        heights.
+        """
+        if any_fresh and not self._logged_vision_check:
+            self._logged_vision_check = True
+            since = (
+                now - self._vision_streaming_since
+                if self._vision_streaming_since is not None
+                else 0.0
+            )
+            LOGGER.info(
+                "Vision check: first fresh frames %.1f s after attach | "
+                "%d cameras delivering | colour only at this rung",
+                since,
+                len(images),
+            )
+            return
+        if (
+            not any_fresh
+            and not self._logged_vision_check
+            and not self._logged_vision_silence
+            and self._vision_streaming_since is not None
+            and now - self._vision_streaming_since > _VISION_SILENCE_WARN_S
+        ):
+            self._logged_vision_silence = True
+            LOGGER.warning(
+                "Vision check: no camera has delivered a new frame in %.0f s. "
+                "Known trap: streaming buffers stay zero-filled when "
+                "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
+                "positive); also check the graphics preset is above 'Lowest', "
+                "which returns empty camera buffers.",
+                _VISION_SILENCE_WARN_S,
+            )
 
     def _scan_for_parking(
         self,
@@ -3072,9 +3411,13 @@ class BeamNgWorker(QObject):
             try:
                 sensor.remove()
             except Exception:
-                LOGGER.debug("Could not remove LiDAR sensor", exc_info=True)
+                LOGGER.debug("Could not remove sensor", exc_info=True)
         self._sensors.clear()
         self._sensor_names.clear()
+        self._camera_digests = {}
+        self._vision_streaming_since = None
+        self._logged_vision_check = False
+        self._logged_vision_silence = False
         self._geometry = None
         self._mirrored_geometry = None
         self._memory.clear()

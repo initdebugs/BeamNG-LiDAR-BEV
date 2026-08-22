@@ -30,6 +30,20 @@ collection — even on a PyQt6 that imports fine standalone. `pyproject.toml` th
 Installed `beamngpy` is **1.35.1** against a `requirements.txt` pin of `1.34.1`, and
 the simulator at `config.BEAMNG_EXE` is BeamNG.tech **0.38.5.0**, not 0.37.6.
 
+**2026-08-22: the pin is now `beamngpy==1.36` and `BEAMNG_EXE` points at
+0.39.4.0, and the two move TOGETHER** — 1.36 speaks bridge protocol v1.27
+(BeamNG 0.39.x) and `hello()` refuses v1.26 (0.38.5), while 1.35.1 refuses
+0.39.4 the same way. Run `pip install -r requirements-dev.txt` once to pick the
+new pin up (ideally into a venv — the PyQt6 6.11 failure above was two projects
+sharing one global site-packages). Two 1.36 behaviours the code now accounts
+for: `vehicles.get_current()` SILENTLY drops vehicles whose ids fail
+object-name validation (reserved `"vehicle"`, leading digit, `/`, leading `%`)
+— `attach_to_player` distinguishes that from "not present" via
+`get_current_info` and says which; and the streaming `Camera` sensor's buffers
+stay zero-filled forever at `requested_update_time=0.0`, which is why
+`CAMERA_UPDATE_TIME_S` must be positive and the worker logs a `Vision check:`
+warning if no fresh frame arrives.
+
 Run the app: `run_app.bat`, or `$env:PYTHONPATH = "$PWD\src"; py -3.12 -m beamng_lidar_bev`
 (the `.bat` uses `pyw` so there is no console window). Runtime logs land in
 `logs/beamng_lidar_bev.log`; `__main__._configure_logging` resolves that directory as
@@ -251,6 +265,46 @@ or create a stale-frame backlog. `SceneWorker` is Qt-aware only for signals and
 timers; all scene arithmetic is in the Qt-free `world_scene.py`. Scene failures
 clear visualization state and emit `scene_error`; they never enter the
 BeamNG-worker poll-failure budget or disengage controls.
+
+### Vision mode (2026-08-22, rung 0 — see docs/VISION_MODE_SPEC.md)
+
+A second SENSOR MODE, not a third view of the LiDAR data: the header's VISION
+toggle asks the worker for the eight-camera rig (Tesla HW4 layout, derived from
+the same live bbox by `geometry.derive_camera_rig` — **forward is `(0, -1, 0)`**,
+the intuitive sign films the rear seats, and mounts sit OUTSIDE the shell
+because there is no hide-ego flag) instead of the six LiDAR units, and
+`vision_view.VisionView` draws every camera as a labelled grid. Five things are
+load-bearing:
+
+- **The worker owns the mode** exactly as it owns the driving toggles:
+  `set_sensor_mode` no-ops on a repeat, records the choice when idle, and
+  re-attaches THROUGH `attach_to_player` when sensors are live, so the one
+  teardown funnel (`_cleanup_sensors`) is the only path between rigs and a
+  half-swapped set cannot exist. `sensor_mode_changed` is emitted before
+  `sensors_ready` so the GUI knows which controls to enable.
+- **Self-driving and both AEBs refuse in vision mode** — they reason over the
+  LiDAR cloud, which rung 0 does not produce. The unprojection rung restores
+  them; until then the GUI doesn't offer the buttons and the worker refuses
+  anyway (belt and braces, worker wins).
+- **`stream_raw()` returns a memoryview of the LIVE shared buffer** — the
+  simulator keeps writing into it — so `_poll_vision_once` copies exactly once
+  before anything reads twice; `test_the_image_is_a_private_copy...` pins it.
+  Colour only at this rung: annotation is a second geometry pass (measured
+  42→33 Hz sim rate) and depth doubles the copied bytes; nothing consumes
+  either yet.
+- **ACQUISITION counts genuinely NEW frames.** The 40 ms tick re-reads shared
+  memory faster than the ~16–18 Hz cameras update, so each camera's buffer is
+  digested (strided sample) and unchanged re-reads don't count — the same
+  honesty rule the LiDAR metric follows, and the same stale-flush.
+- **`CAMERA_UPDATE_TIME_S` must be positive**: at 0.0 every streaming buffer
+  stays zero-filled while the loop spins — a working rig of black frames,
+  measured live. The one-shot `Vision check:` line reports first fresh frames
+  or warns after 5 s of silence, naming that trap and the graphics-preset one.
+
+Failure handling shares the LiDAR path's time-based budget via
+`_note_poll_failure`; a vision tick emits a frame every tick (black grid with
+live metrics, never frozen), and the same prefetched state poll supplies EGO
+SPEED with the same socket-ordering contract.
 
 ### Frame pipeline
 

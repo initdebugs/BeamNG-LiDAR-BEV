@@ -34,6 +34,28 @@ class SensorMount:
 
 
 @dataclass(frozen=True)
+class CameraMount:
+    """
+    One camera of the Vision-mode rig, in the same vehicle frame as
+    `SensorMount` (+X left, +Y rearward, +Z up; `pos.z` referenced to the
+    vehicle ground plane exactly as the LiDAR mounts are).
+
+    `vertical_fov_deg` is what the Camera constructor actually takes
+    (`field_of_view_y`); it is derived from the designed HORIZONTAL aperture
+    and the aspect ratio by `geometry.camera_vertical_fov_deg`, and both are
+    kept here so the coverage overlay and the spec panel never have to
+    re-derive one from the other.
+    """
+
+    name: str
+    position_vehicle: tuple[float, float, float]
+    direction_vehicle: tuple[float, float, float]
+    horizontal_fov_deg: float
+    vertical_fov_deg: float
+    resolution: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class VehicleGeometry:
     ground_z_vehicle: float
     left_m: float
@@ -345,6 +367,30 @@ class BevFrame:
     disappearing when disengaged is the honest reading, because the car is
     not following it then.
     """
+
+
+@dataclass(frozen=True)
+class CameraImage:
+    """One camera's most recent frame, exactly as the engine streamed it."""
+
+    name: str
+    rgba: np.ndarray
+    """(H, W, 4) uint8, RGBA byte order -- a private copy, never the live
+    shared-memory view (beamngpy's stream_raw hands back a memoryview of the
+    buffer the simulator is still writing into)."""
+
+
+@dataclass(frozen=True)
+class VisionFrame:
+    """The Vision-mode analogue of `BevFrame`: the whole rig, one tick."""
+
+    images: tuple[CameraImage, ...]
+    acquisition_fps: float
+    """Rate of genuinely NEW frames. The display tick re-reads the shared
+    buffers faster than the cameras update, so re-reads are detected (by
+    digest) and do not count -- the same honesty rule as the LiDAR metric."""
+    poll_ms: float
+    speed_mps: float
 
 
 @dataclass(frozen=True)
