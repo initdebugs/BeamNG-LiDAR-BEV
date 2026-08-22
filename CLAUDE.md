@@ -450,6 +450,106 @@ the ground-truth model is enrichment on top. Traffic runs on `WORLD_VEHICLE_TTL_
 `WORLD_COLUMN_MEMORY_M`, because a car MOVES and the scenery window would draw it as a streak of
 itself — and, as below, the two are not merely different thresholds but different **clocks**.
 
+### A car is FITTED, not accumulated, and that is forced by the standstill (2026-08-12)
+
+Feeding `SCENE_VEHICLE` to the voxel store made a car visible. It did not make it look like a car,
+and the reason is arithmetic. Everything else in the store is forgotten by the METRE, so a stopped
+ego keeps every look it ever got and a wall fills in; traffic is on the wall clock at
+`WORLD_VEHICLE_TTL_S` (0.15 s) because it MOVES, and `refresh` ingests one snapshot per
+`WORLD_STORE_REFRESH_INTERVAL_S` — so the traffic store holds **one snapshot, sometimes two**.
+One snapshot of a car at 15 m is four or five azimuth stripes over a metre apart, and
+`_column_runs` meshes exactly what it is handed. Reported from the app as a parked car being
+"barely shown ... while we're both at standstill", and standstill is the worst case rather than
+an unlucky one: **a stationary ego re-samples the same rays, so waiting adds nothing.** Two more
+thinnings stack on top — `_limit_pair` decimates traffic and the whole city's boundary returns on
+one stride against `WORLD_MAX_BOUNDARY_POINTS`, and the slab mesher wants dense evidence.
+
+`vehicle_fit.fit_vehicle_boxes` (config + numpy; Qt-free and BeamNGpy-free, beside `parking` in
+the pure layer) fits an oriented box instead, and `_fitted_actors` renders it through the actor
+delegate that already existed. **Accumulation is how you build a surface whose shape you do not
+know; a car is an object whose shape you do.** Five stripes cannot mesh a surface and are ample to
+fit a footprint. It runs in `compose`, per snapshot, so it also has none of the store's refresh
+lag — which is the same defect seen from the other side, since only a MOVING thing reveals that
+the slab mesh is a cadence tick plus a build old.
+
+**It is ADDITIVE, and that is the safety argument.** Nothing is removed from the voxel store; a
+cluster the fitter declines to claim still draws as solids exactly as before. So the failure mode
+is the old picture, never a car that vanished because a fit was wrong — and `refresh` needs no
+knowledge of it, which is what keeps the two-rate confinement contract untouched.
+
+Six things were measured wrong first, each fixed by a rendered scene or a test:
+
+- **Clustering is in the SENSOR's lattice (azimuth × range), not in world XY.** Stripes spread as
+  `r`, so no world-space distance threshold works: wide enough to hold one car together at 30 m
+  welds two parked cars together at 8 m. In polar coordinates the spacing is one cell everywhere.
+  The range link is deliberately **three times** the azimuth link — a flank seen obliquely is
+  crossed by very few stripes and each lands much further down its length, measured at five range
+  cells between one car's own end face and its flank, so a symmetric link split every car in two.
+- **PCA is the wrong fit and MINIMUM-AREA is degenerate on exactly this shape.** A car seen from
+  behind and to one side is an L; an L's principal axis runs diagonally across it. The textbook fix
+  is the minimum-area rectangle — and the convex hull of a clean L is a **triangle**, for which
+  every rectangle on a hull edge has area `2 × area`, identical. Measured on an L with 1.2 m and
+  2.7 m arms it tied and `argmin` took 24°, drawing a car 24° off the kerb. The **closeness**
+  criterion (sum of `1/distance-to-nearest-edge`) has no tie: both real cases put every return ON
+  an edge, and the diagonal frame puts them through the middle.
+- **Stripe sampling under-measures every horizontal extent**, and the correction must be MEASURED
+  from the cluster rather than assumed from the range. A 1.9 m car at 12.75 m spans 0.87 m raw —
+  thin enough to be rejected as not a vehicle. But applying the nominal spacing unconditionally
+  over-reads anything densely sampled, and a 1.7 m face came back 2.6 m wide. The largest hole
+  between consecutive azimuths IS the sampling interval when the cluster is striped and is near
+  zero when it is dense, so it self-calibrates; capped at the nominal spacing so an occlusion hole
+  inside one object cannot inflate it. The short span is corrected only when it already spans a
+  stripe, or the correction would MANUFACTURE depth and report an assumed length as a measured one.
+- **The only question is "was a FLANK seen".** A length is observable exactly when something longer
+  than any vehicle is wide came back. Believing a short measurement instead drew a **2.4 × 2.4 m
+  car**: a parked car alongside the ego shows a badly foreshortened flank, so its L has two short
+  arms and taking them at face value asserts a square vehicle.
+- **In a corner observation, which arm is the width is settled by GEOMETRY, not by which is
+  longer.** Both arms are under a flank's length by the test above, so length says nothing —
+  and assuming the longer one is the length drew a car 30 m ahead **lying across the road**. The
+  face turned toward the ego is the one across the line of sight; the other arm is the
+  foreshortened stub of a flank. One rule covers the bare end face and the corner, and it agrees
+  with the end face exactly.
+- **The length-to-width ratio of road vehicles is usable evidence about the dimension the returns
+  resolve worst.** Small errors in the frame land almost entirely on the short axis, and the
+  parked cars came back 2.4 and 2.8 m wide against a true 1.85. `VEHICLE_MIN_ASPECT` only ever
+  narrows an over-read; a van at 5.1 × 2.1 and an artic at 9 × 2.6 are untouched.
+
+Three smaller rules: every inference goes **behind** the evidence (the box is pushed away from the
+ego by exactly what was added, so the drawn near face stays on measured returns);
+`confidence` carries how much was resolved and rides the delegate's opacity, so an assumed
+dimension is visibly less certain — but **not too faint**, because a parked car almost always has
+one, so `VEHICLE_FIT_ONE_FACE_CONFIDENCE` is the normal case and at 0.72 the near car showed the
+far one through itself and read as a rendering fault; and a cluster too long to be a vehicle is
+split at its largest hole **only when both halves fit whole vehicles**, because at range one car's
+own end face and flank are separated by exactly the gap two parked cars leave between them.
+
+Ids are carried frame to frame by nearest match (`VEHICLE_FIT_TRACK_MATCH_M`) purely so the
+delegate's damping works: `ActorListModel.set_actors` avoids a model reset exactly when the id
+tuple is unchanged, and a reset rebuilds the delegate and discards its animation state.
+
+The QML delegate gained wheels, a shoulder and a set-back greenhouse — four extra primitives, no
+mesh assets, still generic. Its node now stands at the actor's **ground contact** and the model is
+built upward; the reference-node correction that used to be a bare `y: model.y - 0.45` moved into
+`_render_actor` as `WORLD_ACTOR_GROUND_DROP_M`, because a fitted box reports a true base and must
+not get it.
+
+**Verified by rendering, not by reasoning**, per the pixel-questions rule below: a synthetic
+street (two cars parked at a kerb, one ahead, sampled with BOTH instruments' real azimuth spacing
+— 0.062 rad for the 170° units and 0.26° for the front wedge) fed through the real assembler into
+a real `WorldView`, grabbed and looked at. Before: thin blue slivers. After: three recognisable
+cars, all within 0.15 m of their true centres and pointing along the road.
+
+**Not live-checked**, and its checklist is: that a real car reads as a car at a standstill, which
+is the reported case; that a car crossing in front is drawn along its own direction of travel and
+not across it; that a row of parked cars comes back as separate cars rather than one long box (the
+known limit — two cars closer together than the stripe spacing at their range are not separable,
+and the split rule is what catches the rest); that nothing which is NOT a vehicle acquires a box,
+which would show as a car-shaped model over a hedge or a bin; that the box does not visibly lag a
+moving car, since it is composed per snapshot while the solids under it are not; and that a
+distant car with one stripe on it still shows as solids rather than disappearing, which is the
+additive property doing its job.
+
 ### WORLD scene assembly
 
 **Static geometry is forgotten by the METRE and traffic by the SECOND, and that is two clocks, not
@@ -549,6 +649,76 @@ were re-chosen every frame from a re-ordered array so they shimmered, and a wall
 confetti has gaps between the confetti by construction. Now world-anchored `(x, y, height-bin)`
 voxels keep min/max height over a `WORLD_COLUMN_MEMORY_M` window, collapse into vertical runs, merge
 into slabs and extrude. A dense 10 m wall costs **24 vertices against 2,560**.
+
+### The blocks are finer than the ground, and that asymmetry is measured (2026-08-12)
+
+`WORLD_COLUMN_SIZE_M` is **0.125 m** against `WORLD_CELL_SIZE_M`'s 0.25, where the two were equal
+before. The complaint was that the view looks blocky, and the two halves answer it very
+differently.
+
+**Only the slabs are blocky.** `_ground_mesh` shares lattice corners, so the ground is one
+continuous surface with no steps in it by construction — refining it cannot remove a defect it
+does not have. A slab's drawn thickness, on the other hand, tracks the cell size *exactly*:
+measured 0.50 / 0.25 / 0.15 / 0.12 m of drawn wall at those cell sizes, so a kerb was a full
+quarter-metre thick and so was every wall.
+
+**The slabs are also the cheaper half and the better-sampled one.** Measured on an accumulated
+street drive (99.5k-point cloud, 70 m of travel, the stores at steady state) against the 120 ms
+`WORLD_STORE_REFRESH_INTERVAL_S` cadence:
+
+| ground | slabs | build | |
+|---|---|---|---|
+| 0.25 | 0.25 | 44 ms | what this replaces |
+| 0.25 | **0.125** | **73 ms** | **this** |
+| 0.125 | 0.25 | 129 ms | |
+| 0.125 | 0.125 | 182 ms | over the cadence |
+
+The ground is ~2.5× the cost because it is a **disc** and area goes as `r²`, where a facade is a
+surface. It is also where refining buys least, because the ground's radial sampling is what
+collapses with range. Fraction of carriageway a return actually hits:
+
+| band | 0.25 | 0.125 |
+|---|---|---|
+| 0–15 m | 99% | 92% |
+| 15–30 m | 64% | 56% |
+| 30–50 m | 46% | 31% |
+| 50–80 m | 27% | 11% |
+| 80–100 m | 8% | 3% |
+
+Inside 15 m the sampling genuinely supports a finer ground cell; past 30 m halving it nearly
+halves the hit rate, because the same returns are divided among 4× the cells, and cells invented
+by `bridge_gaps` rather than observed rise from **5.7% to 13.9%** of the surface. A wall has no
+such problem: it is sampled thirty times finer vertically than in azimuth (`r·Δθ` 0.04 m against
+`r·Δazimuth` 1.24 m at 20 m), so that detail was there and was being quantised away.
+
+Three companions move with it, and two of them are the ways to make the change a **regression**:
+
+- **`WORLD_MAX_COLUMNS` 90k → 200k.** The store fills with ~4× the voxels for the same geometry
+  (measured 142k against 58k), and at the old cap the cull binds and drops the excess
+  **oldest-first** — which is precisely the accumulated stripe sweep that fills a striped facade
+  in, so walls behind the car would start dissolving. It would have discarded 37% of evidence it
+  had already paid to collect.
+- **`WORLD_COLUMN_BRIDGE_CELLS` 6 → 12**, so the bridge still spans the same physical 1.5 m.
+- **`WORLD_COLUMN_HEIGHT_M` stays at 0.25**, now deliberately coarser than the horizontal size.
+  Halving it too was measured at 87 ms against 86 and 164k voxels against 142k — it buys nothing
+  visible and costs a fifth of the store.
+
+`WORLD_ORIENT_MIN_CELLS` deliberately does **not** move; see its own entry under the WORLD
+constants, where the reasoning that it should is worked through and refuted with a measurement.
+
+The slab half of the build had no budget guard at all — the existing
+`test_covering_the_ground_stays_inside_the_scene_budget` uses a disc of ground returns and barely
+touches the voxel store — so `test_the_slab_half_of_the_build_stays_inside_the_scene_budget` is
+its companion, and it fails against the old cap rather than merely passing against the new one.
+
+**Not live-checked.** The measurements are offline against synthetic clouds sampled from the
+documented ring and stripe geometry, which pins arithmetic and cost but cannot pin what the
+simulator returns. Its checklist: that walls, kerbs and parked cars read visibly crisper rather
+than merely thinner (a 0.125 m slab has less visual mass, and the obstacle band has very little
+luminance room — face shading is a 1.1–1.3:1 crease cue); that SCENE BUILD does not start
+logging over budget on a dense city map, which is the scene most likely to exceed the numbers
+above; and that walls BEHIND the car still fill in over a drive rather than dissolving, which is
+the `WORLD_MAX_COLUMNS` failure and the one to watch for first.
 
 **The third key field is what lets a tree be a tree, and it is not a refinement.** The store used
 to hold one `(base, top)` span per XY column. Grass and terrain are boundary returns — the group
@@ -1913,6 +2083,434 @@ under the path's 1.0), 5 mm under the path's height so the plan wins where they 
 depth-tinted for the path's own reason. Both overlays exist only while self-driving follows a
 route — the overlay disappearing when disengaged is the honest reading.
 
+### Parking bays are found from PAINT, and that is forced by the empty case (2026-08-12)
+
+`parking.py` (config + models + numpy; Qt-free and BeamNGpy-free like `planner` and `aeb`) finds
+candidate bays, and `BevFrame.parking_slots` draws them for the user to click. **Detection and
+selection only — nothing here steers, brakes, or reaches the planner or either AEB band**, which
+is what makes a speculative bay an acceptable thing to draw at all:
+`test_the_parking_scan_never_reaches_the_planner_or_either_aeb_band` pins it by IDENTITY, the
+same way `test_memory_never_reaches_the_aeb_band` pins the planning memory.
+
+**The obvious detector is gap-based and it cannot do the job asked for.** Measuring the hole
+between two parked cars is what production parking assists do, works on unannotated maps and
+needs no new sensing — and an EMPTY lot is one enormous gap with nothing in it to find. An empty
+bay is *defined* by its dividers, so paint is the only signal that survives the empty case.
+(Confirmed live: bay dividers on this map ship as annotated decals and read through the LiDAR,
+the same as the lane paint `Marking check:` confirmed. A lot whose bays are baked into the ground
+texture returns nothing, and no amount of accumulation recovers it — there is no intensity
+channel, per the retired visual-paint experiment.) Gap-based remains the right FALLBACK for
+unpainted lots and is not built.
+
+Three pipeline steps, and each was measured wrong at least once first:
+
+- **The stripe angle is SWEPT, not fitted.** A global PCA over a bay row returns the frontage,
+  because eight 5 m dividers spread over 17.5 m have their greatest variance across the row — the
+  wrong answer by exactly 90°, on the one geometry this exists for. The sweep instead scores each
+  angle by how sharply the PERPENDICULAR projection concentrates the cells.
+- **And it is swept MORE THAN ONCE, because a lot is rarely one row.** The sweep returns ONE
+  angle, so a single pass keeps whichever row carries the most paint and silently drops every row
+  at a different orientation. Reported from the app as "the scan only uses the front sensor" —
+  and it is not a sensing problem at all: **nothing in the detector filters by bearing**, and a
+  row directly behind the car is found in full when it is the only one there (measured: 4 of 4).
+  What it is, is that in a real lot the row you happen to be facing wins the sweep, which is
+  indistinguishable from a forward-only scan. Each pass now consumes the cells its stripes
+  claimed and re-sweeps the remainder (`PARKING_MAX_ROWS`), so two rows at 90° both survive
+  (measured: 4 + 4 alone, 8 together, and 11 across three rows spanning bearings 7°–292°). A pass
+  consumes its stripes whether or not they yielded a bay, or the next pass re-finds the same angle
+  for ever and only the loop bound ends it.
+- **That score needs both a width cap and a per-run division, and each fixes a different
+  failure.** Sum-of-squared bin counts — the standard concentration measure — lets one long head
+  line across the bay heads outscore eight genuine dividers (7,744 against 5,408). Restricting to
+  narrow runs fixes that but then PLATEAUS: a 6 m divider stays inside the 0.7 m cap for ±7°, so
+  mass was flat across a 14° band and `argmax` took its first element — measured, 83° for
+  dividers lying at exactly 90°, after which the stripes merged and no bay survived. Dividing
+  each run's mass by its width keeps the score climbing as the projection tightens (62.0 at 90°
+  against 20.7 at 83°).
+- **`PARKING_OFFSET_BIN_M` must never be finer than `PARKING_MARKING_CELL_M`, and the failure is
+  total rather than gradual.** Store cells sit on a 0.2 m lattice, so at a 0.1 m bin a divider
+  seen ALONG its length lands in alternating occupied and empty bins — it reads as a row of
+  one-bin "stripes" and ties the score of the same divider seen end-on, so the angle 90° out
+  scores equally and nothing is found at all. At or above the cell pitch it fills consecutive
+  bins, becomes one wide run, and is correctly rejected. It costs no precision: a stripe's offset
+  is the MEAN of its cells' own positions, never its bin centre.
+- **`PARKING_MIN_BIN_CELLS` is what makes a head line survivable rather than merely outvoted.**
+  Seen from the dividers' own angle, a line across their heads does not pile into one bin — it
+  smears along the whole row and BRIDGES every divider's bin into a single run too wide to be a
+  stripe. Measured, that took a scene from seven bays to none, which is worse than being
+  outscored. A divider seen end-on stacks its whole length into one bin; anything crossing the
+  projection leaves a sample or two, so a floor of 3 removes only the smear.
+
+Two further rules the geometry carries:
+
+- **Depth is the SHORTER DIVIDER'S LENGTH, and the overlap is only an ADJACENCY test.** Measuring
+  depth as the overlap is the obvious reading and it silently deletes every ANGLED lot. In a
+  herringbone layout the dividers start along a common aisle edge and run off at an angle, so
+  neighbours are staggered along their own direction by `width / tan(angle)` — and subtracting
+  that stagger from the depth measures something the bay's real depth does not depend on.
+  Measured on a proper 2.5 × 5.0 m lot, the overlap runs 5.00 / 4.33 / **3.56** / 2.50 / 0.67 m
+  at 90 / 75 / 60 / 45 / 30°, so a **60° bay — the commonest angled layout — was rejected by
+  4 cm** against the 3.6 m floor, and everything below it too. Perpendicular bays were unaffected,
+  so a lot whose row curves gets some bays and not others. The aisle test survives the change
+  because it works on the LENGTH directly: two 25 m edge lines are 25 m deep either way.
+  `PARKING_STRIPE_MIN_OVERLAP_M` (0.5) is what still separates two facing rows, whose overlap is
+  metres NEGATIVE, and it is 0.5 rather than 1.0 because a 30° lot leaves only 0.67 m.
+- **An offset run is not yet a divider, and TWO FACING ROWS are what prove it.** Facing rows
+  across an aisle put their dividers at the SAME perpendicular offset, so each pair merged into
+  one stripe spanning both rows and every bay between them then failed `PARKING_BAY_MAX_DEPTH_M`.
+  Measured: 5 bays + 5 bays came back as **0**. Each offset run is therefore split into segments
+  along its own length wherever it gaps by more than `PARKING_STRIPE_GAP_M`.
+- **Pairing runs ONCE over every divider the scan found, in 2D, across all sweeps** — and getting
+  there took three tries, each fixing a real live failure. Sort-adjacency on the offset within a
+  pass was the first: once runs are split the offsets *repeat*, so it saw only zero-width and
+  cross-row pairs, and a stray fragment (a kerb line, a worn patch) between two dividers broke
+  the chain and took out the bay on **both** sides. Nearest-overlapping-partner fixed that but
+  was still **per pass**, which is the defect a real lot actually hit: a row following a curved
+  wall has non-parallel dividers, so one swept angle fits part of it and later sweeps claim the
+  rest — and neighbours found on different passes could never meet. Measured live: **18 dividers
+  → 12 bays with 6 unpaired**, and on a single sweep **10 dividers → 5 bays with 5 unpaired**.
+  `_Stripe` therefore carries centre/direction/half-length rather than the sweep's own
+  offset/lo/hi, so pairing is frame-free.
+- **Each divider takes its nearest valid partner on EACH SIDE**, not one nearest overall. A
+  divider in the middle of a row bounds the bay to its left *and* the one to its right, and
+  nominating once loses whichever it did not pick — measured, two bays of ten on a pair of facing
+  rows. Both members of an adjacent pair then nominate each other, which makes the dedupe exact.
+- **`PARKING_STRIPE_MAX_WIDTH_M` is also the tolerance on the SWEEP ANGLE**, which is not obvious
+  from its name. A divider `t` off the swept angle spreads its length over `L·sin(t)`, so at 5 m
+  long a 0.7 m cap silently dropped anything past 8° — on a 150 m-radius curved row that cost a
+  divider and with it a bay. At 1.0 m it tolerates ~11°, and stays under half the narrowest bay
+  so two adjacent dividers still cannot merge into one run.
+- **The scan radius must be comparable to how far paint is DRAWN.** WORLD renders road markings
+  to `WORLD_ROAD_RADIUS_M` (100 m) while the scan culled at 35, so a lot showed a full row of
+  painted bays with outlines on only the near few — measured, detection stopped dead at 32.9 m.
+  `PARKING_SCAN_RADIUS_M` is now 60, sized to `LIDAR_ROOF_FAR_M` (55 m, the all-round ground
+  reach) rather than to a round number, since past that only the forward road-scan wedge reaches
+  and bays beside and behind the car would stop being found anyway. The sweep's cost is driven by
+  cell count and the angle count, not the radius: 9.1 ms at 35 m against 9.3 at 60 on the same
+  2,786-cell lot.
+
+**`ScanReport` exists because a screenshot cannot answer "why is there no outline on that painted
+bay".** Detection is a chain of geometric filters and the screen shows only the survivors, which
+is exactly how the two defects above were reported. The report counts what each filter consumed
+and the `Parking check:` line prints it — one-shot, then only when the bay count CHANGES or a
+minute passes, because a per-scan line at 2 Hz would bury the log. A row that is present but
+unpaired reads as `N dividers -> 0 bays ... N unpaired`; a lot whose paint never annotated reads
+as `0 marking cells`; the cap reads as `over the cap`.
+- **Occupancy never adds or removes a bay**, it only marks one. A bay whose paint is there is a
+  bay; "that one has a car in it" is a different claim from "that one does not exist". The
+  rectangle is shrunk by `PARKING_OCCUPANCY_MARGIN_M` first, because the dividers themselves, the
+  kerb at the head and a neighbour's wing mirror all sit on the boundary.
+
+**Three different rates, on purpose.** Marking cells are folded into `MarkingMemory` EVERY tick,
+because the continuous dividers the detector needs exist only by accumulation — one frame lays
+ground rings ACROSS a divider, not along it, so a stationary car at the lot entrance sees arcs
+cutting the lines rather than the lines. The bay SET is rebuilt every `PARKING_SCAN_INTERVAL_S`
+(the sweep is the expensive part and a lot does not change shape). The PROJECTION into the BEV
+frame runs every tick regardless, so the drawn rectangles stay glued to the ground between scans
+instead of lagging the car.
+
+`MarkingMemory` is its own store rather than a third array on `PlanningMemory`: that one is
+documented planner-only and is gated on `self._self_driving`, whereas scanning for a bay is
+something you do while driving the car yourself. It forgets by the METRE like every other store
+(`PARKING_MARKING_MEMORY_M` at 80 m, four times the planner's, because paint does not move, the
+ego pose is ground truth, and a lot is crossed at a crawl) with the same 25 m teleport guard.
+
+**Bays are drawn and picked in WORLD, and RAW BEV deliberately does not draw them.** They are a
+patch of GROUND, so the view that draws the ground draped over real terrain is where they belong;
+in the plan view they were a rectangle at 10 px on a 35 m radius. `PerceptionSnapshot.parking_slots`
+carries them to the compose thread — the `route_world` precedent, frozen snapshot only, so the
+two-rate confinement contract is untouched — already projected into the BEV frame by the worker,
+because BEV to render is a fixed relabelling (`right, lift, -forward`) and re-deriving it would
+introduce a second pose to disagree with the first.
+
+**Picking is the ENGINE's raycast, not arithmetic here.** `View3D.pick` is the only thing that
+knows this camera's projection, so QML answers *where in the scene* the click landed and
+`SceneBridge.parkingPicked` turns that point into *which bay* with the same containment test the
+worker uses. Reproducing the projection in Python would mean pinning down Qt Quick 3D's euler
+convention by hand — the class of guess this project has measured its way out of twice. Verified
+by clicking: a viewport sweep picks each drawn bay and gets its correct world centre back.
+
+**Bays a scan MISSES survive for a short distance** (`remember_bays`, `PARKING_BAY_MEMORY_M`).
+Each bay sits near several thresholds at once, so a scan can drop it and find it again a moment
+later — reported live as the bays flashing and, far worse, as the SELECTION going away with them,
+because a selection is re-matched against the offered set every scan. Remembered by the METRE
+like every other store here, and a freshly found bay always replaces its remembered twin, so
+memory only ever fills gaps and never overrides what the sensors say now. The identity key is a
+coarse 1 m grid: the same bay is re-measured every scan and its centre wanders a few centimetres,
+so an exact key would make every scan a different bay and remember nothing.
+
+**A selection is held as a WORLD POSE, never as an index.** The bay set is rebuilt on its own
+cadence and a subscript means a different bay afterwards, so the bridge reports the clicked bay's
+world centre and the worker re-matches it within `PARKING_SELECT_MATCH_M`. `match_selection`
+returns None rather than the nearest bay regardless — a selection whose paint has aged out must
+go quiet, not silently become its neighbour. A click that hits no bay emits
+`parking_selection_cleared` rather than a coordinate chosen to miss, because "deselect" is a
+different message from "select the bay here" and a fabricated coordinate would depend on the
+match radius to stay a miss.
+
+### Translucent vertex colour DOES NOT BLEND in this scene, and a bay is an outline because of it
+
+The bays were built as a translucent wash first. Measured on the real GPU over the road, one flat
+`#c6c8c1` quad renders:
+
+| vertex alpha | sampled | |
+|---|---|---|
+| 1.0 | (198,200,193) | correct — exactly `#c6c8c1` |
+| 0.999 | (198,200,193) | correct |
+| 0.9 | (220,222,215) | **brighter than opaque** |
+| 0.5 | (255,255,255) | saturated white |
+| 0.2 | (255,255,255) | saturated white |
+
+Premultiplying the colour changes nothing, and swapping in the AEB corridor's own material
+changes nothing, so it is not the material declaration. Vertex **RGB** binds perfectly (alpha 1.0
+reproduces the configured colour exactly; a red-forced buffer renders red), so it is the alpha
+channel specifically. A 0.20 wash therefore rendered every bay as one solid white slab.
+
+So the parking overlay is **entirely opaque** and gets its hierarchy from HUE and from GEOMETRY:
+a candidate bay is an OUTLINE (which is how a real bay is painted anyway, and it leaves the road
+and the bay's own dividers visible through the middle), an occupied bay adds a cross, and only
+the SELECTED bay is filled — exactly one ever is, so an opaque fill is affordable there and is
+what makes the choice unmistakable. `test_world_scene.py` pins that every parking vertex ships at
+alpha 1.0.
+
+**This puts a question over the AEB overlay**, which carries a 0.04 wash and a 0.80 rail in one
+buffer on the same assumption. CLAUDE.md's supporting measurement used a **black** quad, and
+black is the one colour that cannot tell a correct blend from this failure — both give
+`background · (1 − a)`. The AEB corridor's bright violet and red at low alpha are exactly the
+case that would blow out. Not investigated here; it is a separate overlay with its own checklist.
+
+**Not live-checked**, and its checklist is: bays appearing at all on a real lot (the
+`Parking check:` line reports count, evidence and the nearest bay's size, and a marked lot
+producing nothing means that map's bays are texture-baked rather than decals); bays appearing
+BEHIND and BESIDE the car as well as ahead, which is what the multi-row sweep is for; the row
+filling in as you drive past rather than only under the car; whether real bay paint holds
+`PARKING_MIN_BIN_CELLS` per bin at range or wants lowering; whether a real lot's head line, arrows
+and hatching (which are `DRIVING_INSTRUCTIONS`, deliberately not in `MARKING_CLASSES`) leave the
+sweep alone; that a bay with a car in it reads occupied from the car's own returns; and that a
+click lands on the bay under the cursor at a range and a camera orbit, since the raycast is the
+one part with no offline proof.
+
+### Driving into the bay: a separate controller, because the planner cannot (2026-08-12)
+
+`parking_drive.py` (config + models + numpy; Qt-free and BeamNGpy-free) drives the manoeuvre.
+It is deliberately **not** the arc planner, and the reason is already in this file: the S-curve
+family was built, measured to fix the narrow-road pass, and **not landed** because under per-tick
+re-planning the car drove the outbound half and re-picked it for ever — "landing it safely needs
+the planner to COMMIT to a manoeuvre it has begun". Parking is that problem in its purest form.
+
+**What is committed is the GOAL, not the path.** The bay is world-anchored and the worker
+re-projects it into the BEV frame every tick, so the path is re-derived each tick to an unmoving
+target. That is a feedback law, not a re-choice — there is one target and one path family, and
+the planner's failure mode (re-picking a different candidate each tick) cannot occur when there
+is nothing to pick between. It produces a `ControlCommand` inside a `DrivingPlan`, so
+`worker._actuate` sends it unchanged, gear handling and the AEB override included.
+
+**Scope: forward, nose-in only.** A bay needing a pull-forward-and-back shuffle is reported
+UNREACHABLE rather than half-attempted, which would end with the car across the lines. The phase
+machine is shaped so a reverse segment could be added; it is not implemented.
+
+**There is a HARD geometric envelope, and it is the feature's main limitation.** One arc of
+radius R changes heading by 90° and displaces the car *exactly* R sideways and R forwards, so a
+square-on bay nearer than `MIN_TURN_RADIUS_M` (6 m) ahead, or nearer than that to the side,
+**cannot be entered nose-first at all**. Reported live as "it starts and then stops right away"
+— and it was not a bug: the bay clicked was inside the envelope. Three things follow, and the
+first two are dead ends worth recording so they are not re-tried:
+
+- **A smaller displacement needs a smaller radius, which the car does not have.**
+- **An S-turn does not help.** A single arc is already the MINIMUM lateral displacement for a
+  given heading change; any S displaces more.
+- **A straight staging run up the aisle does not help either**, and was built and removed. It
+  moves the bay CLOSER, which is the wrong direction for precisely the bays that fail — measured,
+  the reachable envelope was identical with and without it.
+
+What reaches a near bay is reversing in or repositioning first. `reachability()` names the reason
+in words the driver can act on ("only 4.0 m ahead and turning into it needs about 6.0 m — back
+up, or pick one further ahead") instead of the bare "no single forward move fits", which is true
+and useless. `test_the_reachable_envelope_is_the_turning_circle_not_a_tuning_choice` pins it so
+nobody "fixes" it by loosening a constant.
+
+### The parking planner is a SEARCH now: Hybrid A* over Reeds-Shepp (2026-08-12)
+
+`reeds_shepp.py` + `hybrid_astar.py` replaced the hand-written manoeuvre families, because those
+could not be patched into covering a real lot and the reason was structural rather than a matter
+of tuning. Each family was ONE straight-arc-straight, which needs `R(1 - cos t)` of lateral room
+and `R sin t` of longitudinal room to turn through `t`: a bay 1.9 m to the side needs 56 degrees,
+so 2.6 m across and 5.0 m along **for the arc alone**, and the setup pose it would have to reach
+first is itself beside the car. Widening every search range changed the reachable envelope by
+nothing, which is what proved it was the path family and not the parameters.
+
+- **Reeds-Shepp is a STEERING FUNCTION, not a planner.** Shortest path between two poses for a
+  car with a minimum radius that can reverse, in EMPTY space. It knows nothing about obstacles.
+  Implemented as three word formulas plus three symmetries (timeflip, reflect, backwards) = 24 of
+  the 48 words; the omitted CCSC/CCSCC families cost a slightly longer path, never a wrong one.
+  Leaving out the BACKWARDS symmetry alone left 37% of random poses with no word at all.
+- **The LRL branch is derived, not copied.** Published sources disagree on it and the wrong one
+  is silently plausible -- it yields a path of the right SHAPE ending somewhere else. `t` is
+  `theta + u/2`, not `theta + pi/2 + acos(rho/4)`, and the only check that catches it is driving
+  the path and measuring where it stops. Every returned path lands on its goal to 1e-8.
+- **Hybrid A\* is the planner.** It searches the car's STATE (position and heading) by expanding
+  short arcs it could really steer, so every node is drivable by construction. Reeds-Shepp appears
+  twice: as the heuristic (straight-line distance is near zero for a goal beside the car facing
+  the wrong way, which is the case needing the most manoeuvring) and as an analytic shortcut to
+  finish exactly. Measured: every previously-refused bay solves, 16-141 ms, ending on the goal.
+- **`Occupancy` distinguishes FREE, BLOCKED and UNKNOWN**, and that third state is new to this
+  codebase. The stores record where returns CAME FROM, so absence of a return has always read as
+  drivable -- and a planner allowed to route through never-observed space plans through walls it
+  has not looked at. Road returns are positively free; everything unseen is traversable at a
+  COST rather than forbidden, because forbidding it strands the car in a lot it has half seen.
+
+Four things the executor needed before it could drive a searched path, each caught by a test:
+
+- **A searched leg carries its own PATH**, not just an endpoint. The canned legs were each a
+  single arc, so a path could be re-derived from the endpoint; re-deriving a searched leg that
+  way produced a **148 m path for a leg 6 m away**.
+- **Pure pursuit must locate the car ON the path first.** A re-derived path starts at the car, so
+  index 0 is right; a searched leg is a fixed path over the ground and the car is somewhere along
+  it. Assuming index 0 sent the tracker chasing the far end and drove the car **71 m away**.
+- **Re-plan at every cusp.** Leg two was planned from where leg one was MEANT to finish, and over
+  a few metres of reversing there is no distance in which to soak up the difference -- it parked
+  **1.20 m off the centreline**. Planning afresh from the real pose resets the error, and a cusp
+  happens once or twice a manoeuvre rather than once a tick.
+- **The gear is committed only once STOPPED.** `self._gear` is what the shift holds while the car
+  is still rolling, so assigning it the gear about to be requested makes the hold a no-op and
+  sends the shift at speed -- caught at 1.13 m/s.
+
+**Cost, and it is real.** A search is 16-141 ms and re-planning at each cusp means several per
+manoeuvre. That is affordable once per manoeuvre on the worker thread but it is NOT a per-tick
+budget: if the engage moment ever feels like a hitch, moving the search to the scene worker's
+pool is the fix, not making it cheaper.
+
+### The multi-leg manoeuvre: position, then reverse in (2026-08-12, superseded)
+
+`plan_manoeuvre` plans the legs that put the car in a bay the nose-in envelope cannot reach —
+**position forwards, then reverse in** — and `ParkingDriver` walks them. Measured closed-loop
+against a kinematic bicycle: bays 2 m ahead and 6 m to either side, level with the car, and 3 m
+BEHIND it all park square and facing out, which is what reversing in means.
+
+- **A leg is held in the BAY's frame, not as a path**, and that is the design. The bay is
+  world-anchored and re-projected every tick, so a leg stays put while the path to it is
+  re-derived from wherever the car actually is — the single move's feedback argument, extended to
+  a sequence. Storing a path would freeze a plan the car then drifts off; re-deriving the whole
+  SEQUENCE every tick would reintroduce the re-choice problem this controller exists to avoid,
+  flipping between manoeuvres and finishing none. **Commit to the leg, re-derive the path.**
+- **Reversing is the forward solver in a frame rotated 180°** (`_reverse_reach`): solve to the
+  negated target and negate the answer. Same trick as `aeb.mirror_points` and the steered
+  reverse — a rotation preserves handedness, so every helper applies unchanged.
+- **Backing in ends the car facing OUT**, so it is the TAIL that clears the head of the bay and
+  the stop pose is measured from `rear_m`, not `front_m`.
+- **Every leg is checked from where the PREVIOUS one finishes.** A sequence is offered only when
+  all of it solves; starting one whose second half is impossible leaves the car across the aisle.
+
+Measured coverage for 90° bays (rows metres ahead, columns metres to the side): the 5–8 m band
+now solves at **every** distance including 1 m ahead, where nose-in needs 6 m. **Still unreached:
+bays under ~5 m to the side**, which need a genuine three-point turn (forward, reverse, forward)
+rather than two legs.
+
+Five things the executor got wrong first, each caught by a test written for it:
+
+- **The gear must not be SENT until the car is at rest.** A leg ends while the car is still
+  rolling, so commanding the new direction as the leg ends sent a reverse shift at **1.22 m/s**.
+  The old gear is held until the car has actually stopped, and only then is the new one asked
+  for; `shiftToGearIndex` has side effects and the box only engages at rest.
+- **A finished park must keep asking for the gear it ARRIVED in.** The hold branch hard-coded
+  forward, so a park that ended by reversing was sent back to drive at **1.01 m/s** while still
+  rolling to a stop.
+- **A SETUP leg is not made until the car is SQUARE to it, not merely at its position.** Position
+  alone declared it done with the car still turning; the reverse then would not solve from where
+  the car actually was, so it re-planned, arrived at the same setup, and cycled — stuck in
+  SHIFTING for the whole run. The FINAL leg is exempt: nothing follows it, and its heading is
+  what the tracker spends the last metre correcting.
+- **Re-planning is BOUNDED** (`PARKING_MAX_REPLANS`). Re-planning when the committed sequence has
+  become undriveable is right — the goal never changes, so it is not per-tick re-choosing — but
+  unbounded it cycles.
+- **The setup's offset side and its FACING side are searched independently.** Tying them together
+  made the manoeuvre work on one side of the aisle and not the other: a bay 7 m to the RIGHT
+  failed while its mirror 6 m to the left parked. Which way the car should point at the setup
+  depends on where it is coming FROM, not on which side of the bay it waits.
+
+**Rear AEB is left armed and allowed to win.** Unlike the forward brake it arms at 0.5 m/s, so it
+really can fire while backing in — which is exactly when it should. If it fires the manoeuvre
+hands back rather than fighting a system that has decided the car is about to hit something.
+
+**Still not reached: some poses beside the bay** — measured, a bay 4 m ahead and 7 m to the right
+plans a setup the car then cannot reverse out of, exhausts the re-plan budget and hands back. It
+stops safely rather than cycling, but it does not park. A three-point turn (forward, reverse,
+forward) is what covers those, and it is not built.
+
+Five things were measured wrong first, and each is a constant or a construction now:
+
+- **A cubic Bézier is the wrong path family and cannot be told about a minimum radius**, only
+  measured afterwards. On the commonest case in a lot — a bay square-on to the aisle — the
+  flattest Bézier reaching the pose still bent to **0.20 1/m against the car's 0.167 limit**, so
+  every square-on bay came back unreachable. `_straight_arc_straight` hits the limit exactly and
+  is what a driver does: straighten, one steady turn, straighten.
+- **The approach distance must be SEARCHED, and the intuition is backwards.** The entry point
+  sits that far back *along the bay axis*, which for a square-on bay is back across the aisle
+  toward the car — so a long approach leaves only a couple of metres of lateral offset while
+  turning 90° displaces the car by a whole radius. They solve at about a metre: turn in AT the
+  mouth, not five metres before it.
+- **The TIGHTEST feasible radius is preferred, not the widest**, and this is also the opposite of
+  the obvious choice. On a square-on bay the arc must deliver a fixed lateral offset, so a tighter
+  arc finishes sooner and leaves a **longer straight run-in**: measured, the widest feasible
+  radius left 0.6 m of run-in and the car was still **7.2° off square** as it crossed the stop
+  plane; the tightest leaves 1.8 m and it arrives straight. A tight turn costs nothing at parking
+  speed — 0.33 m/s² at the 6 m minimum.
+- **Arrival is judged on the STOP POSE, before any path is planned.** The car tracks with a
+  lookahead so it can roll centimetres past the stop point, and once the pose is behind it *no
+  forward path reaches it* — so judging arrival by "the path got short" reported UNREACHABLE at
+  the exact moment of arriving, measured **0.41 m past the mark**. Passing the stop plane IS
+  arriving. Two smaller versions of the same trap: `PARKING_PATH_SLACK_M` (tracking lag put
+  `run_in` at −0.016 m and the exact construction refused it) and the zero-approach endgame
+  candidate.
+- **Speed is capped while there is HEADING left to lose**, not only by distance-to-go. Distance
+  alone let the car cross the stop plane at cruising speed with the wheel still wound on —
+  centred in the bay but visibly crooked. `PARKING_TURN_SLOW_DEG` is what gives the tracker time
+  to straighten.
+
+**Parking creeps below `AEB_MIN_SPEED_MPS` on purpose** (1.4 against 2.0 m/s), so the forward
+emergency brake stays in STANDBY and cannot fire at the kerbs, walls and neighbours a park drives
+close to by design. That is a deliberate property, not a coincidence to be tidied: the manoeuvre
+therefore does **its own** corridor check (`blocking_distance`) over the swept body, and
+`test_the_manoeuvre_stays_below_the_speed_the_brake_arms_at` pins the relationship.
+
+Self-driving is disengaged when parking engages — one thing steers the car at a time — and the
+manoeuvre's ribbon **replaces** the plan ribbon in WORLD while it runs, because the arc planner
+is not running and two ribbons would claim two opinions about where the car is going. `ARRIVED`
+stays engaged and HOLDS the brake: this is the one place the hand-back-a-coasting-car rule is
+wrong, since releasing at the stop line lets the car roll out of the bay.
+
+`test_parking_drive.py` runs the real controller closed-loop against a kinematic bicycle,
+re-projecting the world-anchored bay every tick exactly as the worker does, and asserts where the
+car **stops** — within 0.30 m of the bay centreline and 6° of square, for straight-in, square-on
+left and right, 45°, and an offset start.
+
+**Not live-checked.** Its checklist: that a real bay is entered squarely rather than clipping a
+line; that `Park check:` reports UNREACHABLE rather than attempting a bay the car cannot make in
+one move; that the corridor check stops the car for a neighbour parked over the line (AEB will
+NOT help — it is in STANDBY by design); that the car holds in the bay instead of creeping; that
+disengaging hands back a coasting car; and that the gear stays in DRIVE throughout, since a
+single forward move is all this commits to.
+
+### Reliable parking execution update (2026-08-12)
+
+The active bay and trajectory are now both committed. Engagement copies the complete selected
+`ParkingBay` into an immutable `ParkingJob`; rescans may change the overlay but cannot move the
+active goal. Every leg carries a bay-relative path and the tracker advances monotonically along
+it. Replanning is event-driven and bounded: blockage, excessive cross-track error, lack of
+progress, a direction cusp, or a stopped terminal correction.
+
+Parking independently activates obstacle extraction and maintains a bounded world-cell
+`ParkingMap`. Hybrid A* searches pose plus gear, checks the swept oriented body between samples,
+and returns costed cusp-safe forward/reverse legs. The live corridor check uses the same body
+geometry from current progress. An occupied selected bay is refused before actuation.
+
+Crossing the path endpoint enters `SECURING`, not `ARRIVED`. Success requires a stopped dwell,
+pose and heading tolerances, and the measured body inside the bay envelope. The final control
+applies the parking brake, marks the job `SUCCEEDED`, and ends automatic parking without running
+the normal release-controls funnel. Blockage remains latched until the car is stopped and clear;
+an unreadable gearbox uses limited signed-direction confirmation and opposite motion fails
+stopped rather than being guessed correct.
+
 ## Configuration gotchas
 
 `config.BEAMNG_EXE` is a **hardcoded absolute path** to the local BeamNG.tech install. Anyone
@@ -2017,6 +2615,39 @@ had a measured failure:
 `geometric_obstacle_sets` costs ~4.4 ms of the 40 ms tick for the planner's floor alone and
 ~5.1 ms for both floors, measured on a 60k-point worst case; AEB's corridor scan adds 0.05 ms.
 
+The parking constants have the same "looks like one quantity, is two" trap:
+
+- `PARKING_MARKING_CELL_M` (0.2, the store's grid) vs `PARKING_OFFSET_BIN_M` (0.25, the sweep's
+  grouping). The second must stay **at or above** the first — see the parking section; below it
+  the detector silently finds nothing at all rather than finding less.
+- `PARKING_MIN_BIN_CELLS` (3, is this bin a divider seen end-on) vs `PARKING_MIN_STRIPE_CELLS`
+  (8, is this run a believed divider). The first removes a crossing line's smear so the runs stay
+  separate; the second decides whether a separated run is real. Raising the first toward the
+  second starts deleting genuine dividers at range.
+- `PARKING_STRIPE_MAX_WIDTH_M` (0.7, how wide a stripe may be) is what makes both the width cap
+  and the sharpness division mean anything; it is not a paint width, it is the tolerance on
+  seeing a divider end-on.
+- `PARKING_MARKING_RADIUS_M` (70, how far paint is STORED) vs `PARKING_SCAN_RADIUS_M` (60, how
+  far bays are OFFERED). The store keeps what has been seen so the picture stays filled in; the
+  scan offers what is close enough to be worth driving to. **The store must stay the larger of
+  the two**, or it rather than the scan bounds how far bays are found — and silently, since the
+  scan would simply receive fewer cells. Raise both together.
+- `PARKING_STRIPE_GAP_M` (3.0) is bounded on BOTH sides and neither bound is slack: above the
+  observation gaps along one divider (ground returns thin with range, so metre-scale holes are
+  normal) and below an aisle (6 m and up). Too small and one divider becomes several fragments,
+  each too short to bound a bay; too large and two facing rows merge back into one stripe and the
+  whole lot disappears.
+- `PARKING_MARKING_MEMORY_M` (80) is deliberately four times `MEMORY_DISTANCE_M` (20). That one
+  bounds the lifetime of a remembered ghost that can hard-block the planner; this one bounds how
+  long a bay you can see is offered, and its worst failure is a stale suggestion.
+- `PARKING_MAX_ROWS` (3) is how many row ORIENTATIONS are looked for, and it is the constant that
+  makes bays appear anywhere other than the row you are facing. It is not a bay count —
+  `PARKING_MAX_SLOTS` is. Two facing rows either side of an aisle plus a perpendicular row along
+  an end wall is what 3 covers.
+- Every `WORLD_PARKING_*` colour is OPAQUE and there are no alpha constants, deliberately: see
+  the vertex-alpha section above. Reach for a different hue or for outline-vs-fill, never for a
+  wash.
+
 The WORLD constants have a trap of their own: **several of them are sized by the SENSOR and one
 is sized by the RENDERER, and it is no longer the renderer that binds.**
 
@@ -2030,16 +2661,28 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   made of) are likewise different questions over the same palette, and a class can be in both. Do
   not fold the material sets into the road set to "simplify": road feeds the road store and the
   BEV split, materials feed colour only, and `NATURE` covers both grass and tree canopy.
-- `WORLD_CELL_SIZE_M` / `WORLD_COLUMN_SIZE_M` are 0.25, down from 0.5. They were 0.5 because of
-  the `ProceduralMesh` Python loop, not because of the data; with the raw-buffer bridge the grid
-  follows the sensors instead. 0.25 is what the roof unit supports — ring spacing is 0.24 m at
-  20 m — and going finer would resolve less than the returns carry.
-- `WORLD_ROAD_BRIDGE_CELLS` (4) and `WORLD_COLUMN_BRIDGE_CELLS` (4) are the same idea on
-  different surfaces and both scale with the cell size: halving the cell must double them or the
-  same physical gap stops being closed. The column figure went 2 → 4 for exactly that reason,
-  and the road figure 3 → 4 when `LIDAR_ROOF_DENSITY` went 12.5 → 25 and the azimuth stripes
-  doubled to ~0.93 m at 30 m.
-- `WORLD_COLUMN_VERTICAL_BRIDGE_BINS` (1 bin, 0.25 m) is the *opposite* axis and must stay small.
+- `WORLD_CELL_SIZE_M` (0.25, the ground) and `WORLD_COLUMN_SIZE_M` (0.125, the slabs) are no
+  longer equal, and **the asymmetry is the point** — see "The blocks are finer than the ground"
+  below. Both were 0.5 originally because of the `ProceduralMesh` Python loop rather than because
+  of the data; with the raw-buffer bridge the grid follows the sensors instead.
+- `WORLD_ROAD_BRIDGE_CELLS` (6) and `WORLD_COLUMN_BRIDGE_CELLS` (12) are the same idea on
+  different surfaces and both scale with **their own** cell size — which is now a different
+  number for each: halving a cell must double its bridge or the same physical gap stops being
+  closed. Both span ~1.5 m today. The column figure went 6 → 12 with `WORLD_COLUMN_SIZE_M`, and
+  the road figure 3 → 4 → 6 as `LIDAR_ROOF_DENSITY` went 12.5 → 25 and the azimuth stripes
+  widened. Getting this wrong is how a finer grid renders *worse* than a coarse one — the far
+  field breaks into disconnected fragments, which reads as harder blockiness than the cell size
+  ever did. `test_azimuth_stripe_gaps_are_bridged_but_a_real_opening_is_not` is the guard and it
+  is written in METRES (1.5 m stripes bridged, a 4 m opening not) precisely so it catches a cell
+  size that moves without its bridge.
+- `WORLD_MAX_COLUMNS` (200k) must move with `WORLD_COLUMN_SIZE_M`, and forgetting it is a
+  correctness failure rather than a memory one: the cull drops the excess **oldest-first**, and
+  the oldest voxels are the accumulated stripe sweep that fills a striped facade in, so walls
+  behind the car dissolve. Pinned by
+  `test_the_slab_half_of_the_build_stays_inside_the_scene_budget`.
+- `WORLD_COLUMN_VERTICAL_BRIDGE_BINS` (2 bins, 0.5 m) is the *opposite* axis and must stay small.
+  It counts `WORLD_COLUMN_HEIGHT_M` bins, not `WORLD_COLUMN_SIZE_M` cells, so the slabs going to
+  0.125 m left it alone.
   It has to exceed the vertical sampling gap on a wall (0.10 m at 50 m) so walls stay solid, and
   stay far under the clear air beneath a canopy or a bridge deck so those still split. Raising it
   to swallow noise would re-merge the tree with the grass under it.
@@ -2052,6 +2695,18 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   the bigger window because four collinear stripe samples ARE a direction; the anisotropy guard
   is what rejects four clumped ones, and relaxing THAT one is the silent-failure dial: every
   clump of foliage acquires a confident, wrong angle.
+
+  **`WORLD_ORIENT_MIN_CELLS` does NOT scale with `WORLD_COLUMN_SIZE_M`, and the obvious
+  reasoning that it must is wrong.** The window is 7 m of world, so halving the cell size looks
+  like it has to quadruple the cells inside it and quietly relax the guard by 4×. Measured, it
+  does not: a cell count is bounded by the RETURNS, not by the lattice. A wall sampled at 1.5 m
+  azimuth stripes holds **6 cells in the densest window at 0.25 m and 6 at 0.125 m** — each
+  stripe lands in one cell either way. Raising it to 16 to compensate (which is what this
+  document recommended before the measurement) would have refused every sparse wall and brought
+  back the staircases the orientation pass exists to remove. Only a densely-sampled BLOB scales
+  (a bush went 88 cells → 298), and the blob was never this guard's to reject — measured at both
+  sizes it comes back oriented 0 of 88 and 0 of 298, because anisotropy is a **scale-free ratio**.
+  The two guards asking different questions is exactly what makes the finer grid safe here.
 - `WORLD_COLLISION_CEILING_M` (2.6) is a question about the VEHICLE, not the scene. Raise it for
   anything tall enough to hit a branch a car passes under.
 - `WORLD_CELL_MEMORY_M` (25) and `WORLD_COLUMN_MEMORY_M` (90) are **metres travelled, not
@@ -2084,6 +2739,26 @@ is sized by the RENDERER, and it is no longer the renderer that binds.**
   something. 0.5 m is still far under the metres of clear air beneath a canopy, so trees still
   split.
 
+The vehicle-fit constants have their own version of it:
+
+- `VEHICLE_FIT_STRIPE_RAD` (0.062) is the azimuth spacing of the **170° units**, which is the
+  worst case; the front wedge is 14× finer. It is used for two different things — the clustering
+  lattice, where coarse is harmless because cells just hold more points, and the CAP on the
+  measured extent correction. Do not re-derive it from the front unit.
+- `VEHICLE_FIT_LINK_AZIMUTH_CELLS` (2) vs `VEHICLE_FIT_LINK_RANGE_CELLS` (6). The asymmetry is
+  measured, not tidy — see the vehicle-fit section. Equalising them splits every car whose flank
+  is oblique.
+- `VEHICLE_FIT_SIDE_LENGTH_M` (3.0) is the threshold on BELIEVING a length, and
+  `VEHICLE_MIN_LENGTH_M` (3.0) is the validation floor under it. They are equal today and are not
+  the same question: the first decides whether the returns measured a flank, the second rejects a
+  fit whose length nothing supports.
+- `VEHICLE_FIT_SPLIT_LENGTH_M` (6.0, ask whether this is two vehicles) vs `VEHICLE_MAX_LENGTH_M`
+  (14.0, nothing this long drives). Between them a cluster is interrogated and kept; above the
+  second it is claimed only if it splits into two real vehicles.
+- `VEHICLE_FIT_ONE_FACE_CONFIDENCE` is not a marginal case — a parked car almost always has an
+  inferred dimension — so it sets the opacity of the COMMON car, and it was chosen by rendering.
+- `VEHICLE_MIN_ASPECT` (2.2) bounds an over-read WIDTH using the length. It only ever narrows.
+
 The AEB constants have the same "looks like one quantity, is two" trap as the driving ones:
 
 - `AEB_OBSTACLE_MIN_HEIGHT_M` (0.30) vs `OBSTACLE_MIN_HEIGHT_M` (0.12). Different questions —
@@ -2112,11 +2787,12 @@ The AEB constants have the same "looks like one quantity, is two" trap as the dr
 
 Every module starts with `from __future__ import annotations`. Modules are single-responsibility
 and one-directional — `config` → `models` → {`geometry`, `semantics`, `raster`, `launcher`,
-`planner`, `controller`, `navigation`} → `aeb` → {`worker`, `bridge_monitor`} →
+`planner`, `controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit`} → `aeb` →
+{`worker`, `bridge_monitor`} →
 {`bev_widget`, `main_window`}; keep the pure/testable layers free
 of Qt and BeamNGpy imports (`geometry`, `semantics`, `raster`, `launcher`, `planner`,
-`controller`, `navigation` and `aeb` currently import
-neither — `bridge_monitor` exists as a separate module precisely so `launcher` can stay
+`controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit` and `aeb` currently
+import neither — `bridge_monitor` exists as a separate module precisely so `launcher` can stay
 Qt-free; `navigation` takes its Lua runner as an injected callable for the same reason).
 `aeb` sits just below `worker` rather than beside `planner` because it depends on
 `planner.corridor_blocking_distances`; that is the only sibling edge in the pure layer.

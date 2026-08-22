@@ -22,7 +22,14 @@ from PyQt6.QtWidgets import QSizePolicy, QWidget
 from .aeb import corridor_cross_section, predicted_corridor
 from .config import DISPLAY_RADIUS_M
 from .geometry import sensor_coverage
-from .models import BRAKING, STANDBY, AebState, BevFrame, DrivingPlan, VehicleGeometry
+from .models import (
+    BRAKING,
+    STANDBY,
+    AebState,
+    BevFrame,
+    DrivingPlan,
+    VehicleGeometry,
+)
 from .planner import arc_polyline, path_polyline
 from .raster import rasterize_points
 

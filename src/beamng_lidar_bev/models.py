@@ -166,6 +166,7 @@ class ControlCommand:
     """DRIVING | BLOCKED | REVERSING | STUCK."""
     target_speed_mps: float
     reason: str
+    parking_brake: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,68 @@ class AebState:
 
 
 @dataclass(frozen=True)
+class ParkingBay:
+    """
+    One candidate parking bay in WORLD XY metres -- the anchored form.
+
+    Lives here rather than in `parking` because `PerceptionSnapshot` carries
+    these to the scene thread, and `models` sits below both. The BEV-frame
+    `ParkingSlot` below is what gets drawn; this is what persists between the
+    scans that rebuild the set.
+    """
+
+    centre: tuple[float, float]
+    axis: tuple[float, float]
+    """Unit vector from the bay's MOUTH toward its head."""
+    width_m: float
+    depth_m: float
+    occupied: bool
+    stripe_cells: int
+
+
+@dataclass(frozen=True)
+class ParkingJob:
+    """Immutable world-space goal plus the externally meaningful job state."""
+
+    bay: ParkingBay
+    status: str = "PLANNING"
+
+
+@dataclass(frozen=True)
+class ParkingSlot:
+    """
+    One candidate parking bay, carried in BOTH frames on purpose.
+
+    The BEV fields are what gets drawn and hit-tested; `centre_world` is the
+    bay's IDENTITY. A selection has to survive both the ego moving and the bay
+    set being rebuilt every `PARKING_SCAN_INTERVAL_S`, and an index into the
+    last scan survives neither -- so the widget reports the world centre of
+    what was clicked and the worker re-matches it, rather than passing a
+    subscript that means something different by the time it arrives.
+    """
+
+    centre_right_m: float
+    centre_forward_m: float
+    heading_rad: float
+    """
+    Direction pointing INTO the bay from its mouth, in BEV (right, forward).
+
+    Measured from +forward toward +right, so it is a compass-style bearing in
+    the display frame rather than the planner's `arctan2(forward, right)`. The
+    widget draws the entry chevron from it; nothing steers by it yet.
+    """
+    width_m: float
+    """Divider to divider, across the bay."""
+    depth_m: float
+    """Mouth to head, along the dividers."""
+    occupied: bool
+    stripe_cells: int
+    """Marking cells backing the two dividers -- the evidence, for the label."""
+    centre_world: tuple[float, float]
+    selected: bool = False
+
+
+@dataclass(frozen=True)
 class BevFrame:
     road_points: np.ndarray
     obstacle_points: np.ndarray
@@ -342,6 +405,23 @@ class PerceptionSnapshot:
     The route reaches WORLD's compose thread through this snapshot ONLY --
     no store, no refresh-thread contact -- so the two-rate confinement
     contract is untouched. Populated only while self-driving follows a route.
+    """
+    parking_path: np.ndarray | None = None
+    """
+    (N, 2) BEV samples of the manoeuvre being driven into a bay, or None.
+
+    Present only while the park is actually running, so the overlay appearing
+    IS the manoeuvre being under way -- the same honesty rule the route ribbon
+    follows.
+    """
+    parking_slots: tuple[ParkingSlot, ...] = ()
+    """
+    Candidate bays in this snapshot's BEV frame, or empty with the scan off.
+
+    Already projected by the worker rather than re-derived here: WORLD draws
+    the same bays the worker found, and BEV to render is a fixed relabelling
+    (`right, height, -forward`) needing no pose of its own. Reaches the scene
+    thread through the frozen snapshot only, the `route_world` precedent.
     """
 
     def __post_init__(self) -> None:
@@ -463,3 +543,26 @@ class WorldFrame:
     route_indices: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.uint32)
     )
+    # Parking bays: one mesh for all of them, because vertex alpha multiplies
+    # the material's opacity exactly (measured on the real GPU), so a single
+    # opaque material carries the wash, the border and the selected bay's
+    # stronger fill without needing a second pass.
+    parking_vertices: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    parking_colors: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 4), dtype=np.float32)
+    )
+    parking_indices: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.uint32)
+    )
+    parking_slots: tuple[ParkingSlot, ...] = ()
+    """
+    The bays this frame drew, in BEV metres, for HIT-TESTING what was picked.
+
+    Kept beside the mesh rather than derived from it: the renderer's own
+    `View3D.pick` answers where in the scene the click landed, and turning
+    that point into "which bay" is a containment test this tuple is the
+    input to. A picked triangle index could not say which bay it belonged
+    to, because they share one mesh.
+    """

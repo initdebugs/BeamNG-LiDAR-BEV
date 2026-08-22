@@ -6,6 +6,43 @@ Rectangle {
     id: root
     color: "#d7dadc"
 
+    // Called from WorldView on a left click. The View3D raycast is the ONLY
+    // thing here that knows the camera's projection, so it answers where in
+    // the scene the click landed and Python decides which bay that is. A hit
+    // on anything else -- or on nothing -- is a miss, which is how clicking
+    // away from the bays deselects.
+    function pickParkingBay(px, py) {
+        var result = world.pick(px, py)
+        if (result.objectHit === parkingModel) {
+            sceneBridge.parkingPicked(
+                result.scenePosition.x, result.scenePosition.z
+            )
+        } else {
+            sceneBridge.parkingMissed()
+        }
+    }
+
+    // One wheel. Qt applies scale in the model's own space and THEN the
+    // rotation, so a #Cylinder scaled (dia, tread, dia) and turned a quarter
+    // turn about Z lies on its side with its circular face across the car --
+    // the tread rides on the cylinder's own axis, which is its local Y.
+    component ActorWheel: Model {
+        property real dia: 0.6
+        property real carWidth: 1.9
+        property real axle: 1.4
+        property real side: 1
+        property real along: 1
+
+        source: "#Cylinder"
+        eulerRotation.z: 90
+        x: side * carWidth * 0.45
+        y: dia * 0.5
+        z: along * axle
+        scale: Qt.vector3d(dia / 100, carWidth * 0.10 / 100, dia / 100)
+        materials: [wheelMaterial]
+        castsShadows: true
+    }
+
     View3D {
         id: world
         anchors.fill: parent
@@ -128,6 +165,24 @@ Rectangle {
         }
 
         DefaultMaterial {
+            id: parkingMaterial
+            // Parking bays: the wash, the border and the selected bay's fill
+            // all ride in ONE buffer, because vertex alpha multiplies this
+            // material's opacity exactly (measured on the real GPU, the same
+            // fact the AEB corridor depends on). So the material stays fully
+            // opaque and world_scene._parking_mesh carries the whole ramp.
+            diffuseColor: "#ffffff"
+            vertexColorsEnabled: true
+            lighting: DefaultMaterial.NoLighting
+            cullMode: DefaultMaterial.NoCulling
+            // Without this the vertex alpha is simply ignored -- the mesh is
+            // drawn in the opaque pass and every bay comes back a solid white
+            // slab, borders, chevrons and selection all invisible inside it.
+            // The AEB corridor carries the same line for the same reason.
+            blendMode: DefaultMaterial.SourceOver
+        }
+
+        DefaultMaterial {
             id: routeMaterial
             // The navigation route: guidance like the path, subordinate to it
             // by chroma and alpha (world_scene._route_ribbon carries both in
@@ -239,6 +294,17 @@ Rectangle {
         }
 
         PrincipledMaterial {
+            // Darker than the body it hangs off, which is all a wheel has to be
+            // -- it is a notch in the silhouette, not a surface anyone reads.
+            // Still inside the obstacle band, so this costs no contrast against
+            // the air or the road.
+            id: wheelMaterial
+            baseColor: "#0f1a25"
+            roughness: 0.86
+            metalness: 0.02
+        }
+
+        PrincipledMaterial {
             id: contactShadowMaterial
             baseColor: "#1b1f23"
             opacity: 0.09
@@ -269,6 +335,23 @@ Rectangle {
             geometry: sceneBridge.vehicleGeometry
             materials: [vehicleMaterial]
             castsShadows: false
+        }
+
+        // Under every guidance overlay: bays are static ground furniture and
+        // the plan, the route and the AEB corridors all have to read on top
+        // of them. `pickable` is what makes them selectable -- the engine's
+        // own raycast answers WHERE the click landed in the scene, and
+        // SceneBridge turns that point into WHICH bay. Doing the projection
+        // by hand would mean re-deriving Qt Quick 3D's camera convention,
+        // which is exactly the kind of guess this project has been wrong
+        // about before.
+        Model {
+            id: parkingModel
+            objectName: "parkingBays"
+            geometry: sceneBridge.parkingGeometry
+            materials: [parkingMaterial]
+            castsShadows: false
+            pickable: true
         }
 
         // Before the path so the plan ribbon always reads over the route it
@@ -367,13 +450,27 @@ Rectangle {
         Repeater3D {
             model: sceneBridge.actorModel
 
+            // The node stands at the actor's GROUND CONTACT and the model is
+            // built upward from it. That used to be a bare `y: model.y - 0.45`
+            // here, correcting a simulator actor's reference-node height; the
+            // LiDAR-fitted boxes report a true base instead, so the correction
+            // moved into `_render_actor` where it can apply to one path and not
+            // the other. See WORLD_ACTOR_GROUND_DROP_M.
             delegate: Node {
                 id: actorNode
                 x: model.x
-                y: model.y - 0.45
+                y: model.y
                 z: model.z
                 eulerRotation.y: model.yaw
                 opacity: Math.max(0.12, model.confidence)
+
+                readonly property real carW: model.actorWidth
+                readonly property real carH: model.actorHeight
+                readonly property real carL: model.actorLength
+                // Sized off BOTH dimensions so a van does not get cartwheels
+                // and a low car does not get castors.
+                readonly property real wheelDia: Math.min(carH * 0.42, carL * 0.17)
+                readonly property real axle: carL * 0.30
 
                 Behavior on x { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
                 Behavior on y { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
@@ -381,29 +478,81 @@ Rectangle {
                 Behavior on opacity { NumberAnimation { duration: 180 } }
                 Behavior on eulerRotation.y { NumberAnimation { duration: 140; easing.type: Easing.OutQuad } }
 
+                // Lower body, inset so the wheels stand proud of it.
                 Model {
                     source: "#Cube"
-                    y: model.actorHeight * 0.34
+                    y: actorNode.wheelDia * 0.5 + actorNode.carH * 0.12
                     scale: Qt.vector3d(
-                        model.actorWidth / 100,
-                        model.actorHeight * 0.52 / 100,
-                        model.actorLength / 100
+                        actorNode.carW * 0.94 / 100,
+                        actorNode.carH * 0.40 / 100,
+                        actorNode.carL / 100
                     )
                     materials: [actorMaterial]
                     castsShadows: true
                 }
 
+                // Shoulder: full width, and what gives the silhouette a waist
+                // rather than one slab from sill to roof.
                 Model {
                     source: "#Cube"
-                    y: model.actorHeight * 0.70
-                    z: model.actorLength * 0.03
+                    y: actorNode.carH * 0.55
                     scale: Qt.vector3d(
-                        model.actorWidth * 0.72 / 100,
-                        model.actorHeight * 0.32 / 100,
-                        model.actorLength * 0.48 / 100
+                        actorNode.carW / 100,
+                        actorNode.carH * 0.20 / 100,
+                        actorNode.carL * 0.92 / 100
+                    )
+                    materials: [actorMaterial]
+                    castsShadows: true
+                }
+
+                // Greenhouse, set back from centre so the car reads as having
+                // a bonnet -- which is the cue that says which way it faces.
+                Model {
+                    source: "#Cube"
+                    y: actorNode.carH * 0.80
+                    z: actorNode.carL * 0.06
+                    scale: Qt.vector3d(
+                        actorNode.carW * 0.80 / 100,
+                        actorNode.carH * 0.30 / 100,
+                        actorNode.carL * 0.44 / 100
                     )
                     materials: [glassMaterial]
                     castsShadows: true
+                }
+
+                // Wheels. A cylinder's axis is its own Y, so a quarter turn
+                // about Z lays it on its side and the circular face points
+                // across the car. Four explicit models rather than a nested
+                // Repeater3D: this delegate is already inside one, and the
+                // saving would be a handful of lines against a second model
+                // rebuild per actor per frame.
+                ActorWheel {
+                    dia: actorNode.wheelDia
+                    carWidth: actorNode.carW
+                    axle: actorNode.axle
+                    side: 1
+                    along: 1
+                }
+                ActorWheel {
+                    dia: actorNode.wheelDia
+                    carWidth: actorNode.carW
+                    axle: actorNode.axle
+                    side: -1
+                    along: 1
+                }
+                ActorWheel {
+                    dia: actorNode.wheelDia
+                    carWidth: actorNode.carW
+                    axle: actorNode.axle
+                    side: 1
+                    along: -1
+                }
+                ActorWheel {
+                    dia: actorNode.wheelDia
+                    carWidth: actorNode.carW
+                    axle: actorNode.axle
+                    side: -1
+                    along: -1
                 }
             }
         }

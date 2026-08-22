@@ -34,6 +34,7 @@ from .config import (
     AEB_CONFIRM_S,
     AEB_MAX_HORIZON_M,
     AEB_MIN_HITS,
+    AEB_MIN_SPEED_MPS,
     AEB_MIN_VERTICAL_EXTENT_M,
     AEB_OBSTACLE_MIN_HEIGHT_M,
     AEB_TRIGGER_MARGIN,
@@ -57,6 +58,14 @@ from .config import (
     MEMORY_ROAD_STRIDE,
     NAV_POLL_INTERVAL_MS,
     OBSTACLE_MIN_HEIGHT_M,
+    PARKING_BAY_MAX_DEPTH_M,
+    PARKING_BAY_MIN_DEPTH_M,
+    PARKING_BAY_WIDTH_MAX_M,
+    PARKING_BAY_WIDTH_MIN_M,
+    PARKING_DRIVE_SPEED_MPS,
+    PARKING_OCCUPANCY_MIN_HEIGHT_M,
+    PARKING_SCAN_INTERVAL_S,
+    PARKING_SCAN_RADIUS_M,
     PLANNER_HORIZON_M,
     PLANT_REFERENCE_VEHICLE,
     REVERSE_COST_SMOOTHNESS,
@@ -90,6 +99,7 @@ from .geometry import (
     vehicle_axes,
     world_points_to_bev,
 )
+from .hybrid_astar import Occupancy
 from .launcher import (
     bridge_is_reachable,
     build_launch_command,
@@ -103,12 +113,34 @@ from .models import (
     BevFrame,
     ControlCommand,
     DrivingPlan,
+    ParkingJob,
+    ParkingSlot,
     PerceptionSnapshot,
     RoadGrid,
     SensorMount,
     VehicleGeometry,
 )
 from .navigation import fetch_route_reply, parse_route, route_heading
+from .parking import (
+    MarkingMemory,
+    ParkingBay,
+    ScanReport,
+    find_bays,
+    match_selection,
+    project_bays,
+    remember_bays,
+)
+from .parking_drive import (
+    PARK_APPROACH,
+    PARK_ARRIVED,
+    PARK_BACKING,
+    PARK_BLOCKED,
+    PARK_SECURING,
+    PARK_SHIFTING,
+    ParkingDriver,
+    ParkingDriveState,
+)
+from .parking_map import ParkingMap
 from .planner import (
     ObstacleBand,
     corridor_return_profile,
@@ -241,6 +273,8 @@ class BeamNgWorker(QObject):
     self_driving_changed = pyqtSignal(bool)
     aeb_changed = pyqtSignal(bool)
     rear_aeb_changed = pyqtSignal(bool)
+    parking_changed = pyqtSignal(bool)
+    parking_drive_changed = pyqtSignal(bool)
     fatal_error = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -297,6 +331,34 @@ class BeamNgWorker(QObject):
         # never reads it -- see planning_map's module docstring.
         self._memory = PlanningMemory()
         self._last_memory_log_at = 0.0
+
+        # --- Parking bay scan, display and selection only -------------------
+        #
+        # Independent of self-driving on purpose: finding a bay is something
+        # you do while driving the car yourself. Nothing here reaches the
+        # planner or either AEB band, and the bays are held in WORLD so they
+        # stay put between the scans that rebuild them.
+        self._parking_scan = False
+        self._marking_memory = MarkingMemory()
+        self._parking_bays: tuple[ParkingBay, ...] = ()
+        self._parking_selected: tuple[float, float] | None = None
+        self._parking_job: ParkingJob | None = None
+        self._last_parking_scan_at = 0.0
+        self._logged_parking_check = False
+        self._parking_seen_at: dict[tuple[int, int], float] = {}
+        self._last_parking_report: ScanReport | None = None
+        self._last_parking_log_at = 0.0
+        self._last_parking_bay_count = -1
+        # The MANOEUVRE, separate from the scan: you arm the scan to look, and
+        # engage this to go. Mutually exclusive with self-driving, because one
+        # thing steers the car at a time -- and the arc planner would fight a
+        # committed manoeuvre for exactly the reasons parking_drive exists.
+        self._parking_driving = False
+        self._parking_driver = ParkingDriver()
+        self._parking_map = ParkingMap()
+        self._last_park_state: ParkingDriveState | None = None
+        self._logged_park_phase = ""
+        self._last_shift_log_at = 0.0
         self._last_drive_block_ms = 0.0
         # Per system, NOT shared. Both step in the same tick, so one timestamp
         # gave whichever ran second a dt of microseconds: its confirmation
@@ -668,6 +730,164 @@ class BeamNgWorker(QObject):
             self.self_driving_changed.emit(False)
             if announce:
                 self.status_changed.emit("STREAMING", reason)
+
+    @pyqtSlot(bool)
+    def set_parking_scan(self, enabled: bool) -> None:
+        """
+        Arm or disarm the parking bay scan. Display and selection only.
+
+        Deliberately NOT gated on self-driving: scanning is what you do while
+        driving the car yourself, looking for somewhere to put it. Disarming
+        drops the accumulated paint as well as the bays, so re-arming starts
+        from what the sensors can see now rather than from a stale lot.
+        """
+        if enabled and not self._sensor_set_is_complete():
+            self.parking_changed.emit(False)
+            self.status_changed.emit(
+                "READY", "Attach to a vehicle before scanning for parking"
+            )
+            return
+        self._parking_scan = enabled
+        if not enabled:
+            self._marking_memory.clear()
+            self._parking_bays = ()
+            self._parking_selected = None
+            self._logged_parking_check = False
+        self.parking_changed.emit(enabled)
+        if enabled:
+            LOGGER.info(
+                "Parking check: scanning for bays from road paint within "
+                "%.0f m, %.1f-%.1f m wide and %.1f-%.1f m deep. Detection "
+                "and selection only -- nothing here steers, brakes or "
+                "reaches the planner.",
+                PARKING_SCAN_RADIUS_M,
+                PARKING_BAY_WIDTH_MIN_M,
+                PARKING_BAY_WIDTH_MAX_M,
+                PARKING_BAY_MIN_DEPTH_M,
+                PARKING_BAY_MAX_DEPTH_M,
+            )
+
+    @pyqtSlot(bool)
+    def set_parking_drive(self, enabled: bool) -> None:
+        """
+        Engage or release the manoeuvre that drives into the selected bay.
+
+        Refused without a selection, because the goal IS the selection: there
+        is nothing to commit to otherwise. Self-driving is disengaged first --
+        one thing steers the car at a time, and the arc planner would fight a
+        committed manoeuvre for exactly the reasons parking_drive exists.
+        """
+        if not enabled:
+            was = self._parking_driving
+            self._parking_driving = False
+            if self._parking_job is not None:
+                self._parking_job = replace(
+                    self._parking_job, status="CANCELLED"
+                )
+            self._parking_driver.reset()
+            self._last_park_state = None
+            self._logged_park_phase = ""
+            if was:
+                self.parking_drive_changed.emit(False)
+            return
+        matched = (
+            None
+            if self._parking_selected is None
+            else match_selection(self._parking_bays, self._parking_selected)
+        )
+        if matched is None or not self._sensor_set_is_complete():
+            self.parking_drive_changed.emit(False)
+            self.status_changed.emit(
+                "READY", "Select a parking bay before parking into it"
+            )
+            return
+        if matched.occupied:
+            self._parking_job = None
+            self.parking_drive_changed.emit(False)
+            self.status_changed.emit(
+                "READY", "The selected parking bay is occupied"
+            )
+            return
+        if self._self_driving:
+            self._disengage_self_driving(
+                "Self-driving off: parking takes the wheel", announce=False
+            )
+        self._parking_driver.reset()
+        self._parking_map.clear()
+        self._parking_job = ParkingJob(matched)
+        self._parking_driving = True
+        self._logged_park_phase = ""
+        self.parking_drive_changed.emit(True)
+        LOGGER.info(
+            "Park check: engaged with a latched world-space bay, creeping at "
+            "%.1f km/h (below the %.1f km/h AEB arms at, so the forward "
+            "brake stays in STANDBY and the manoeuvre does its own corridor "
+            "check). A bay needing a shuffle is refused, not attempted.",
+            PARKING_DRIVE_SPEED_MPS * 3.6,
+            AEB_MIN_SPEED_MPS * 3.6,
+        )
+
+    def _disengage_parking_drive(self, reason: str) -> None:
+        """Single funnel, mirroring _disengage_self_driving."""
+        if not self._parking_driving:
+            return
+        self._parking_driving = False
+        if self._parking_job is not None:
+            self._parking_job = replace(self._parking_job, status="FAILED")
+        self._parking_driver.reset()
+        self._last_park_state = None
+        if self._vehicle is not None:
+            try:
+                self._vehicle.control(
+                    throttle=0.0, brake=0.0, steering=0.0, parkingbrake=0.0
+                )
+            except Exception:
+                LOGGER.debug("Could not zero the controls", exc_info=True)
+        LOGGER.info("Park check: disengaged -- %s", reason)
+        self.parking_drive_changed.emit(False)
+        self.status_changed.emit("STREAMING", f"Parking stopped: {reason}")
+
+    def _complete_parking_drive(self) -> None:
+        """End automation after success without releasing its parking brake."""
+        if not self._parking_driving:
+            return
+        self._parking_driving = False
+        if self._parking_job is not None:
+            self._parking_job = replace(self._parking_job, status="SUCCEEDED")
+        LOGGER.info("Park check: complete -- vehicle secured")
+        self.parking_drive_changed.emit(False)
+        self.status_changed.emit("STREAMING", "Parking complete; vehicle secured")
+
+    @pyqtSlot()
+    def clear_parking_selection(self) -> None:
+        """Drop the held bay. Clicking off the bays is how this arrives."""
+        self._parking_selected = None
+
+    @pyqtSlot(float, float)
+    def select_parking_slot(self, world_x: float, world_y: float) -> None:
+        """
+        Hold, or clear, the bay the user clicked.
+
+        The WORLD centre is the identity rather than an index into the last
+        scan: the set is rebuilt every PARKING_SCAN_INTERVAL_S and a
+        subscript means something different afterwards. A click that matches
+        no bay clears the selection, which is how clicking empty space
+        deselects.
+        """
+        if not self._parking_scan:
+            return
+        target = (float(world_x), float(world_y))
+        matched = match_selection(self._parking_bays, target)
+        self._parking_selected = None if matched is None else matched.centre
+        if matched is not None:
+            LOGGER.info(
+                "Parking check: selected a %.2f m x %.2f m bay, %s, %d "
+                "marking cells of evidence",
+                matched.width_m,
+                matched.depth_m,
+                "occupied" if matched.occupied else "clear",
+                matched.stripe_cells,
+            )
 
     @pyqtSlot(bool)
     def set_aeb(self, enabled: bool) -> None:
@@ -1078,7 +1298,13 @@ class BeamNgWorker(QObject):
             plan: DrivingPlan | None = None
             aeb: AebState | None = None
             rear_aeb: AebState | None = None
-            if self._self_driving or self._aeb_enabled or self._rear_aeb_enabled:
+            parking_occupancy: Occupancy | None = None
+            if (
+                self._self_driving
+                or self._aeb_enabled
+                or self._rear_aeb_enabled
+                or self._parking_driving
+            ):
                 # Every driving step below is isolated from the poll-failure
                 # budget on purpose: a planner, AEB or controller bug must not
                 # masquerade as a lost bridge and tear the whole connection down
@@ -1205,6 +1431,20 @@ class BeamNgWorker(QObject):
                     aeb_obstacles = _EMPTY_BEV
                     measured = False
 
+                if self._parking_driving:
+                    ego_pos = vec3(state["pos"])
+                    if measured:
+                        self._parking_map.update(
+                            ego_pos,
+                            right_axis,
+                            forward,
+                            obstacles,
+                            bev[scene_groups == SCENE_ROAD],
+                        )
+                    parking_occupancy = self._parking_map.occupancy_bev(
+                        ego_pos, right_axis, forward
+                    )
+
                 if self._self_driving:
                     try:
                         # The planner's cloud gains the memory; AEB's band
@@ -1307,6 +1547,56 @@ class BeamNgWorker(QObject):
                     time.perf_counter() - drive_block_started
                 ) * 1000.0
 
+            parking_slots: tuple[ParkingSlot, ...] = ()
+            # The planner's band if a driving feature built one this tick,
+            # otherwise nothing -- parking must never invent obstacles, and a
+            # missing band means the corridor check simply finds it clear,
+            # which is why the manoeuvre also creeps.
+            obstacles_for_parking = obstacles if self._parking_driving else None
+            if self._parking_scan and had_returns:
+                # Its own handler, for the reason every driving step has one:
+                # a fault here must not masquerade as a lost bridge and tear
+                # the connection down. It is also the weakest claim on the
+                # tick -- nothing actuates from it -- so it fails to an empty
+                # overlay rather than to anything else changing.
+                try:
+                    parking_slots = self._scan_for_parking(
+                        state, bev, heights, scene_materials, geometry
+                    )
+                except Exception:
+                    LOGGER.exception("Parking bay scan failed")
+                    self._parking_bays = ()
+
+            # The overlay may be rebuilt or disappear; the active target may
+            # not. Project the immutable job bay independently of scan state.
+            if self._parking_driving and self._parking_job is not None:
+                parking_slots = project_bays(
+                    (self._parking_job.bay,),
+                    vec3(state["pos"]),
+                    right_axis,
+                    forward,
+                    selected_world=self._parking_job.bay.centre,
+                )
+
+            if self._parking_driving:
+                # Its own handler, like every other driving step: a fault here
+                # must not masquerade as a lost bridge. It produces a full
+                # DrivingPlan, so `_actuate` sends it exactly as it sends the
+                # road controller's -- gear handling and the AEB override
+                # included, which is what keeps one actuation path.
+                try:
+                    plan = self._drive_into_bay(
+                        state,
+                        parking_slots,
+                        geometry,
+                        obstacles_for_parking,
+                        parking_occupancy,
+                        rear_aeb,
+                    )
+                except Exception as exc:
+                    LOGGER.exception("Parking manoeuvre failed")
+                    self._disengage_parking_drive(str(exc))
+
             frame = BevFrame(
                 road_points=road_points,
                 obstacle_points=obstacle_points,
@@ -1361,6 +1651,15 @@ class BeamNgWorker(QObject):
                     route_world=(
                         None if plan is None else self._route_world_preview()
                     ),
+                    parking_slots=parking_slots,
+                    parking_path=(
+                        None
+                        if self._last_park_state is None
+                        or self._last_park_state.path is None
+                        else self._last_park_state.path.points.astype(
+                            np.float32
+                        )
+                    ),
                 )
             )
             # The last statement of a successful tick, deliberately after
@@ -1395,6 +1694,247 @@ class BeamNgWorker(QObject):
                 self.fatal_error.emit(
                     f"LiDAR streaming stopped after repeated connection errors: {exc}"
                 )
+
+    def _scan_for_parking(
+        self,
+        state: dict[str, Any],
+        bev: np.ndarray,
+        heights: np.ndarray,
+        materials: np.ndarray,
+        geometry: VehicleGeometry,
+    ) -> tuple[ParkingSlot, ...]:
+        """
+        Accumulate paint every tick, re-detect bays occasionally, project both.
+
+        The three rates are deliberate and different. Marking cells are folded
+        in EVERY tick, because the continuous dividers the detector needs only
+        exist by accumulation -- a single frame lays ground rings ACROSS a
+        divider, not along it. The bay SET is rebuilt every
+        PARKING_SCAN_INTERVAL_S, because the sweep is the expensive part and
+        the lot is not changing shape. And the projection into the BEV frame
+        happens every tick regardless, so the drawn rectangles stay glued to
+        the ground between scans instead of lagging the car.
+        """
+        ego_pos = vec3(state["pos"])
+        right_axis, forward, _ = vehicle_axes(state)
+        self._marking_memory.update(
+            ego_pos, right_axis, forward, bev[materials == SURFACE_MARKING]
+        )
+
+        now = time.monotonic()
+        if now - self._last_parking_scan_at >= PARKING_SCAN_INTERVAL_S:
+            self._last_parking_scan_at = now
+            # Occupancy evidence comes from this tick's cloud rather than from
+            # PlanningMemory: that store is planner-only and is gated on
+            # self-driving, and a bay is worth scanning for with self-driving
+            # off. Anything standing above the ego's ground plane counts --
+            # the height floor keeps the surface itself and its paint out, and
+            # the bay rectangle is shrunk before anything inside it is
+            # believed.
+            standing = bev[
+                heights - geometry.ground_z_vehicle
+                >= PARKING_OCCUPANCY_MIN_HEIGHT_M
+            ]
+            ego_xy = np.asarray(ego_pos, dtype=np.float64)[:2]
+            r_xy = np.asarray(right_axis, dtype=np.float64)[:2]
+            f_xy = np.asarray(forward, dtype=np.float64)[:2]
+            r_xy = r_xy / max(float(np.hypot(*r_xy)), 1e-9)
+            f_xy = f_xy / max(float(np.hypot(*f_xy)), 1e-9)
+            standing_world = (
+                ego_xy + standing[:, [0]] * r_xy + standing[:, [1]] * f_xy
+                if len(standing)
+                else np.empty((0, 2), dtype=np.float64)
+            )
+            report = ScanReport()
+            found = find_bays(
+                self._marking_memory.cells_world(),
+                standing_world,
+                ego_xy,
+                report,
+            )
+            # Bays a scan happened to miss survive for a short distance. Each
+            # sits near several thresholds at once, so one can drop out and
+            # return a moment later -- which made the bays flash and, worse,
+            # took the SELECTION with them, since a selection is re-matched
+            # against the offered set every scan.
+            self._parking_bays = remember_bays(
+                self._parking_bays,
+                found,
+                self._marking_memory.travelled_m,
+                self._parking_seen_at,
+                ego_xy,
+            )
+            self._last_parking_report = report
+            # A selection that no longer matches any bay is dropped here, so
+            # the held pose can never outlive the evidence for it.
+            if self._parking_selected is not None:
+                matched = match_selection(
+                    self._parking_bays, self._parking_selected
+                )
+                self._parking_selected = (
+                    None if matched is None else matched.centre
+                )
+            self._log_parking_check(ego_xy)
+
+        return project_bays(
+            self._parking_bays,
+            ego_pos,
+            right_axis,
+            forward,
+            selected_world=self._parking_selected,
+        )
+
+    def _drive_into_bay(
+        self,
+        state: dict[str, Any],
+        slots: tuple[ParkingSlot, ...],
+        geometry: VehicleGeometry,
+        obstacles: np.ndarray | None,
+        occupancy: Occupancy | None = None,
+        rear_aeb: AebState | None = None,
+    ) -> DrivingPlan:
+        """
+        One tick of the manoeuvre, as a DrivingPlan so `_actuate` is unchanged.
+
+        The bay is found by IDENTITY against the held world pose rather than
+        by index: the scan rebuilds its list on its own cadence, and the goal
+        this manoeuvre committed to is a place in the world, not a subscript.
+        """
+        selected = next(
+            (slot for slot in slots if slot.selected), None
+        )
+        now = time.perf_counter()
+        dt = (
+            now - self._last_plan_at
+            if self._last_plan_at
+            else DISPLAY_INTERVAL_MS / 1000.0
+        )
+        self._last_plan_at = now
+        forward = vehicle_axes(state)[1]
+        forward_speed = float(
+            vec3(state.get("vel", (0.0, 0.0, 0.0))) @ forward
+        )
+        reported_gear = self._reported_gear()
+        command, park = self._parking_driver.step(
+            selected,
+            geometry,
+            forward_speed,
+            dt,
+            obstacles=obstacles,
+            occupancy=occupancy,
+            reported_gear=reported_gear,
+            forward_gear=forward_gear_index(reported_gear),
+            # The REAR brake arms at parking speed and really can fire while
+            # backing in. It is left armed and allowed to win: the manoeuvre
+            # hands back rather than fighting a system that has decided the
+            # car is about to hit something.
+            rear_aeb_braking=bool(rear_aeb is not None and rear_aeb.engaged),
+        )
+        self._last_park_state = park
+        if self._parking_job is not None:
+            status = {
+                PARK_BLOCKED: "WAITING",
+                PARK_SECURING: "SECURING",
+                PARK_ARRIVED: "SUCCEEDED",
+            }.get(park.phase, "EXECUTING")
+            self._parking_job = replace(self._parking_job, status=status)
+        if park.phase != self._logged_park_phase:
+            self._logged_park_phase = park.phase
+            LOGGER.info(
+                "Park check: %s -- %s (%.1f m to go) | gear commanded %+d, "
+                "box reports %r, speed %.2f m/s, legs %s",
+                park.phase,
+                park.reason,
+                park.remaining_m,
+                command.gear,
+                reported_gear,
+                forward_speed,
+                "none"
+                if self._parking_driver.legs is None
+                else " then ".join(
+                    "reverse" if leg.reverse else "forward"
+                    for leg in self._parking_driver.legs
+                ),
+            )
+        elif park.phase == PARK_SHIFTING:
+            # A shift that does not complete is invisible otherwise: the
+            # phase never changes, so the one-shot line above never fires
+            # again and the car simply sits there. Throttled, because the
+            # normal case is two or three ticks.
+            now_shift = time.monotonic()
+            if now_shift - self._last_shift_log_at > 2.0:
+                self._last_shift_log_at = now_shift
+                LOGGER.info(
+                    "Park check: still %s -- commanded %+d, box reports %r, "
+                    "speed %.2f m/s",
+                    park.phase,
+                    command.gear,
+                    reported_gear,
+                    forward_speed,
+                )
+        if park.phase == PARK_ARRIVED:
+            self._complete_parking_drive()
+        elif park.phase not in (
+            PARK_APPROACH,
+            PARK_BACKING,
+            PARK_SHIFTING,
+            PARK_BLOCKED,
+            PARK_SECURING,
+        ):
+            self._disengage_parking_drive(park.reason)
+        return DrivingPlan(
+            arc=_BLIND_ARC,
+            command=command,
+            forward_speed_mps=forward_speed,
+            reported_gear=reported_gear,
+        )
+
+    def _log_parking_check(self, ego_xy: np.ndarray) -> None:
+        """
+        The scan's own account of itself, throttled.
+
+        Detection is a chain of geometric filters and the screen shows only
+        the survivors, so "there is paint there but no bay on it" is not
+        answerable from the picture -- which is exactly how it was reported.
+        `ScanReport` names the filter that consumed each candidate, so the
+        question becomes one log line.
+
+        It also carries the live-only fact the offline suite cannot reach:
+        whether this map's bay dividers annotate through the LiDAR at all.
+        Lane paint was confirmed to; bay paint is a separate question, and a
+        lot whose bays are baked into the ground texture rather than shipped
+        as decals returns nothing here however many cells accumulate.
+        """
+        report = self._last_parking_report
+        if report is None:
+            return
+        now = time.monotonic()
+        first = not self._logged_parking_check
+        # After the one-shot, only when the answer CHANGES or a minute has
+        # passed -- a per-scan line at 2 Hz would bury the log.
+        changed = report.bays_found != self._last_parking_bay_count
+        if not first and not changed and now - self._last_parking_log_at < 60.0:
+            return
+        self._logged_parking_check = True
+        self._last_parking_log_at = now
+        self._last_parking_bay_count = report.bays_found
+
+        if not self._parking_bays:
+            LOGGER.info("Parking check: no bays -- %s", report.summary())
+            return
+        nearest = self._parking_bays[0]
+        clear = sum(1 for bay in self._parking_bays if not bay.occupied)
+        LOGGER.info(
+            "Parking check: %d bays (%d clear, %d occupied); nearest %.1f m "
+            "away, %.2f m wide x %.2f m deep. %s",
+            len(self._parking_bays),
+            clear,
+            len(self._parking_bays) - clear,
+            float(np.hypot(*(np.asarray(nearest.centre) - ego_xy))),
+            nearest.width_m,
+            nearest.depth_m,
+            report.summary(),
+        )
 
     def _compute_plan(
         self,
@@ -2127,7 +2667,7 @@ class BeamNgWorker(QObject):
                 # parking brake we never mention is a parking brake we never
                 # release -- and the game's own vehicle spawner clears it by
                 # hand for this reason.
-                "parkingbrake": 0.0,
+                "parkingbrake": command.parking_brake,
             }
             # Only when it actually needs to change: shiftToGearIndex has side
             # effects, and this loop runs 25 times a second.
@@ -2526,6 +3066,7 @@ class BeamNgWorker(QObject):
         # the same sockets the prefetch thread may still be using.
         self._drop_state_future()
         self._disengage_aeb("Sensors stopped", announce=False)
+        self._disengage_parking_drive("Sensors stopped")
         self._disengage_self_driving("Sensors stopped", announce=False)
         for sensor in reversed(self._sensors):
             try:
@@ -2537,6 +3078,24 @@ class BeamNgWorker(QObject):
         self._geometry = None
         self._mirrored_geometry = None
         self._memory.clear()
+        self._parking_map.clear()
+        # The bays described a lot this car was standing in; a re-attach may
+        # be a different car in a different place, and a held selection must
+        # never survive the evidence for it. The toggle itself is reported
+        # off so the button cannot stay lit over a dead scan.
+        if self._parking_scan:
+            self._parking_scan = False
+            self.parking_changed.emit(False)
+        self._marking_memory.clear()
+        self._parking_bays = ()
+        self._parking_seen_at = {}
+        self._parking_selected = None
+        self._last_parking_scan_at = 0.0
+        self._logged_parking_check = False
+        self._parking_seen_at: dict[tuple[int, int], float] = {}
+        self._last_parking_report: ScanReport | None = None
+        self._last_parking_log_at = 0.0
+        self._last_parking_bay_count = -1
         self._logged_reach = False
         self._logged_markings = False
         self._logged_marking_silence = False

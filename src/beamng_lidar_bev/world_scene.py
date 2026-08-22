@@ -9,8 +9,11 @@ import numpy as np
 from .aeb import corridor_cross_section, predicted_corridor
 from .config import (
     AEB_BRAKING_DECEL_MPS2,
+    VEHICLE_FIT_ACTOR_MATCH_M,
+    VEHICLE_FIT_TRACK_MATCH_M,
     WORLD_ACTOR_COAST_S,
     WORLD_ACTOR_FADE_S,
+    WORLD_ACTOR_GROUND_DROP_M,
     WORLD_AEB_ARMED_RGB,
     WORLD_AEB_BAR_ALPHA,
     WORLD_AEB_BAR_THICKNESS_M,
@@ -74,6 +77,12 @@ from .config import (
     WORLD_ORIENT_CELL_M,
     WORLD_ORIENT_MIN_ANISOTROPY,
     WORLD_ORIENT_MIN_CELLS,
+    WORLD_PARKING_BORDER_M,
+    WORLD_PARKING_CHEVRON_M,
+    WORLD_PARKING_FREE_RGB,
+    WORLD_PARKING_LIFT_M,
+    WORLD_PARKING_OCCUPIED_RGB,
+    WORLD_PARKING_SELECTED_RGB,
     WORLD_PATH_ALERT_RGB,
     WORLD_PATH_RGB,
     WORLD_POSE_JUMP_RESET_M,
@@ -128,6 +137,7 @@ from .semantics import (
     SURFACE_VEGETATION,
     SURFACE_WATER,
 )
+from .vehicle_fit import VehicleBox, fit_vehicle_boxes
 
 _EMPTY_VERTICES = np.empty((0, 3), dtype=np.float32)
 _EMPTY_COLOURS = np.empty((0, 4), dtype=np.float32)
@@ -205,6 +215,9 @@ _BOUNDARY_LIT_LINEAR = linear_rgb(WORLD_BOUNDARY_LIT_RGB)
 _PATH_LINEAR = linear_rgb(WORLD_PATH_RGB)
 _PATH_ALERT_LINEAR = linear_rgb(WORLD_PATH_ALERT_RGB)
 _ROUTE_LINEAR = linear_rgb(WORLD_ROUTE_RGB)
+_PARKING_FREE_LINEAR = linear_rgb(WORLD_PARKING_FREE_RGB)
+_PARKING_OCCUPIED_LINEAR = linear_rgb(WORLD_PARKING_OCCUPIED_RGB)
+_PARKING_SELECTED_LINEAR = linear_rgb(WORLD_PARKING_SELECTED_RGB)
 _UNCERTAIN_LINEAR = linear_rgb(WORLD_UNCERTAIN_RGB)
 # Indexed by SURFACE_* code, so the lookup is one fancy-index over the cells.
 # Every entry sits on the road's rung of the contrast ladder and separates by
@@ -1379,8 +1392,9 @@ def pack_cell_keys(keys: np.ndarray) -> np.ndarray:
 
     `np.unique(..., axis=0)` sorts a void view of each row and is dramatically
     slower than sorting plain integers -- measured 41 ms against 6 ms for the
-    same road cells. Three 21-bit fields fit an int64, which covers +/- 524 km
-    of cell index at any grid size this code uses.
+    same road cells. Three 21-bit fields fit an int64, i.e. +/- 1,048,576 cell
+    indices: +/- 131 km at the finest grid here (WORLD_COLUMN_SIZE_M, 0.125 m)
+    and further at every coarser one, against maps a few km across.
     """
     keys = np.asarray(keys)
     packed = np.zeros(len(keys), dtype=np.int64)
@@ -1400,7 +1414,7 @@ def _scan_order(keys: np.ndarray, axis: int) -> np.ndarray:
     over the array, where packing the three fields into a single int64 in the
     same precedence needs one. Measured on 86k ground cells, 2.98 ms -> 2.11.
     The 21-bit fields are `pack_cell_keys`'s, only permuted, so the same
-    +/- 524 km of cell index is covered.
+    +/- 1,048,576 cell indices are covered.
     """
     other = 1 - axis
     return np.argsort(
@@ -1978,6 +1992,13 @@ class WorldSceneAssembler:
 
     def __init__(self) -> None:
         self._actor_tracks: dict[str, _ActorTrack] = {}
+        # LiDAR-fitted vehicles, carried frame to frame only to keep their ids
+        # stable. `ActorListModel.set_actors` avoids a model reset exactly when
+        # the id tuple is unchanged, and a reset rebuilds the QML delegate and
+        # throws away its animation state -- so an id that churned would leave
+        # every fitted car snapping between positions instead of easing.
+        self._fitted_tracks: dict[str, np.ndarray] = {}
+        self._fitted_sequence = 0
         self._last_ego_pos: np.ndarray | None = None
         # Camera state. None means "no pose yet", which makes the first frame
         # land exactly on its target instead of easing in from a guess.
@@ -1989,6 +2010,7 @@ class WorldSceneAssembler:
 
     def clear(self) -> None:
         self._actor_tracks.clear()
+        self._fitted_tracks.clear()
         self._last_ego_pos = None
         self._clear_geometry()
 
@@ -2160,7 +2182,17 @@ class WorldSceneAssembler:
         path_vertices, path_colors, path_indices = self._planned_path(
             snapshot, alert, ground_field
         )
+        if snapshot.parking_path is not None:
+            # The manoeuvre replaces the arc plan while it runs, because the
+            # arc planner is not running -- two ribbons would claim two
+            # opinions about where the car is going.
+            path_vertices, path_colors, path_indices = self._parking_ribbon(
+                snapshot, ground_field
+            )
         route_vertices, route_colors, route_indices = self._route_ribbon(
+            snapshot, ground_field
+        )
+        parking_vertices, parking_colors, parking_indices = self._parking_mesh(
             snapshot, ground_field
         )
         camera_position, camera_euler = self._camera(snapshot, alert)
@@ -2188,6 +2220,12 @@ class WorldSceneAssembler:
             route_vertices=route_vertices,
             route_colors=route_colors,
             route_indices=route_indices,
+            parking_vertices=parking_vertices,
+            parking_colors=parking_colors,
+            parking_indices=parking_indices,
+            # Carried through for HIT-TESTING what the renderer's pick
+            # returns; the mesh alone cannot say which bay a triangle is in.
+            parking_slots=snapshot.parking_slots,
             uncertain_points=uncertain,
             uncertain_colors=uncertain_colors,
             actors=actors,
@@ -3246,6 +3284,7 @@ class WorldSceneAssembler:
                 track.observation = actor
 
         rendered: list[WorldActor] = []
+        claimed: list[np.ndarray] = []
         expired: list[str] = []
         for actor_id, track in self._actor_tracks.items():
             age = snapshot.timestamp - track.last_evidence
@@ -3261,9 +3300,88 @@ class WorldSceneAssembler:
                 )
             observation = observations.get(actor_id, track.observation)
             rendered.append(self._render_actor(observation, confidence, snapshot))
+            claimed.append(
+                np.asarray(observation.pos_world, dtype=np.float64)[:2]
+            )
         for actor_id in expired:
             del self._actor_tracks[actor_id]
+        rendered.extend(self._fitted_actors(snapshot, vehicle_points, claimed))
         return tuple(rendered)
+
+    def _fitted_actors(
+        self,
+        snapshot: PerceptionSnapshot,
+        vehicle_points: np.ndarray,
+        claimed: list[np.ndarray],
+    ) -> tuple[WorldActor, ...]:
+        """
+        Draw a car the LiDAR resolved, whether or not the simulator confirmed it.
+
+        The corroboration path above needs `vehicles.get_states()`, which
+        BeamNG.tech rejects in free-roam, so in the normal workflow it produces
+        nothing at all -- and what was left was the voxel store, which holds ONE
+        snapshot of traffic (`WORLD_VEHICLE_TTL_S`) and meshes its four or five
+        azimuth stripes into confetti. See `vehicle_fit` for why the answer is to
+        fit the shape rather than to accumulate more of it.
+
+        Purely ADDITIVE: the same returns still feed the voxel store and still
+        draw as solids underneath, so a cluster this declines to claim looks
+        exactly as it does today rather than disappearing.
+        """
+        boxes = fit_vehicle_boxes(vehicle_points, snapshot.ego_pos_world)
+        previous, self._fitted_tracks = self._fitted_tracks, {}
+        actors: list[WorldActor] = []
+        for box in boxes:
+            centre = np.asarray(box.centre_world[:2], dtype=np.float64)
+            # A fit on top of a car the ground-truth path already draws is that
+            # same car; two models in one place is worse than either alone.
+            if any(
+                float(np.hypot(*(centre - position)))
+                <= VEHICLE_FIT_ACTOR_MATCH_M
+                for position in claimed
+            ):
+                continue
+            actor_id = self._match_fitted_track(centre, previous)
+            self._fitted_tracks[actor_id] = centre
+            actors.append(self._render_box(box, actor_id, snapshot))
+        return tuple(actors)
+
+    def _match_fitted_track(
+        self, centre: np.ndarray, previous: dict[str, np.ndarray]
+    ) -> str:
+        nearest, best = None, VEHICLE_FIT_TRACK_MATCH_M
+        for actor_id, position in previous.items():
+            if actor_id in self._fitted_tracks:
+                continue
+            distance = float(np.hypot(*(centre - position)))
+            if distance < best:
+                nearest, best = actor_id, distance
+        if nearest is not None:
+            return nearest
+        self._fitted_sequence += 1
+        return f"lidar-{self._fitted_sequence}"
+
+    @staticmethod
+    def _render_box(
+        box: VehicleBox, actor_id: str, snapshot: PerceptionSnapshot
+    ) -> WorldActor:
+        position = world_to_render(
+            np.asarray((box.centre_world,), dtype=np.float32), snapshot
+        )[0]
+        right, forward = _basis(snapshot)
+        heading = _unit(
+            np.asarray(box.forward_world, dtype=np.float64), "fitted vehicle"
+        )
+        return WorldActor(
+            actor_id=actor_id,
+            kind=box.kind,
+            position=tuple(float(value) for value in position),
+            yaw_deg=math.degrees(
+                math.atan2(float(heading @ right), float(heading @ forward))
+            ),
+            scale=box.dimensions_m,
+            confidence=box.confidence,
+        )
 
     @staticmethod
     def _actor_hit_count(
@@ -3300,6 +3418,15 @@ class WorldSceneAssembler:
             np.asarray((actor.pos_world,), dtype=np.float32),
             snapshot,
         )[0]
+        # The delegate builds its model UP from its node, so the node is the
+        # actor's ground contact -- and a simulator actor reports its reference
+        # node, which stands above the road. This correction used to sit in the
+        # QML as a bare `y: model.y - 0.45`, which the LiDAR-fitted boxes must
+        # NOT get: those already report a true base height. Two conventions in
+        # one binding is one too many, so it moved here.
+        position = position - np.asarray(
+            (0.0, WORLD_ACTOR_GROUND_DROP_M, 0.0), dtype=position.dtype
+        )
         right, forward = _basis(snapshot)
         actor_forward = _unit(
             np.asarray(actor.dir_world, dtype=np.float64), "actor forward"
@@ -3315,6 +3442,205 @@ class WorldSceneAssembler:
             scale=actor.dimensions_m,
             confidence=float(np.clip(confidence, 0.0, 1.0)),
         )
+
+    @staticmethod
+    def _parking_mesh(
+        snapshot: PerceptionSnapshot,
+        field: GroundField | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Candidate parking bays as draped quads: wash, border, entry chevron.
+
+        Drawn on the ground rather than as standing boxes because a bay is a
+        REGION of surface, not an object -- a waist-high box would join the
+        obstacle band and read as a thing to avoid, which is the opposite of
+        what it means. It is draped for the reason every overlay here is: at
+        one flat height a lot on any slope draws its bays under its own road.
+
+        **Every vertex is OPAQUE, and the renderer forces that.** Translucent
+        vertex colour does not blend here: measured over the road, one flat
+        `#c6c8c1` quad renders correctly at vertex alpha 1.0 and 0.999, comes
+        back BRIGHTER than opaque at 0.9, and saturates to pure white at 0.5
+        and below; premultiplying changes nothing. A washed bay was therefore
+        a solid white slab on screen. So a bay is an OUTLINE -- which is how a
+        real bay is painted anyway, and it leaves the road and the dividers
+        the bay was derived from visible through the middle of it. Only the
+        SELECTED bay is filled, because exactly one ever is.
+
+        Bay geometry arrives already in the BEV frame, so this is a
+        relabelling (`right, lift, -forward`) and not a projection -- there
+        is no second pose here to disagree with the worker's.
+        """
+        slots = snapshot.parking_slots
+        if not slots:
+            return (
+                _EMPTY_VERTICES.copy(),
+                _EMPTY_COLOURS.copy(),
+                _EMPTY_INDICES.copy(),
+            )
+
+        border = WORLD_PARKING_BORDER_M
+        pieces: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for slot in slots:
+            if slot.selected:
+                rgb = _PARKING_SELECTED_LINEAR
+            elif slot.occupied:
+                rgb = _PARKING_OCCUPIED_LINEAR
+            else:
+                rgb = _PARKING_FREE_LINEAR
+            sin_h = math.sin(slot.heading_rad)
+            cos_h = math.cos(slot.heading_rad)
+            half_depth = slot.depth_m * 0.5
+            half_width = slot.width_m * 0.5
+
+            def place(depth: float, across: float) -> tuple[float, float]:
+                # The bay's own frame into BEV: depth along the heading,
+                # across to its right.
+                return (
+                    slot.centre_right_m + depth * sin_h + across * cos_h,
+                    slot.centre_forward_m + depth * cos_h - across * sin_h,
+                )
+
+            def quad(
+                corners: list[tuple[float, float]],
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                vertices = np.asarray(
+                    [
+                        (right, WORLD_PARKING_LIFT_M, -forward)
+                        for right, forward in corners
+                    ],
+                    dtype=np.float32,
+                )
+                colours = np.tile(
+                    np.asarray((*rgb, 1.0), dtype=np.float32), (4, 1)
+                )
+                return (
+                    vertices,
+                    colours,
+                    np.asarray((0, 1, 2, 0, 2, 3), dtype=np.uint32),
+                )
+
+            def band(
+                depth_range: tuple[float, float],
+                across_range: tuple[float, float],
+            ) -> None:
+                (near, far), (left, right_edge) = depth_range, across_range
+                pieces.append(
+                    quad(
+                        [
+                            place(near, left),
+                            place(near, right_edge),
+                            place(far, right_edge),
+                            place(far, left),
+                        ]
+                    )
+                )
+
+            if slot.selected:
+                # The one bay drawn solid. Opaque is affordable here because
+                # it is deliberately singular, and it is what makes the
+                # choice unmistakable at a glance.
+                band((-half_depth, half_depth), (-half_width, half_width))
+            else:
+                # Four strips forming the outline. The buffer holds triangles
+                # only, so an outline is four bands, exactly as the AEB rails
+                # are strips rather than lines.
+                band(
+                    (-half_depth, half_depth),
+                    (-half_width, -half_width + border),
+                )
+                band(
+                    (-half_depth, half_depth),
+                    (half_width - border, half_width),
+                )
+                band(
+                    (-half_depth, -half_depth + border),
+                    (-half_width, half_width),
+                )
+                band(
+                    (half_depth - border, half_depth),
+                    (-half_width, half_width),
+                )
+
+            if slot.occupied:
+                # A cross, so "taken" reads at a glance where a dimmer
+                # outline alone just reads as further away.
+                for sign in (-1.0, 1.0):
+                    pieces.append(
+                        quad(
+                            [
+                                place(-half_depth, -half_width * sign),
+                                place(
+                                    -half_depth + border * 2.0,
+                                    -half_width * sign,
+                                ),
+                                place(half_depth, half_width * sign),
+                                place(
+                                    half_depth - border * 2.0,
+                                    half_width * sign,
+                                ),
+                            ]
+                        )
+                    )
+                continue
+
+            # The entry chevron, at the mouth pointing in: which way the car
+            # would drive in, which no rectangle can show.
+            reach = min(WORLD_PARKING_CHEVRON_M, half_depth * 0.7)
+            base = -half_depth + reach * 0.5
+            for sign in (-1.0, 1.0):
+                pieces.append(
+                    quad(
+                        [
+                            place(base, half_width * 0.55 * sign),
+                            place(base + reach, 0.0),
+                            place(base + reach - border * 1.7, 0.0),
+                            place(base - border * 1.3, half_width * 0.55 * sign),
+                        ]
+                    )
+                )
+
+        combined = _combine(pieces)
+        drape(combined[0], snapshot, field)
+        return combined
+
+    @staticmethod
+    def _parking_ribbon(
+        snapshot: PerceptionSnapshot,
+        field: GroundField | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        The manoeuvre being driven into a bay, as the plan ribbon.
+
+        It IS the planned path while parking -- the arc planner is not running
+        -- so it takes the path's own colour and full alpha rather than a
+        fourth guidance hue. Present only while the park is under way.
+        """
+        points = snapshot.parking_path
+        if points is None or len(points) < 2:
+            return (
+                _EMPTY_VERTICES.copy(),
+                _EMPTY_COLOURS.copy(),
+                _EMPTY_INDICES.copy(),
+            )
+        # The same half-width the plan ribbon uses -- half the body plus a
+        # margin -- because it is the same claim: this is where the car goes.
+        vertices, indices = path_ribbon(
+            np.asarray(points, dtype=np.float64),
+            snapshot.vehicle_geometry.width_m * 0.5 + 0.18,
+        )
+        if not len(vertices):
+            return (
+                _EMPTY_VERTICES.copy(),
+                _EMPTY_COLOURS.copy(),
+                _EMPTY_INDICES.copy(),
+            )
+        colours = np.tile(
+            np.asarray((*_PATH_LINEAR, 1.0), dtype=np.float32),
+            (len(vertices), 1),
+        )
+        drape(vertices, snapshot, field)
+        return vertices, colours, indices
 
     @staticmethod
     def _route_ribbon(

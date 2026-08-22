@@ -396,7 +396,127 @@ WORLD_ACTOR_REGISTRY_INTERVAL_S = 1.0
 WORLD_ACTOR_STATE_INTERVAL_S = 0.1
 WORLD_ACTOR_COAST_S = 0.35
 WORLD_ACTOR_FADE_S = 0.8
+# The QML actor delegate builds its model UP from its node, so the node is the
+# actor's GROUND CONTACT. A simulator actor reports its reference node instead,
+# which stands about this far above the road -- the same quantity
+# `ground_z_vehicle` measures for the ego, which no other actor reports. This
+# used to be a bare `y: model.y - 0.45` in the delegate; it lives here now
+# because the LiDAR-fitted boxes report a true base height and must NOT be
+# dropped, so the two paths can no longer share one correction in the QML.
+WORLD_ACTOR_GROUND_DROP_M = 0.45
 WORLD_MAX_UNCERTAIN_POINTS = 2_000
+
+# --- Fitting a box to vehicle returns ------------------------------------------
+#
+# A traffic car is the one object in this scene that CANNOT be drawn by
+# accumulating a surface, and the reason is arithmetic rather than tuning.
+# Everything else is forgotten by the metre, so a stopped ego keeps every look it
+# ever got and a wall fills in; traffic is forgotten by the second
+# (`WORLD_VEHICLE_TTL_S`) because a car MOVES and would otherwise draw as a
+# streak of itself. At a standstill that leaves ONE snapshot of evidence, and one
+# snapshot of a car at 15 m is four or five azimuth stripes over a metre apart --
+# which `_column_runs` then meshes into exactly what it was given: confetti.
+#
+# So the returns are not meshed at all. **Accumulation is how you build a surface
+# whose shape you do not know; a car is an object whose shape you do.** Five
+# stripes is nowhere near enough to mesh a surface and ample to fit a footprint,
+# so the fit produces a `WorldActor` and the existing delegate draws a car. This
+# runs in `compose`, per snapshot, so it also has none of the store's refresh lag.
+#
+# It is ADDITIVE. The returns still enter the voxel store and still draw as
+# solids underneath, so a fit that is wrong or missing degrades to exactly
+# today's picture rather than to an invisible car -- the same direction of error
+# as every other rule here.
+
+# Clustering happens in the SENSOR's own lattice (azimuth x range), not in world
+# XY, and that is what makes one constant work at every distance. Azimuth stripes
+# spread as `r`, so a fixed world gap either shatters a car at range or welds two
+# parked cars together up close; in polar coordinates the spacing is constant by
+# construction. Measured stripe spacing is 1.24 m at 20 m, i.e. 0.062 rad.
+VEHICLE_FIT_STRIPE_RAD = 0.062
+VEHICLE_FIT_RANGE_CELL_M = 0.5
+# Link across this many missing stripes / range cells. Two is enough to bridge a
+# stripe that fell in a window gap without reaching across the ~1 m a row of
+# parked cars leaves between them.
+VEHICLE_FIT_LINK_AZIMUTH_CELLS = 2
+# Range links reach FURTHER than azimuth ones, and the asymmetry is measured.
+# A flank seen obliquely is crossed by very few stripes, and each one lands
+# much further down its length than the last: on a car 3 m off the axis at
+# 12 m, its end face and its flank came back 5 range cells apart, so a
+# symmetric link split every single car into two fragments.
+VEHICLE_FIT_LINK_RANGE_CELLS = 6
+# Below this there is no footprint to fit; the returns stay solids and nothing
+# is claimed about them.
+VEHICLE_FIT_MIN_POINTS = 12
+# Where confidence saturates. Confidence rides the delegate's opacity, so it is
+# the honesty channel: a car resolved by two stripes is drawn faint.
+VEHICLE_FIT_FULL_POINTS = 120
+# The footprint is fitted by MINIMUM-AREA RECTANGLE over a swept angle, not by
+# PCA. PCA answers the wrong question on the shape a LiDAR actually returns: a
+# car seen from behind is an L (rear face plus one flank), and the principal
+# axis of an L lies diagonally across it. Minimum area locks onto the faces --
+# and on a single flat face it degenerates gracefully to that face's own angle,
+# which is precisely the case handled below.
+VEHICLE_FIT_ANGLE_STEP_DEG = 2.0
+# How close to an edge counts as ON it. The frame is chosen by summing
+# `1 / distance-to-the-nearest-edge`, so this floor is what bounds the reward
+# and therefore how sharply a frame the returns lie on beats one they lie
+# inside. Roughly the noise on a face, and well under any real vehicle
+# dimension.
+VEHICLE_FIT_EDGE_FLOOR_M = 0.05
+# A cluster longer than a vehicle can be is two vehicles, so it is split at its
+# largest gap. Bounded below by the stripe spacing so a split never fires on the
+# sampling itself.
+VEHICLE_FIT_SPLIT_GAP_M = 0.8
+# Above this a cluster is asked whether it is two vehicles. Longer than any
+# car and shorter than a bus, so a bus is never interrogated and a queue of
+# cars always is. The gap alone can never decide it -- at range one car's own
+# end face and flank are separated by exactly the hole two parked cars leave
+# between them, so the split is taken only when BOTH halves fit whole
+# vehicles.
+VEHICLE_FIT_SPLIT_LENGTH_M = 6.0
+VEHICLE_FIT_MAX_CLUSTERS = 24
+# One face and no measurable depth: is this the SIDE of a car or its END? The
+# side of any vehicle is longer than this and the end of one is not.
+VEHICLE_FIT_SIDE_LENGTH_M = 3.0
+# What the unobserved dimension is assumed to be. The box is then pushed AWAY
+# from the ego by the amount it was extended, because the face that was seen is
+# the near one -- the inference goes behind the evidence, never in front of it.
+VEHICLE_FIT_DEFAULT_WIDTH_M = 1.9
+VEHICLE_FIT_DEFAULT_LENGTH_M = 4.5
+# A box with an inferred dimension is drawn fainter than one measured on two
+# faces. It is the same claim the ground-truth actors' confidence makes.
+#
+# Not lower, and this was rendered before it was chosen: confidence drives the
+# delegate's opacity directly, and a parked car alongside the ego almost
+# always has an inferred dimension -- its flank is foreshortened to nothing --
+# so this value is the NORMAL case, not the marginal one. At 0.72 the near car
+# showed the far one through itself and read as a rendering fault rather than
+# as uncertainty. A fully measured box still draws at 1.0.
+VEHICLE_FIT_ONE_FACE_CONFIDENCE = 0.85
+# Carrying an id across frames is what lets the delegate's damping work at all:
+# `ActorListModel.set_actors` only avoids a model reset when the id tuple is
+# unchanged, and a reset rebuilds the delegate and discards its animation state.
+VEHICLE_FIT_TRACK_MATCH_M = 2.5
+# A fit this close to an actor the ground-truth path already draws is that same
+# car; drawing both would put two models in one place.
+VEHICLE_FIT_ACTOR_MATCH_M = 3.0
+# Plausible vehicle envelope. A cluster outside it is not refused a drawing so
+# much as left to the solids: these bounds are what stop a hedge, a bin or two
+# merged cars being asserted to be one vehicle.
+# Length-to-width of anything that drives. A small hatchback is 2.2, a van
+# 2.4, an artic 3.5 -- so this bounds an over-read width without ever
+# touching a shape that is really on the road.
+VEHICLE_MIN_ASPECT = 2.2
+VEHICLE_MIN_WIDTH_M = 1.2
+VEHICLE_MAX_WIDTH_M = 3.2
+# The floor on a BELIEVED length. Nothing shorter than VEHICLE_FIT_SIDE_LENGTH_M
+# is ever measured as a length (see `vehicle_fit`), so this only ever rejects,
+# and it is what stops a stubby corner observation being asserted as a car.
+VEHICLE_MIN_LENGTH_M = 3.0
+VEHICLE_MAX_LENGTH_M = 14.0
+VEHICLE_MIN_HEIGHT_M = 0.6
+VEHICLE_MAX_HEIGHT_M = 4.5
 
 # --- Boundary columns (buildings, walls, kerbs) --------------------------------
 #
@@ -428,11 +548,42 @@ WORLD_MAX_UNCERTAIN_POINTS = 2_000
 # arrives as dense vertical stripes over a metre apart. Ego motion sweeps those
 # stripes across the wall and fills it in, which is what the TTL is for; the
 # single-frame gaps between stripes are closed by WORLD_COLUMN_BRIDGE_CELLS.
-WORLD_COLUMN_SIZE_M = 0.25
-# Vertical quantisation of the voxel store. Finer than the horizontal size buys
-# nothing -- vertical ring spacing on a wall is 0.04 m at 20 m, thirty times
-# denser than azimuth -- and coarser starts merging a kerb into the pavement
-# behind it.
+#
+# 0.125 m, half WORLD_CELL_SIZE_M, and the asymmetry is deliberate: the SLABS
+# are what read as blocky and the ground does not, because `_ground_mesh` shares
+# lattice corners and so is one continuous surface with no steps to see. A
+# slab's drawn thickness tracks this constant exactly -- measured 0.50 / 0.25 /
+# 0.15 / 0.12 m of drawn wall at those cell sizes -- so a kerb was a full
+# quarter-metre thick and a wall likewise.
+#
+# It is also the half the SAMPLING supports and the cheaper half of the two.
+# Measured on an accumulated street drive (99.5k-point cloud, 70 m of travel),
+# against the 120 ms WORLD_STORE_REFRESH_INTERVAL_S cadence:
+#
+#     ground 0.25, columns 0.25     44 ms      (what this replaces)
+#     ground 0.25, columns 0.125    87 ms      <- this
+#     ground 0.125, columns 0.25   129 ms
+#     ground 0.125, columns 0.125  182 ms      over the cadence
+#
+# The ground is 2.5x the cost because it is a DISC and area goes as r^2, and it
+# is also where refining buys least: the fraction of carriageway a return
+# actually hits falls from 46% to 31% over 30-50 m and 27% to 11% over 50-80 m
+# when the ground cell halves, so most of what the finer lattice would draw out
+# there is `bridge_gaps` inference rather than measurement (5.7% -> 13.9% of the
+# surface invented). A wall does not have that problem: it is sampled thirty
+# times finer vertically than in azimuth, so the detail is genuinely there and
+# was being quantised away.
+WORLD_COLUMN_SIZE_M = 0.125
+# Vertical quantisation of the voxel store, and it is deliberately COARSER than
+# the horizontal size now rather than equal to it. Vertical ring spacing on a
+# wall is 0.04 m at 20 m, thirty times denser than azimuth, so the returns would
+# carry a finer bin -- but halving this too was measured at 87 ms against 86 ms
+# and 164k voxels against 142k, i.e. it buys nothing visible and costs a fifth
+# of the store. Coarser than 0.25 starts merging a kerb into the pavement
+# behind it, so this is the floor rather than a free parameter.
+#
+# WORLD_COLUMN_VERTICAL_BRIDGE_BINS is counted in THESE bins, so it is unmoved
+# by the horizontal change -- see its own comment.
 WORLD_COLUMN_HEIGHT_M = 0.25
 # Further than WORLD_CELL_MEMORY_M, and measured the same way -- in metres
 # driven, not in seconds. A wall is static scenery that only improves with more
@@ -445,7 +596,17 @@ WORLD_COLUMN_HEIGHT_M = 0.25
 WORLD_COLUMN_MEMORY_M = 90.0
 # Output bound, applied after accumulation. Slabs are merged runs, so this is
 # generous: a facade costs a handful of boxes, not one per voxel.
-WORLD_MAX_COLUMNS = 90_000
+#
+# It had to move with WORLD_COLUMN_SIZE_M, and this is the failure that makes
+# the finer grid a REGRESSION if it is forgotten. The store fills with roughly
+# 4x the voxels for the same geometry, and at 90k the cull binds and drops the
+# excess OLDEST-FIRST -- which is precisely the accumulated stripe sweep that
+# fills a striped facade in, so walls behind the car would start dissolving.
+# Measured on the street drive, the store wants 142k at 0.125 m against 58k at
+# 0.25; at the old cap it would have discarded 37% of the wall evidence it had
+# already paid to collect. 200k leaves headroom for a denser scene and costs
+# about 9 MB.
+WORLD_MAX_COLUMNS = 200_000
 # Input bound, applied before binning. Far higher than the old 4,000 render cap
 # because binning is one vectorised pass over the cloud, not per-point geometry.
 WORLD_MAX_BOUNDARY_POINTS = 60_000
@@ -453,8 +614,8 @@ WORLD_MAX_BOUNDARY_POINTS = 60_000
 # same height, so a 10 m facade and the 0.15 m kerb in front of it stay
 # separate rather than averaging into one waist-high wall.
 WORLD_SLAB_HEIGHT_BUCKET_M = 0.5
-# How many empty columns may be bridged between two observed ones. At 0.25 m
-# columns, 6 spans 1.5 m: azimuth stripes on a wall run past a metre apart at
+# How many empty columns may be bridged between two observed ones. At 0.125 m
+# columns, 12 spans 1.5 m: azimuth stripes on a wall run past a metre apart at
 # range (and wider since the standard wedges went to density 35), and a bridge
 # that stops short of the stripe spacing leaves an oriented wall as a row of
 # posts -- measured, a 30-degree wall sampled every 1.5 m went from 19
@@ -463,7 +624,14 @@ WORLD_SLAB_HEIGHT_BUCKET_M = 0.5
 # the ray passed through, so the surface between them was there to be hit.
 # Still under anything a car could drive through, and the 4 m doorway case is
 # pinned open by test_azimuth_stripe_gaps_are_bridged_but_a_real_opening_is_not.
-WORLD_COLUMN_BRIDGE_CELLS = 6
+#
+# It is counted in CELLS and the stripe spacing it has to clear is a PHYSICAL
+# distance, so it must move inversely with WORLD_COLUMN_SIZE_M or the same gap
+# stops being closed: it went 6 -> 12 with the columns at 0.125 m, and 1.5 m is
+# unchanged either side of that. Leaving it at 6 is the way to make a finer grid
+# look WORSE than a coarse one -- the far field breaks into disconnected
+# fragments, which reads as harder blockiness than the cell size ever did.
+WORLD_COLUMN_BRIDGE_CELLS = 12
 # How many empty height bins may be bridged INSIDE a column before the run is
 # treated as two separate structures.
 #
@@ -489,10 +657,10 @@ WORLD_MIN_SLAB_HEIGHT_M = 0.10
 # parked at an angle as a heap of them. The orientation is now MEASURED from the
 # footprint and the box is rotated to match.
 #
-# It cannot be measured inside one column. A 0.25 m cell holds at most 0.25 m of
-# evidence, which is smaller than the azimuth stripe spacing the returns arrive
-# with (about a metre and more at range), so the direction has to come from a
-# NEIGHBOURHOOD: metre tiles, summed over a sliding 7x7 of them -- a 7 m
+# It cannot be measured inside one column. A 0.125 m cell holds at most 0.125 m
+# of evidence, which is far smaller than the azimuth stripe spacing the returns
+# arrive with (about a metre and more at range), so the direction has to come
+# from a NEIGHBOURHOOD: metre tiles, summed over a sliding 7x7 of them -- a 7 m
 # window. It was a 3 m window first, and that is exactly what the staircase
 # complaint was: a wall at range arrives as stripe samples over a metre apart,
 # so 3 m often held two or three cells, the guards (correctly) refused to fit,
@@ -538,6 +706,22 @@ WORLD_ORIENT_BUCKETS = 24
 # is exactly the case the orientation exists for, and four collinear stripe
 # samples are a direction while four clumped ones fail the anisotropy guard
 # beside this one -- the two guards ask different questions.
+#
+# IT DOES NOT SCALE WITH WORLD_COLUMN_SIZE_M, and the obvious reasoning that it
+# should is wrong. The window is 7 m of WORLD (a sliding 7x7 of metre tiles), so
+# halving the cell size looks like it must quadruple the cells inside it and
+# quietly relax this guard by 4x. Measured, it does not, because a cell count is
+# bounded by the RETURNS and not by the lattice: a wall sampled at 1.5 m azimuth
+# stripes holds 6 cells in the densest window at 0.25 m and 6 at 0.125 m -- each
+# stripe lands in one cell either way. Raising this to 16 to "compensate" would
+# therefore have refused every sparse wall and brought back the staircases the
+# whole orientation pass exists to remove.
+#
+# Only a densely-sampled BLOB scales (a bush went 88 cells -> 298), and the blob
+# was never this guard's to reject: measured at both sizes it comes back
+# oriented 0 of 88 and 0 of 298, because ANISOTROPY is a scale-free ratio and is
+# what does that work. The two guards asking different questions is exactly what
+# makes the finer grid safe here.
 WORLD_ORIENT_MIN_CELLS = 4
 WORLD_ORIENT_MIN_ANISOTROPY = 0.6
 
@@ -653,6 +837,48 @@ WORLD_ROUTE_ALPHA = 0.55
 WORLD_ROUTE_DASH_M = 2.0
 WORLD_ROUTE_GAP_M = 1.5
 WORLD_ROUTE_HALF_WIDTH_M = 0.35
+# Parking bays. A bay is an INFERENCE drawn from two painted lines rather
+# than something the sensors saw standing there, so like the path and the
+# route it separates by CHROMA and never takes a luminance rung -- the two
+# steps in the ladder are spoken for.
+#
+# **Every one of these is OPAQUE, and that is forced by the renderer.**
+# Translucent vertex colour does not blend in this scene: measured on the real
+# GPU over the road, one flat quad of `#c6c8c1` renders (198,200,193) at
+# vertex alpha 1.0 and 0.999 -- correct -- then (220,222,215) at 0.9, which is
+# BRIGHTER than opaque, and saturates to pure white at 0.5 and below.
+# Premultiplying the colour changes nothing. So the whole visual hierarchy
+# here comes from HUE and from GEOMETRY (outline against fill), never from a
+# wash, and a bay is drawn as an outline so the road and its own dividers stay
+# visible through the middle of it.
+#
+# Note this puts a question over the AEB overlay, which carries a 0.04 wash
+# and a 0.80 rail in one buffer: CLAUDE.md's supporting measurement used a
+# BLACK quad, and black is the one colour that cannot tell a correct blend
+# from this failure -- both give `background * (1 - a)`.
+#
+# The free bay borrows the PAINT colour outright, and that is the point: the
+# bay is exactly the space its dividers define, so drawing it in the colour of
+# its own evidence ties the claim to what supports it.
+WORLD_PARKING_FREE_RGB = WORLD_SURFACE_MARKING_RGB
+# Occupied bays recede toward the road rather than dimming toward the
+# obstacle band: "there is a bay here and it is taken" must not read as
+# "there is something solid here", which the boundary colour would say.
+WORLD_PARKING_OCCUPIED_RGB = "#7e8489"
+# The selected bay, and the one warm hue with no other job in this scene:
+# path and route are blue, AEB violet then red, everything else neutral. It
+# is also the only bay drawn FILLED -- exactly one ever is, so an opaque fill
+# is affordable there and is what makes the choice unmistakable.
+WORLD_PARKING_SELECTED_RGB = "#ff9d4d"
+# Outline thickness. Wide enough to survive at range (a bay 30 m out is a few
+# pixels tall), narrow enough not to close up the bay it outlines.
+WORLD_PARKING_BORDER_M = 0.14
+# Lift above the draped surface. Over the road mesh but under the paint
+# quads' 2 cm, so a bay outline never hides the dividers it came from.
+WORLD_PARKING_LIFT_M = 0.012
+# The entry chevron: which way the car would drive in, the one property of a
+# bay a rectangle cannot show.
+WORLD_PARKING_CHEVRON_M = 0.9
 # Traffic drawn from LiDAR alone, in the same blue as the corroborated actor
 # models, because hue is the only thing separating a car from a wall -- both
 # live in the dark obstacle band. See WORLD_VEHICLE_TTL_S: these are the returns
@@ -1769,3 +1995,393 @@ REVERSE_COST_SMOOTHNESS = 0.3
 # Vehicle.control() is a blocking ack. Raise to 80 to actuate every other tick
 # if POLL TIME ever exceeds DISPLAY_INTERVAL_MS with self-driving engaged.
 CONTROL_INTERVAL_MS = 40
+
+# --- Parking bay detection ----------------------------------------------------
+#
+# Bays are found from PAINT, not from gaps between parked cars. A gap-based
+# finder is what production parking assists use and it works on unannotated
+# maps, but it has one fatal property here: an EMPTY lot is one enormous gap
+# and offers nothing to find. An empty bay is defined by its lines, so paint is
+# the only signal that survives the empty case -- which is the case this was
+# asked for. (Confirmed live: bays on this map ship as annotated decals and
+# read through the LiDAR, the same way `Marking check:` confirmed lane paint.)
+#
+# Nothing here feeds the planner or either AEB band. Detection is a display and
+# selection concern only, so a wrong bay costs a bad suggestion the user can
+# see and decline -- not a phantom brake or a phantom wall.
+
+# Marking cells accumulate in their own world-anchored store, separate from
+# PlanningMemory: that store is documented planner-only and is gated on
+# self-driving, whereas scanning for a bay is something you do while driving
+# the car yourself.
+#
+# Finer than MEMORY_CELL_M because the quantity being measured is a LINE'S
+# OFFSET, not whether a cell is occupied. A bay line is ~0.12 m of paint, so
+# 0.2 m keeps it to one or two cells across and leaves the stripe narrow
+# against PARKING_STRIPE_MAX_WIDTH_M.
+PARKING_MARKING_CELL_M = 0.2
+# Forgotten by the METRE, the WORLD/PlanningMemory two-clocks rule -- and much
+# longer than MEMORY_DISTANCE_M's 20 m on purpose. Paint does not move, the
+# ego pose is ground truth so old cells are exactly as valid as new ones, and
+# a lot is crossed at a crawl: at 15 km/h a 20 m window empties while you are
+# still deciding. The failure this risks is a stale bay the user can see is
+# stale, which is not the class of failure the planner's window guards.
+PARKING_MARKING_MEMORY_M = 80.0
+# Paint returns thin with range like every other ground return; past this the
+# stripes arrive too sparsely to fit a line to. Must stay comfortably ABOVE
+# PARKING_SCAN_RADIUS_M or the store, not the scan, is what bounds how far
+# bays are found -- and it would do it silently, since the scan would simply
+# receive fewer cells.
+PARKING_MARKING_RADIUS_M = 70.0
+# A 45 m disc at 0.2 m is ~159k cells if it were solid paint; markings occupy
+# a small fraction of that and the cap bounds the per-tick sort-merge.
+PARKING_MARKING_MAX_CELLS = 60_000
+
+# Bays are only offered inside this radius, and it has to be comparable to
+# how far paint is DRAWN or the view contradicts itself: WORLD renders the
+# road (and its markings) to WORLD_ROAD_RADIUS_M = 100 m, so at the original
+# 35 m a lot showed a full row of painted bays with outlines on only the near
+# few. Measured on a straight row, detection stopped dead at 32.9 m.
+#
+# 60 m is what the SENSORS support all round rather than a round number: the
+# roof unit owns the near bowl out to LIDAR_ROOF_FAR_M (55 m) in every
+# direction, and past that only the forward road-scan wedge reaches, so bays
+# behind and beside the car would stop being found anyway. The sweep's cost
+# is driven by cell count and the angle count, not by the radius -- measured
+# 9.1 ms at 35 m against 9.3 at 60 on the same 2,786-cell lot.
+PARKING_SCAN_RADIUS_M = 60.0
+# How far along a divider a gap may run before it is two separate dividers.
+# This is what makes TWO FACING ROWS across an aisle work, and without it
+# they are not merely degraded but completely undetectable: facing rows put
+# their dividers at the SAME perpendicular offsets, so each pair merged into
+# one stripe spanning both rows and every bay then failed
+# PARKING_BAY_MAX_DEPTH_M. Measured, 5 bays + 5 bays became 0.
+#
+# Bounded on both sides: above the observation gaps along one divider (ground
+# returns thin with range, so metre-scale holes are normal), and below an
+# aisle, which is 6 m and up. A divider split by an occluding car into
+# fragments under PARKING_BAY_MIN_DEPTH_M correctly stops bounding a bay --
+# that is the honest reading of not having seen enough of it.
+PARKING_STRIPE_GAP_M = 3.0
+# Below this the store holds a few stray marking returns rather than a lot,
+# and every geometric conclusion drawn from them would be noise.
+PARKING_MIN_MARKING_CELLS = 40
+# Re-detection cadence. The stripes are world-anchored and re-projected into
+# the BEV frame every tick, so the drawn bays stay glued to the ground between
+# scans; only the SET of bays needs the sweep, and it does not need it at
+# 25 Hz.
+PARKING_SCAN_INTERVAL_S = 0.5
+
+# The stripe-direction sweep. All bay dividers in a row are parallel, so the
+# right angle is the one whose PERPENDICULAR projection concentrates the cells
+# into narrow peaks. Coarse pass over [0, 180) then a fine refine around the
+# winner: at 1 deg a 5 m stripe smears 0.09 m at its ends, comparable to the
+# offset bin, and the refine costs 21 more evaluations.
+PARKING_ANGLE_COARSE_DEG = 1.0
+PARKING_ANGLE_FINE_DEG = 0.1
+# This MUST NOT be finer than PARKING_MARKING_CELL_M, and the reason is the
+# whole sweep. Store cells sit on a 0.2 m lattice, so at a 0.1 m bin a line
+# seen ALONG its length lands in alternating occupied and empty bins -- it
+# reads as a row of one-bin "stripes" and scores exactly as well as the same
+# line seen end-on. Measured, that tied the correct angle with the one 90
+# degrees from it and the detector found nothing at all. At or above the cell
+# pitch the same line fills consecutive bins, becomes one wide run, and is
+# rejected, which is what the width cap is for. 0.25 leaves margin for the
+# sub-cell jitter of a stored MEAN position.
+#
+# It costs no precision: a stripe's offset is the MEAN of its cells' own
+# positions, never its bin centre. The bin decides grouping only.
+PARKING_OFFSET_BIN_M = 0.25
+# A run of occupied offset bins wider than this is not a stripe seen end-on --
+# it is a stripe seen ALONG its length, i.e. the wrong angle, or a broad decal.
+#
+# This width cap is also what makes the sweep's score honest, and a plain
+# "sum of squared bin counts" concentration score is NOT: a single long line
+# perpendicular to the bays (the head line many lots have) piles into one bin
+# and, squared, outscores eight genuine stripes. Scoring instead by HOW MANY
+# CELLS lie in narrow runs makes the eight stripes win on their own mass.
+# 1.0 rather than 0.7 because it is also the tolerance on the SWEEP ANGLE: a
+# divider whose own direction differs from the swept angle by `t` spreads its
+# length over `L * sin(t)`, so at 5 m long a 0.7 m cap silently drops any
+# divider more than 8 degrees off the sweep. A row following a curved wall is
+# exactly that -- measured on a 150 m-radius row of ten bays, one divider was
+# lost and with it a bay. Still less than half the narrowest bay width, so it
+# cannot merge two adjacent dividers into one run.
+PARKING_STRIPE_MAX_WIDTH_M = 1.0
+# Cells in one offset bin before that bin counts as occupied at all, and this
+# is what makes a head line survivable rather than merely outvoted. Seen from
+# the dividers' own angle a line across their heads does not pile into one bin
+# -- it smears along the whole row and BRIDGES every divider's bin, merging
+# eight clean stripes into one run too wide to be a stripe. Measured, that
+# took the scene from seven bays to none.
+#
+# The discriminator is that a divider seen end-on stacks its entire length
+# into one bin (tens of cells) while anything crossing the projection leaves
+# only a sample or two per bin. 3 is strictly weaker than the
+# PARKING_MIN_STRIPE_CELLS filter that follows it, so it removes only the
+# smear.
+PARKING_MIN_BIN_CELLS = 3
+# Cells backing one stripe before it is believed. At 0.2 m a 5 m line is ~25
+# cells even sampled once; 8 rejects fragments without needing the whole line.
+PARKING_MIN_STRIPE_CELLS = 8
+
+# Bay dimensions. Width is the gap between adjacent dividers; a UK/EU bay is
+# 2.4-2.5 m and a US one 2.7-2.9, so the band covers both with slack for the
+# cell pitch. The lower bound is what rejects the two halves of a DOUBLE
+# divider line, which some lots paint 0.3-0.5 m apart.
+PARKING_BAY_WIDTH_MIN_M = 2.1
+PARKING_BAY_WIDTH_MAX_M = 3.4
+# Depth is the SHORTER DIVIDER'S LENGTH, not the overlap between the two, and
+# that distinction is what makes ANGLED (herringbone) lots work at all.
+#
+# In an angled lot the dividers start along a common aisle edge and run off at
+# an angle, so adjacent dividers are STAGGERED along their own direction by
+# `width / tan(angle)`. Measuring depth as their overlap subtracts that
+# stagger from a number that should not depend on it: measured on a proper
+# 2.5 m x 5 m angled lot, a 60-degree bay -- the commonest angled layout --
+# has 3.56 m of overlap against this 3.6 m floor and was rejected by 4 cm,
+# while 45 degrees gave 2.50 m and 30 degrees 0.67 m. Perpendicular bays were
+# fine, so a lot whose row curves has some bays detected and some not, which
+# is exactly how it was reported.
+#
+# The maximum still rejects an AISLE: its two long edge lines are parallel and
+# plausibly spaced, and it is their LENGTH that gives them away -- a test that
+# works on the length directly rather than on the overlap.
+PARKING_BAY_MIN_DEPTH_M = 3.6
+PARKING_BAY_MAX_DEPTH_M = 7.5
+# The overlap is still needed, but as an ADJACENCY test rather than as the
+# depth: two dividers that barely overlap are not bounding one bay. This is
+# what keeps two FACING rows across an aisle apart, where the overlap is
+# strongly negative (measured -5 m), while leaving an angled bay's honest
+# stagger alone. Kept well under PARKING_BAY_MIN_DEPTH_M so it constrains
+# only the pairing, never the depth.
+#
+# 0.5 rather than 1.0 because the stagger grows as the bay angle falls: a
+# 30-degree lot leaves only 0.67 m of overlap between neighbours and was the
+# one layout still missed at 1.0. Facing rows are separated by metres of
+# NEGATIVE overlap, so the margin costs nothing there -- verified at 0.5 that
+# facing rows still return 10 bays rather than merging into 20.
+PARKING_STRIPE_MIN_OVERLAP_M = 0.5
+
+# Occupancy. The rectangle is shrunk by this before anything inside it counts,
+# because the dividers themselves, the kerb at the head and a neighbour's
+# wing mirror all sit on or just inside the boundary.
+PARKING_OCCUPANCY_MARGIN_M = 0.3
+# Returns above the ego's ground plane that count as something standing in the
+# bay. Above the paint and the road crown, below a kerb face's top: a car
+# fills this several hundred times over, so the threshold is not doing subtle
+# work -- it is keeping the surface itself out.
+PARKING_OCCUPANCY_MIN_HEIGHT_M = 0.30
+PARKING_OCCUPANCY_MIN_CELLS = 4
+# Nearest-first cap on what is drawn and clickable. Raised with the scan
+# radius: a real lot inside 60 m holds far more than 20 bays, and a cap that
+# binds looks exactly like the detection failures this feature has already
+# had -- painted bays on screen with no outline on them. 48 outlines is about
+# 1,150 vertices, which is nothing beside the ground mesh.
+PARKING_MAX_SLOTS = 48
+# How many row ORIENTATIONS to look for. The sweep returns one angle, so a
+# single pass keeps whichever row carries the most paint and silently drops
+# every row lying at a different angle -- in a real lot, the row you happen to
+# be facing keeps its bays and the rest of the lot has none, which reads as a
+# sensor that only looks forwards. It is not: nothing in the detector filters
+# by bearing, and a row directly behind the car is found perfectly when it is
+# the only one there. Each pass consumes the cells its stripes claimed and
+# re-sweeps the remainder.
+#
+# 3 covers the shapes that actually occur -- two facing rows either side of an
+# aisle, plus a perpendicular row along an end wall. Each pass is another full
+# sweep over the residual, which shrinks fast, so the cost is well under the
+# first pass's.
+PARKING_MAX_ROWS = 3
+# A selection is held as a WORLD pose, never as an index into the last scan:
+# the set is rebuilt every PARKING_SCAN_INTERVAL_S and indices are not stable
+# across a rebuild. After each scan the held pose is re-matched to the nearest
+# bay centre inside this radius, and a selection that matches nothing survives
+# unmatched rather than silently jumping to a different bay.
+PARKING_SELECT_MATCH_M = 1.5
+
+# How far two dividers' directions may differ and still bound one bay. This
+# exists because pairing now runs across every sweep at once: a slightly
+# CURVED row (one following a wall, which is what a real lot does) has its
+# dividers claimed by two or three different sweep angles, and pairing within
+# a pass meant neighbours found on different passes could never meet.
+# Measured live on such a lot: 18 dividers -> 12 bays with 6 unpaired, and on
+# a single sweep 10 dividers -> 5 bays with 5 unpaired.
+#
+# Wide enough to span the sweep-angle steps a curve is split across, narrow
+# enough that two genuinely different rows never pair -- those differ by tens
+# of degrees.
+PARKING_STRIPE_ANGLE_TOL_DEG = 15.0
+
+# --- Driving into the bay -----------------------------------------------------
+#
+# The manoeuvre, as opposed to finding the bay. Its own controller and its own
+# constants, because the road laws are wrong here in ways that are not a matter
+# of tuning -- see parking_drive's module docstring.
+
+# Manoeuvring speed, and it is chosen to sit BELOW AEB_MIN_SPEED_MPS (2.0).
+# That is not a coincidence to be tidied away: at parking speed the forward
+# emergency brake stays in STANDBY, so it cannot fire at the kerbs, walls and
+# neighbouring cars a park deliberately drives close to. Parking therefore
+# does its own corridor check (`blocking_distance`) rather than leaning on a
+# system that is, correctly, not watching.
+PARKING_DRIVE_SPEED_MPS = 1.4
+# Enough to keep rolling against a gentle grade without lurching; the
+# distance-to-go law tapers through it to the stop.
+PARKING_DRIVE_CREEP_MPS = 0.5
+# Comfortable deceleration for the approach. Gentle on purpose: the whole
+# manoeuvre is under 15 m and there is nothing to be gained by hurrying the
+# last of it.
+PARKING_DRIVE_DECEL_MPS2 = 1.0
+# Pure-pursuit lookahead ceiling. It shortens as the car slows, because a
+# fixed lookahead cuts the corner into the bay -- which is exactly where the
+# tolerance is smallest.
+PARKING_DRIVE_LOOKAHEAD_M = 3.0
+# How far outside the mouth the car is brought onto the bay's own axis. This
+# is what makes the entry straight rather than a swerve across the lines, and
+# it is grown on retry when the sweep would be too tight.
+PARKING_DRIVE_APPROACH_M = 5.0
+# Abort if the car strays this far from the planned line.
+PARKING_DRIVE_MAX_CROSS_TRACK_M = 1.5
+
+# A committed path is replanned only after a genuine tracking failure, not on
+# every tick. Progress means at least a few centimetres closer to the end.
+PARKING_PROGRESS_TIMEOUT_S = 3.0
+# How close the nose stops to the head of the bay.
+PARKING_HEAD_CLEARANCE_M = 0.5
+# Half-width margin added to the body for the manoeuvre's own corridor check.
+# Tighter than the planner's 0.35: parking is close work by definition, and a
+# generous margin here refuses bays the car fits in comfortably.
+PARKING_BODY_CLEARANCE_M = 0.18
+# Remaining path length at which the manoeuvre is finished.
+PARKING_ARRIVE_TOLERANCE_M = 0.15
+# Held once parked. A finished park must STAY put -- releasing at the stop
+# line lets the car roll on out of the bay -- so this is a hold, unlike every
+# teardown path in the worker, which deliberately hands back a coasting car.
+PARKING_STOP_BRAKE = 0.55
+# Samples along the swept approach. The curvature check and the corridor check
+# both run on these, so it is a resolution, not a drawing detail.
+PARKING_PATH_SAMPLES = 48
+# How far the car may be past a path's ideal turn-in point and still have that
+# path built for it. This is TRACKING LAG, not slop: the car follows the path
+# with a lookahead, so it reaches the turn-in marginally beyond it and the
+# exact construction goes infeasible by centimetres -- measured, a turning
+# manoeuvre reported unreachable at run_in = -0.016 m, a few centimetres from
+# arriving, and stopped on the line. Inside this the arc simply starts now.
+PARKING_PATH_SLACK_M = 0.75
+# Distance inside which the creep floor is released so the profile can reach
+# zero. Above it a floor keeps the car rolling against a gentle grade instead
+# of stalling short of the bay; below it that same floor is what would carry
+# the car straight through the stop point.
+PARKING_DRIVE_CREEP_HOLD_M = 1.0
+# Heading still to be lost, above which the manoeuvre holds a crawl. Distance
+# alone let the car cross the stop plane at cruising speed with the wheel
+# still wound on -- centred in the bay but 7.2 degrees off square. Slowing
+# while there is turn left gives the tracker time to straighten.
+PARKING_TURN_SLOW_DEG = 8.0
+# Where the car stops before backing into a bay, in the bay's own frame:
+# how far out to the side, and how far past the mouth. These are the poses a
+# driver actually uses -- alongside and a little past the space, squared to
+# the aisle -- and they are searched rather than fixed because which one
+# works depends on how much aisle there is and where the car starts.
+PARKING_SETUP_ACROSS_M = (2.6, 3.4, 4.2, 5.0, 5.8)
+PARKING_SETUP_OUT_M = (0.5, 1.5, 2.5, 3.5, 4.5)
+
+# At or below this the car counts as stopped for a gear change. Tighter than
+# STALL_SPEED_MPS because shifting a moving box is exactly what this exists to
+# prevent, and looser than AEB_STOPPED_SPEED_MPS because a shift does not need
+# the precision a brake release does.
+PARKING_SHIFT_SPEED_MPS = 0.08
+# Distance to a leg's pose inside which "no path reaches it" means the car is
+# essentially ON it rather than unable to get there. The same endgame the
+# single forward move hit, now once per leg: the tracker rolls a little past
+# the pose and no forward construction reaches back to it.
+PARKING_LEG_CLOSE_M = 1.5
+# How square to its pose a SETUP leg must leave the car before the next leg
+# begins. Position alone declared the leg made with the car still turning, the
+# reverse then would not solve from where it actually was, and the manoeuvre
+# cycled between re-planning and arriving at the same setup.
+PARKING_LEG_SQUARE_DEG = 12.0
+# Re-plans allowed before handing back. A plan that keeps producing a sequence
+# the car cannot drive would otherwise cycle for ever.
+PARKING_MAX_REPLANS = 4
+# How far the car may travel before a bay the scan has stopped finding is
+# forgotten. Detection is a chain of filters over an accumulating cloud, so a
+# bay near several thresholds at once drops out and returns a moment later --
+# reported as bays flashing, and worse, as the SELECTION vanishing with them.
+#
+# Measured in METRES like the WORLD stores and PlanningMemory, for the same
+# reason: paint does not move and the ego pose is ground truth, so what makes
+# a bay stale is the car leaving, not the clock passing. A freshly found bay
+# always replaces its remembered twin, so this only ever fills gaps.
+PARKING_BAY_MEMORY_M = 25.0
+# Grid a bay's centre is rounded to when deciding whether two scans found the
+# SAME bay. Coarse on purpose: a bay is re-measured every scan and its centre
+# wanders a few centimetres as cells come and go, so an exact key would make
+# every scan a different bay and remember nothing.
+PARKING_BAY_MATCH_M = 1.0
+
+# --- Hybrid A*: the pose-space planner ----------------------------------------
+#
+# Searches the car's state (position AND heading) by expanding short arcs it
+# could really steer, so every node is drivable by construction. Reeds-Shepp
+# supplies both the heuristic and an analytic shortcut to the goal.
+
+# Grid the search collapses states onto. Too fine and it never revisits a
+# state, so the frontier explodes; too coarse and genuinely different poses
+# get merged and the path jinks.
+HYBRID_CELL_M = 0.5
+HYBRID_HEADING_BINS = 36
+# One motion primitive. About a cell's worth of travel: shorter multiplies the
+# expansions for no extra reach, longer skips past thin gaps.
+HYBRID_STEP_M = 0.7
+# Reversing is allowed but not free -- a plan that shuffles when it could
+# simply drive in is a worse plan even when it is shorter.
+HYBRID_REVERSE_PENALTY = 1.6
+# Changing direction costs more than reversing does, because each one is a
+# full stop, a gear change and a wait for the box to confirm. This is what
+# keeps the answer to a manoeuvre a driver would recognise rather than a
+# five-point shuffle that happens to measure shortest.
+HYBRID_GEAR_PENALTY = 3.0
+HYBRID_STEER_PENALTY = 0.15
+# Cost per body sample standing in never-observed ground. Traversable at a
+# price rather than forbidden: forbidding it strands the car in a lot it has
+# only partly seen, while pricing it makes a route over ground the sensors
+# have actually returned beat a route through the unseen.
+HYBRID_UNKNOWN_PENALTY = 0.25
+HYBRID_GOAL_RADIUS_M = 0.4
+HYBRID_GOAL_HEADING_DEG = 8.0
+# How often the Reeds-Shepp shot at the goal is tried. It is the expensive
+# part of an expansion and far from the goal it almost never clears, so it is
+# tried periodically -- and always once the search is near.
+HYBRID_ANALYTIC_INTERVAL = 8
+# Hard bound on the search. A parking manoeuvre that needs more than this is
+# one to hand back rather than to keep grinding at, and it runs off the
+# control tick so the ceiling is about answering promptly, not about safety.
+HYBRID_MAX_EXPANSIONS = 12000
+# How far past a leg's pose still counts as having made it. This is for
+# OVERSHOOT -- the car tracks with a lookahead and rolls a few centimetres
+# beyond -- so it must stay small: at a metre it fired while the car was
+# still a metre off to the side and latched the park there, 0.96 m off the
+# centreline of a 3.18 m bay.
+PARKING_OVERSHOOT_M = 0.4
+# How long the manoeuvre waits, stopped and asking for a gear, before it
+# proceeds without confirmation. Confirmation is the evidence a shift took --
+# but waiting for it forever is a hang, and an UNREADABLE gearbox is exactly
+# that: `electrics` unavailable means the reported gear is None, neither the
+# forward nor the reverse test can pass, and the car sits braking. Long
+# enough that a box which does report gets to, short enough that a box which
+# never will does not strand the manoeuvre.
+PARKING_SHIFT_DWELL_S = 1.2
+
+# Blockage and terminal-state hysteresis. These make WAITING and success real
+# states rather than one-frame labels that can alternate with motion.
+PARKING_BLOCKED_CLEAR_DWELL_S = 0.5
+PARKING_SUCCESS_DWELL_S = 0.5
+PARKING_SUCCESS_SPEED_MPS = 0.05
+# Bay geometry comes from rasterised paint, so terminal containment has a
+# small measurement envelope while remaining substantially tighter than the
+# detector's bay matching tolerance.
+PARKING_SUCCESS_POSITION_M = 0.55
+PARKING_SUCCESS_HEADING_DEG = 12.0
+PARKING_SUCCESS_BOUNDARY_TOLERANCE_M = 0.30

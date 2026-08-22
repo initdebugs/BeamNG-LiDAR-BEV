@@ -15,7 +15,18 @@ from beamng_lidar_bev.config import (
     LOOKAHEAD_MAX_M,
     LOOKAHEAD_MIN_M,
 )
-from beamng_lidar_bev.models import BevFrame, PerceptionSnapshot, VehicleGeometry
+from beamng_lidar_bev.hybrid_astar import Occupancy
+from beamng_lidar_bev.models import (
+    BevFrame,
+    ControlCommand,
+    DrivingPlan,
+    ParkingBay,
+    ParkingJob,
+    ParkingSlot,
+    PerceptionSnapshot,
+    VehicleGeometry,
+)
+from beamng_lidar_bev.parking_drive import PARK_UNREACHABLE
 from beamng_lidar_bev.semantics import SemanticPalette
 from beamng_lidar_bev.worker import BeamNgWorker
 
@@ -1345,3 +1356,340 @@ def test_the_colour_probe_is_retired_but_re_armable(
     assert probe._logged_colour_probe is False
     BeamNgWorker._watch_visual_colours(probe, "road", colours, points)  # type: ignore[arg-type]
     assert probe._logged_colour_probe is True
+
+
+# --- the parking bay scan ----------------------------------------------------
+
+
+def _parking_worker() -> tuple[BeamNgWorker, list[PerceptionSnapshot]]:
+    """
+    Bays travel to WORLD on the snapshot, so that is what the tests read.
+
+    `BevFrame` deliberately does not carry them: the overlay lives in the 3D
+    view, where a bay can be drawn on the ground it was measured from and
+    picked by the renderer's own raycast.
+    """
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    snapshots: list[PerceptionSnapshot] = []
+    worker.perception_ready.connect(snapshots.append)
+    worker.set_parking_scan(True)
+    return worker, snapshots
+
+
+def test_the_parking_scan_never_reaches_the_planner_or_either_aeb_band(
+    monkeypatch,
+) -> None:
+    """
+    Pinned by IDENTITY, exactly as the planning memory is.
+
+    A bay is an inference drawn from two painted lines, and the whole reason
+    it is safe to draw a speculative one is that nothing steers or brakes
+    from it. The planner and both AEB systems must therefore receive the
+    same arrays with the scan on as with it off.
+    """
+    planner_band = np.asarray([[0.5, 20.0]] * 5, dtype=np.float32)
+    aeb_band = np.asarray([[0.5, 30.0]] * 7, dtype=np.float32)
+    monkeypatch.setattr(
+        worker_module,
+        "geometric_obstacle_sets",
+        lambda *args, **kwargs: [planner_band, aeb_band],
+    )
+
+    # Captured ONCE. Patching inside the helper would make the second run's
+    # wrapper close over the first run's wrapper, and the first list would
+    # then keep growing while the second run executed.
+    real_plan_arc = worker_module.plan_arc
+
+    def run(scanning: bool) -> tuple[list[int], list[int]]:
+        planner_seen: list[int] = []
+        aeb_seen: list[int] = []
+        monkeypatch.setattr(
+            worker_module,
+            "plan_arc",
+            lambda obstacles, *a, **k: (
+                planner_seen.append(len(obstacles)),
+                real_plan_arc(obstacles, *a, **k),
+            )[1],
+        )
+        worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+        worker._vehicle = VehicleStub()  # type: ignore[assignment]
+        worker.set_self_driving(True)
+        worker._aeb_enabled = True
+        worker._rear_aeb_enabled = True
+        real_compute_aeb = worker._compute_aeb
+        worker._compute_aeb = (  # type: ignore[method-assign]
+            lambda system, obstacles, *a, **k: (
+                aeb_seen.append(len(obstacles)),
+                real_compute_aeb(system, obstacles, *a, **k),
+            )[1]
+        )
+        if scanning:
+            worker.set_parking_scan(True)
+            # Paint under the car, so the scan genuinely has something to
+            # accumulate and cannot pass by doing nothing.
+            worker._marking_memory.update(
+                np.asarray((1.0, 2.0, 3.0)),
+                np.asarray((1.0, 0.0, 0.0)),
+                np.asarray((0.0, 1.0, 0.0)),
+                np.asarray([[0.0, y * 0.2] for y in range(30)], dtype=np.float32),
+            )
+        worker._poll_once()
+        return planner_seen, aeb_seen
+
+    quiet_planner, quiet_aeb = run(scanning=False)
+    scanning_planner, scanning_aeb = run(scanning=True)
+
+    assert quiet_planner == scanning_planner
+    assert quiet_aeb == scanning_aeb
+
+
+def test_parking_alone_activates_obstacle_extraction(monkeypatch) -> None:
+    """Parking must not become blind when it disengages road self-driving."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        worker_module,
+        "geometric_obstacle_sets",
+        lambda *args, **kwargs: (
+            calls.append(1),
+            [np.asarray(((0.5, 8.0),), dtype=np.float32), np.empty((0, 2))],
+        )[1],
+    )
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    worker._parking_driving = True
+
+    worker._poll_once()
+
+    assert calls == [1]
+
+
+def test_worker_passes_parking_occupancy_to_the_real_driver() -> None:
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    slot = ParkingSlot(
+        centre_right_m=-6.0,
+        centre_forward_m=8.0,
+        heading_rad=-np.pi / 2,
+        width_m=3.18,
+        depth_m=5.3,
+        occupied=False,
+        stripe_cells=52,
+        centre_world=(-5.0, 10.0),
+        selected=True,
+    )
+    wall = np.column_stack(
+        (np.linspace(-30.0, 30.0, 600), np.full(600, 3.0))
+    )
+    free = np.column_stack(
+        [
+            axis.ravel()
+            for axis in np.meshgrid(
+                np.arange(-30.0, 30.0, 0.5),
+                np.arange(-30.0, 30.0, 0.5),
+            )
+        ]
+    )
+
+    worker._drive_into_bay(
+        worker._vehicle.state,  # type: ignore[union-attr]
+        (slot,),
+        worker._geometry,  # type: ignore[arg-type]
+        wall,
+        Occupancy(wall, free),
+    )
+
+    assert worker._last_park_state is not None
+    assert worker._last_park_state.phase == PARK_UNREACHABLE
+
+
+def test_parking_engagement_latches_the_complete_world_bay() -> None:
+    worker, _ = _parking_worker()
+    bay = ParkingBay((-5.0, 10.0), (0.0, 1.0), 3.1, 5.4, False, 52)
+    worker._parking_bays = (bay,)
+    worker._parking_selected = bay.centre
+
+    worker.set_parking_drive(True)
+    worker._parking_bays = (
+        ParkingBay((-3.0, 12.0), (1.0, 0.0), 2.5, 5.0, False, 40),
+    )
+    worker._parking_selected = worker._parking_bays[0].centre
+
+    assert worker._parking_job == ParkingJob(bay=bay)
+
+
+def test_an_occupied_bay_cannot_start_a_parking_job() -> None:
+    worker, _ = _parking_worker()
+    bay = ParkingBay((-5.0, 10.0), (0.0, 1.0), 3.1, 5.4, True, 52)
+    worker._parking_bays = (bay,)
+    worker._parking_selected = bay.centre
+    statuses: list[str] = []
+    worker.status_changed.connect(lambda _state, message: statuses.append(message))
+
+    worker.set_parking_drive(True)
+
+    assert worker._parking_driving is False
+    assert worker._parking_job is None
+    assert any("occupied" in message.lower() for message in statuses)
+
+
+def test_actuation_forwards_the_parking_brake_command() -> None:
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    command = ControlCommand(0.0, 0.0, 0.3, 2, "PARKING", 0.0, "Parked", 1.0)
+    plan = DrivingPlan(worker_module._BLIND_ARC, command, 0.0, reported_gear="D")
+    worker._last_control_at = 0.0
+
+    worker._actuate(plan, None)
+
+    assert worker._vehicle.controls[-1]["parkingbrake"] == 1.0  # type: ignore[union-attr]
+
+
+def test_success_ends_automatic_parking_without_releasing_the_brake() -> None:
+    worker, _ = _parking_worker()
+    bay = ParkingBay((-5.0, 10.0), (0.0, 1.0), 3.1, 5.4, False, 52)
+    worker._parking_bays = (bay,)
+    worker._parking_selected = bay.centre
+    worker.set_parking_drive(True)
+    changes: list[bool] = []
+    worker.parking_drive_changed.connect(changes.append)
+    before = len(worker._vehicle.controls)  # type: ignore[union-attr]
+
+    worker._complete_parking_drive()
+
+    assert worker._parking_driving is False
+    assert worker._parking_job is not None
+    assert worker._parking_job.status == "SUCCEEDED"
+    assert changes == [False]
+    assert len(worker._vehicle.controls) == before  # type: ignore[union-attr]
+
+
+def test_the_scan_is_off_by_default_and_draws_nothing() -> None:
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    snapshots: list[PerceptionSnapshot] = []
+    worker.perception_ready.connect(snapshots.append)
+
+    worker._poll_once()
+
+    assert worker._parking_scan is False
+    assert snapshots[0].parking_slots == ()
+
+
+def test_disarming_the_scan_drops_the_paint_and_the_selection() -> None:
+    """Re-arming starts from what the sensors can see now, not a stale lot."""
+    worker, _ = _parking_worker()
+    worker._marking_memory.update(
+        np.asarray((0.0, 0.0, 0.0)),
+        np.asarray((1.0, 0.0, 0.0)),
+        np.asarray((0.0, 1.0, 0.0)),
+        np.asarray([[0.0, y * 0.2] for y in range(30)], dtype=np.float32),
+    )
+    worker._parking_selected = (4.0, 5.0)
+    assert worker._marking_memory.cell_count > 0
+
+    worker.set_parking_scan(False)
+
+    assert worker._marking_memory.cell_count == 0
+    assert worker._parking_bays == ()
+    assert worker._parking_selected is None
+
+
+def test_a_selection_is_held_as_a_world_pose_and_a_miss_clears_it() -> None:
+    worker, _ = _parking_worker()
+    bay = worker_module.ParkingBay(
+        centre=(10.0, 20.0),
+        axis=(0.0, 1.0),
+        width_m=2.5,
+        depth_m=5.0,
+        occupied=False,
+        stripe_cells=52,
+    )
+    worker._parking_bays = (bay,)
+
+    worker.select_parking_slot(10.1, 19.9)
+    assert worker._parking_selected == (10.0, 20.0)
+
+    # A click that matches no bay is how deselecting works.
+    worker.select_parking_slot(80.0, 80.0)
+    assert worker._parking_selected is None
+
+    worker.select_parking_slot(10.0, 20.0)
+    assert worker._parking_selected is not None
+    worker.clear_parking_selection()
+    assert worker._parking_selected is None
+
+
+def test_a_selection_cannot_be_made_while_the_scan_is_off() -> None:
+    worker, _ = _armed_worker([StreamingLidarStub() for _ in range(4)])
+    worker._parking_bays = (
+        worker_module.ParkingBay(
+            centre=(1.0, 1.0),
+            axis=(0.0, 1.0),
+            width_m=2.5,
+            depth_m=5.0,
+            occupied=False,
+            stripe_cells=52,
+        ),
+    )
+
+    worker.select_parking_slot(1.0, 1.0)
+
+    assert worker._parking_selected is None
+
+
+def test_the_bay_set_is_rebuilt_on_its_own_cadence_but_projected_every_tick(
+    monkeypatch,
+) -> None:
+    """
+    Three rates, and the projection is the one that must run every tick or
+    the drawn rectangles lag the car between scans.
+    """
+    scans: list[int] = []
+    monkeypatch.setattr(
+        worker_module,
+        "find_bays",
+        lambda *args, **kwargs: (scans.append(1), ())[1],
+    )
+    worker, snapshots = _parking_worker()
+
+    for _ in range(4):
+        worker._poll_once()
+
+    assert len(scans) == 1, "the sweep must not run on every tick"
+    assert len(snapshots) == 4
+    assert worker._marking_memory.cell_count >= 0
+
+
+def test_teardown_drops_the_scan_and_reports_it_off() -> None:
+    worker, _ = _parking_worker()
+    reported: list[bool] = []
+    worker.parking_changed.connect(reported.append)
+    worker._marking_memory.update(
+        np.asarray((0.0, 0.0, 0.0)),
+        np.asarray((1.0, 0.0, 0.0)),
+        np.asarray((0.0, 1.0, 0.0)),
+        np.asarray([[0.0, y * 0.2] for y in range(30)], dtype=np.float32),
+    )
+    worker._parking_selected = (1.0, 2.0)
+
+    worker._cleanup_sensors()
+
+    assert worker._parking_scan is False
+    assert worker._marking_memory.cell_count == 0
+    assert worker._parking_selected is None
+    assert reported == [False]
+
+
+def test_a_scan_fault_costs_the_overlay_and_nothing_else(monkeypatch) -> None:
+    """
+    The weakest claim on the tick: nothing actuates from a bay, so a fault
+    here must not reach the poll-failure budget and read as a lost bridge.
+    """
+    monkeypatch.setattr(
+        worker_module,
+        "find_bays",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    worker, snapshots = _parking_worker()
+
+    worker._poll_once()
+
+    assert len(snapshots) == 1
+    assert snapshots[0].parking_slots == ()
+    assert worker._poll_failures == 0

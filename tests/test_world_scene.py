@@ -15,6 +15,7 @@ from beamng_lidar_bev.models import (
     ArcPlan,
     ControlCommand,
     DrivingPlan,
+    ParkingSlot,
     PerceptionSnapshot,
     VehicleGeometry,
 )
@@ -74,6 +75,7 @@ def _snapshot(
     materials: tuple[int, ...] | None = None,
     route_world: np.ndarray | None = None,
     plan: DrivingPlan | None = None,
+    parking_slots: tuple[ParkingSlot, ...] = (),
 ) -> PerceptionSnapshot:
     return PerceptionSnapshot(
         points_world=np.asarray(points, dtype=np.float32).reshape(-1, 3),
@@ -95,6 +97,7 @@ def _snapshot(
         aeb=aeb,  # type: ignore[arg-type]
         rear_aeb=rear_aeb,  # type: ignore[arg-type]
         route_world=route_world,
+        parking_slots=parking_slots,
     )
 
 
@@ -460,10 +463,16 @@ def test_every_face_of_a_slab_is_shaded_separately() -> None:
 
 def test_azimuth_stripe_gaps_are_bridged_but_a_real_opening_is_not() -> None:
     """
-    A wall is sampled at r*dazimuth horizontally -- 1.24 m at 20 m against 0.5 m
-    columns -- so it arrives as vertical stripes and extruding stripes just
-    gives striped buildings. Bridging is bounded by WORLD_COLUMN_BRIDGE_CELLS
-    precisely so it can never close a gap the car could drive through.
+    A wall is sampled at r*dazimuth horizontally -- 1.24 m at 20 m against
+    0.125 m columns -- so it arrives as vertical stripes and extruding stripes
+    just gives striped buildings. Bridging is bounded by
+    WORLD_COLUMN_BRIDGE_CELLS precisely so it can never close a gap the car
+    could drive through.
+
+    Both halves are expressed in METRES, which is what makes this the guard on
+    the physical span rather than on the cell count: the stripes below are
+    1.5 m apart and the opening 4 m whatever WORLD_COLUMN_SIZE_M is, so a cell
+    size that moves without its bridge constant moving inversely fails here.
     """
     dense = _wall(-5.0, 5.0, 12.0, 0.0, 4.0)
     striped = dense[(np.floor(dense[:, 0] / 0.5).astype(int) % 3) == 0]
@@ -714,6 +723,13 @@ def test_a_car_is_drawn_from_lidar_alone_with_no_ground_truth_actor() -> None:
 
     Perception first: a car is a solid the LiDAR saw. The ground-truth model is
     enrichment on top of that, never the thing that makes it visible.
+
+    Since 2026-08-12 it is drawn TWICE over, and deliberately: `vehicle_fit`
+    fits a box to the returns and the actor delegate draws a car, while the same
+    returns still feed the voxel store underneath. The fit is what makes a car
+    recognisable -- one snapshot of traffic is a handful of azimuth stripes and
+    meshing them gives confetti -- and the solids are what make a fit this
+    declines to claim degrade to the old picture instead of to nothing.
     """
     car = _wall(-0.9, 0.9, 14.0, -0.45, 1.4, step=0.1)
     groups = (SCENE_VEHICLE,) * len(car)
@@ -722,7 +738,16 @@ def test_a_car_is_drawn_from_lidar_alone_with_no_ground_truth_actor() -> None:
         _snapshot(tuple(map(tuple, car)), groups)
     )
 
-    assert frame.actors == (), "no simulator actor was offered"
+    assert len(frame.actors) == 1, "no simulator actor was offered, and the "
+    fitted = frame.actors[0]
+    assert fitted.actor_id.startswith("lidar-"), "not drawn from the LiDAR"
+    width, height, length = fitted.scale
+    assert width == pytest.approx(1.8, abs=0.3)
+    assert height == pytest.approx(1.8, abs=0.2)
+    # Only the end face was seen, so the length is assumed -- and the assumption
+    # sits BEHIND the returns, never in front of them.
+    assert fitted.position[2] < -14.0
+
     boxes = _vehicle_boxes(frame)
     assert len(boxes), "a car with no confirmed actor is invisible"
     assert boxes[0][:, 1].max() - boxes[0][:, 1].min() > 1.2
@@ -1482,6 +1507,78 @@ def test_covering_the_ground_stays_inside_the_scene_budget() -> None:
     assert elapsed_ms < budget_ms, f"scene build took {elapsed_ms:.1f} ms"
 
 
+def _striped_street(ego_y: float, blocks: float = 90.0) -> np.ndarray:
+    """
+    Facades either side of a street, sampled as AZIMUTH STRIPES.
+
+    Uniform noise would be the wrong worst case: the returns really arrive as
+    dense vertical stripes over a metre apart (r*dazimuth at 20 m is 1.24 m
+    against r*dtheta of 0.04 m), which is what makes one wall thousands of
+    voxels in a handful of columns rather than a smear.
+    """
+    out = []
+    for x in (-8.0, 8.0, -18.0, 18.0):
+        for y in np.arange(ego_y - 30.0, ego_y + blocks, 1.1):
+            r = max(4.0, float(np.hypot(x, y - ego_y)))
+            z = np.arange(0.0, 9.0, max(0.03, r * np.radians(0.118)))
+            out.append(
+                np.column_stack(
+                    (np.full(len(z), x), np.full(len(z), y), z)
+                )
+            )
+    for x in (-3.55, 3.55):  # kerb faces, the sub-slab structure
+        y = np.arange(ego_y - 30.0, ego_y + blocks, 0.12)
+        for z in (0.0, 0.05, 0.1):
+            out.append(
+                np.column_stack(
+                    (np.full(len(y), x), y, np.full(len(y), z))
+                )
+            )
+    return np.concatenate(out)
+
+
+def test_the_slab_half_of_the_build_stays_inside_the_scene_budget() -> None:
+    """
+    The companion to the ground budget above, and it exists because that one
+    cannot see this half: its scene is a DISC of ground returns, so it measures
+    `_ground_mesh` and barely touches the voxel store.
+
+    WORLD_COLUMN_SIZE_M went to 0.125 to halve the drawn thickness of a wall,
+    which puts about 4x the voxels in the store for the same geometry -- the
+    one change most likely to blow this budget, and nothing pinned it.
+    """
+    assembler = WorldSceneAssembler()
+    timestamp = 0.0
+    for ego_y in np.arange(0.0, 60.0, 4.0):  # accumulate, as a real drive does
+        assembler.refresh(
+            _boundary_snapshot(
+                _striped_street(float(ego_y)),
+                ego_pos_world=(0.0, float(ego_y), 0.0),
+                timestamp=timestamp,
+            )
+        )
+        timestamp += 0.4
+    last = _boundary_snapshot(
+        _striped_street(60.0), ego_pos_world=(0.0, 60.0, 0.0), timestamp=timestamp
+    )
+
+    started = time.perf_counter()
+    for _ in range(3):
+        assembler.refresh(last)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0 / 3
+
+    assert len(assembler._voxel_keys) > 40_000, "the store stopped being loaded"
+    # The cap binding is not a slow build, it is a WRONG one: the cull drops the
+    # excess oldest-first, and the oldest voxels are the accumulated stripe
+    # sweep that fills a striped facade in. Walls behind the car would dissolve.
+    assert len(assembler._voxel_keys) < config.WORLD_MAX_COLUMNS, (
+        f"the voxel store is at its cap ({len(assembler._voxel_keys):,}); "
+        "WORLD_MAX_COLUMNS has to move with WORLD_COLUMN_SIZE_M"
+    )
+    budget_ms = config.WORLD_STORE_REFRESH_INTERVAL_S * 1000.0 * 0.5
+    assert elapsed_ms < budget_ms, f"slab build took {elapsed_ms:.1f} ms"
+
+
 # --- Which way a slab faces ---------------------------------------------------
 #
 # The voxel lattice is world-aligned, so every slab used to be a world-aligned
@@ -2111,3 +2208,102 @@ def test_the_threat_marker_stands_on_the_slope_at_its_full_height() -> None:
     # never less than the marker's own height, which is the flattening case.
     span = float(vertices[:, 1].max() - vertices[:, 1].min())
     assert span > config.WORLD_AEB_MARKER_HEIGHT_M
+
+
+# --- parking bays in WORLD ---------------------------------------------------
+
+
+def _bay_slot(**overrides) -> ParkingSlot:
+    fields = dict(
+        centre_right_m=2.0,
+        centre_forward_m=12.0,
+        heading_rad=0.0,
+        width_m=2.5,
+        depth_m=5.0,
+        occupied=False,
+        stripe_cells=52,
+        centre_world=(2.0, 12.0),
+        selected=False,
+    )
+    fields.update(overrides)
+    return ParkingSlot(**fields)
+
+
+def test_parking_bays_are_drawn_fully_opaque() -> None:
+    """
+    The renderer forces this, and a wash was tried first and measured.
+
+    Translucent vertex colour does not blend in this scene: over the road,
+    one flat #c6c8c1 quad renders correctly at vertex alpha 1.0 and 0.999,
+    comes back BRIGHTER than opaque at 0.9, and saturates to pure white at
+    0.5 and below -- premultiplying the colour changes nothing. A washed bay
+    was a solid white slab on screen, so the hierarchy is carried by hue and
+    by outline-against-fill instead.
+    """
+    snapshot = _snapshot(parking_slots=(_bay_slot(),))
+
+    frame = WorldSceneAssembler().update(snapshot)
+
+    assert len(frame.parking_vertices)
+    assert np.all(frame.parking_colors[:, 3] == 1.0)
+
+
+def test_only_the_selected_bay_is_filled_and_it_is_the_only_warm_one() -> None:
+    """Outline for candidates, a solid fill for the one that was chosen."""
+    outline = WorldSceneAssembler().update(
+        _snapshot(parking_slots=(_bay_slot(),))
+    )
+    filled = WorldSceneAssembler().update(
+        _snapshot(parking_slots=(_bay_slot(selected=True),))
+    )
+
+    free = world_scene.linear_rgb(config.WORLD_PARKING_FREE_RGB)
+    chosen = world_scene.linear_rgb(config.WORLD_PARKING_SELECTED_RGB)
+    assert np.allclose(outline.parking_colors[:, :3], free)
+    assert np.any(np.allclose(chosen, row) for row in filled.parking_colors[:, :3])
+    # An outline is four strips plus a chevron; a fill is one quad plus one.
+    # The fill therefore costs FEWER vertices, which is the check that the
+    # two really are different shapes rather than the same one recoloured.
+    assert len(filled.parking_vertices) < len(outline.parking_vertices)
+
+
+def test_bays_are_draped_onto_the_road_not_laid_in_a_flat_plane() -> None:
+    """
+    Same rule as every other overlay: at one scalar height a lot on any
+    slope draws its bays under its own surface.
+    """
+    slot = _bay_slot()
+    flat = WorldSceneAssembler().update(_snapshot(parking_slots=(slot,)))
+    assert len(set(np.round(flat.parking_vertices[:, 1], 4).tolist())) == 1
+
+    # A graded surface under the same bay must tilt the mesh with it.
+    ramp_points, ramp_groups = _ramp_points(grade=0.08)
+    ramp = _snapshot(
+        points=ramp_points, groups=ramp_groups, parking_slots=(slot,)
+    )
+    assembler = WorldSceneAssembler()
+    assembler.update(ramp)
+    draped = assembler.update(ramp)
+
+    heights = draped.parking_vertices[:, 1]
+    assert heights.max() - heights.min() > 0.1
+
+
+def test_the_bays_travel_to_the_view_for_hit_testing() -> None:
+    """
+    The mesh alone cannot say which bay a picked triangle belongs to -- they
+    share one buffer -- so the slots ride alongside it.
+    """
+    slots = (_bay_slot(), _bay_slot(centre_right_m=5.0, selected=True))
+
+    frame = WorldSceneAssembler().update(_snapshot(parking_slots=slots))
+
+    assert frame.parking_slots == slots
+
+
+def test_no_scan_means_no_parking_geometry() -> None:
+    frame = WorldSceneAssembler().update(_snapshot())
+
+    assert len(frame.parking_vertices) == 0
+    assert len(frame.parking_indices) == 0
+    assert frame.parking_slots == ()

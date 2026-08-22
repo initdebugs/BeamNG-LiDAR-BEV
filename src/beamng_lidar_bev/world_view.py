@@ -5,9 +5,11 @@ from typing import Any
 
 import numpy as np
 from PyQt6.QtCore import (
+    Q_ARG,
     QAbstractListModel,
     QByteArray,
     QEvent,
+    QMetaObject,
     QModelIndex,
     QObject,
     QPointF,
@@ -23,7 +25,8 @@ from PyQt6.QtQuick3D import QQuick3DGeometry
 from PyQt6.QtQuickWidgets import QQuickWidget
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
-from .models import WorldActor, WorldFrame
+from .models import ParkingSlot, WorldActor, WorldFrame
+from .parking import slot_contains
 from .world_scene import apply_view_orbit
 
 _POSITION_BYTES = 12
@@ -203,10 +206,15 @@ class ActorListModel(QAbstractListModel):
 class SceneBridge(QObject):
     state_changed = pyqtSignal()
     geometry_changed = pyqtSignal()
+    parking_slot_clicked = pyqtSignal(float, float)
+    """The WORLD centre of the bay picked in the 3D view."""
+    parking_selection_cleared = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         triangles = QQuick3DGeometry.PrimitiveType.Triangles
+        self._parking_geometry = SceneGeometry(triangles)
+        self._parking_slots: tuple[ParkingSlot, ...] = ()
         self._road_geometry = SceneGeometry(triangles)
         self._boundary_geometry = SceneGeometry(triangles)
         self._vehicle_geometry = SceneGeometry(triangles)
@@ -269,6 +277,51 @@ class SceneBridge(QObject):
     @pyqtProperty(QQuick3DGeometry, constant=True)
     def routeGeometry(self) -> QQuick3DGeometry:
         return self._route_geometry
+
+    @pyqtProperty(QQuick3DGeometry, constant=True)
+    def parkingGeometry(self) -> QQuick3DGeometry:
+        return self._parking_geometry
+
+    @pyqtSlot(float, float)
+    def parkingPicked(self, render_x: float, render_z: float) -> None:
+        """
+        Turn a scene point from the QML raycast into the bay that owns it.
+
+        Render space is `(right, height, -forward)`, so dropping the height
+        and negating z lands in the BEV frame the slots are already in --
+        a relabelling, not a projection, which is why nothing here needs the
+        camera or the ego pose.
+
+        Reported as the bay's WORLD centre for the same reason the whole
+        selection path uses one: the worker rebuilds the bay set on its own
+        cadence, so any index would refer to a different bay by the time it
+        arrived.
+        """
+        hit = next(
+            (
+                slot
+                for slot in self._parking_slots
+                if not slot.occupied
+                and slot_contains(slot, render_x, -render_z)
+            ),
+            None,
+        )
+        if hit is None:
+            # The ray met the bay MESH but no bay's rectangle owns the point
+            # -- a chevron overhang, or a bay drawn as occupied. Treated as a
+            # miss, so it deselects rather than doing nothing.
+            self.parking_selection_cleared.emit()
+        else:
+            self.parking_slot_clicked.emit(*hit.centre_world)
+
+    @pyqtSlot()
+    def parkingMissed(self) -> None:
+        self.parking_selection_cleared.emit()
+
+    @property
+    def has_parking_slots(self) -> bool:
+        """Whether a click could pick anything, so the filter can stand aside."""
+        return bool(self._parking_slots)
 
     @pyqtProperty(QQuick3DGeometry, constant=True)
     def uncertainGeometry(self) -> QQuick3DGeometry:
@@ -362,6 +415,10 @@ class SceneBridge(QObject):
         self._route_geometry.set_mesh(
             frame.route_vertices, frame.route_colors, frame.route_indices
         )
+        self._parking_geometry.set_mesh(
+            frame.parking_vertices, frame.parking_colors, frame.parking_indices
+        )
+        self._parking_slots = frame.parking_slots
         self._uncertain_geometry.set_mesh(
             frame.uncertain_points, frame.uncertain_colors
         )
@@ -405,9 +462,11 @@ class SceneBridge(QObject):
             self._aeb_marker_geometry,
             self._path_geometry,
             self._route_geometry,
+            self._parking_geometry,
             self._uncertain_geometry,
         ):
             geometry.clear_mesh()
+        self._parking_slots = ()
         self._actor_model.set_actors(())
         self._speed_text = "0"
         self._target_speed_text = "—"
@@ -492,6 +551,14 @@ class WorldView(QWidget):
             # Swallow the context menu too: the right button is the orbit
             # control here, so a menu popping up mid-drag would be noise.
             return kind == QEvent.Type.ContextMenu
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and kind == QEvent.Type.MouseButtonPress
+        ):
+            # Only when there is something to pick, so with the scan off the
+            # left button reaches QML exactly as it always did.
+            if self._pick_parking(event.position()):
+                return True
         if event.button() == Qt.MouseButton.RightButton:
             if kind == QEvent.Type.MouseButtonDblClick:
                 self._orbit_yaw_deg = 0.0
@@ -528,6 +595,30 @@ class WorldView(QWidget):
             self._push_orbit()
             return True
         return False
+
+    def _pick_parking(self, position: QPointF) -> bool:
+        """
+        Ask QML's raycast what the click landed on. True if it was handled.
+
+        The pick runs in QML because `View3D.pick` is the only thing that
+        knows this camera's projection; the bridge turns the returned scene
+        point into a bay. Reproducing the projection in Python would mean
+        pinning down Qt Quick 3D's euler convention by hand, which is the
+        class of guess this project has measured its way out of twice.
+        """
+        if not self._ready or not self.bridge.has_parking_slots:
+            return False
+        root = self._quick.rootObject()
+        if root is None:
+            return False
+        QMetaObject.invokeMethod(
+            root,
+            "pickParkingBay",
+            Qt.ConnectionType.DirectConnection,
+            Q_ARG("QVariant", position.x()),
+            Q_ARG("QVariant", position.y()),
+        )
+        return True
 
     def _push_orbit(self) -> None:
         self.bridge.set_view_orbit(

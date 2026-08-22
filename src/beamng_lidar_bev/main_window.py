@@ -71,6 +71,8 @@ class MainWindow(QMainWindow):
     self_drive_requested = pyqtSignal(bool)
     aeb_requested = pyqtSignal(bool)
     rear_aeb_requested = pyqtSignal(bool)
+    parking_requested = pyqtSignal(bool)
+    park_here_requested = pyqtSignal(bool)
     scene_clear_requested = pyqtSignal()
     streaming_changed = pyqtSignal(bool)
 
@@ -237,6 +239,41 @@ class MainWindow(QMainWindow):
         self.rear_aeb_button.setEnabled(False)
         self.rear_aeb_button.clicked.connect(self._request_rear_aeb)
         sidebar_layout.addWidget(self.rear_aeb_button)
+
+        self.parking_button = QPushButton("Find Parking")
+        self.parking_button.setObjectName("parkingButton")
+        self.parking_button.setIcon(
+            application_style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView)
+        )
+        self.parking_button.setCheckable(True)
+        self.parking_button.setToolTip(
+            "Scan the road paint for parking bays and draw them on the "
+            "ground in the 3D WORLD view; click one to select it. Detection "
+            "and selection only -- this does not drive the car, and it "
+            "changes nothing the planner or either emergency brake sees. "
+            "Bays are found all round the car, and fill in as you move: one "
+            "scan lays sensor rings ACROSS a bay line rather than along it."
+        )
+        self.parking_button.setEnabled(False)
+        self.parking_button.clicked.connect(self._request_parking)
+        sidebar_layout.addWidget(self.parking_button)
+
+        self.park_here_button = QPushButton("Park In Selected Bay")
+        self.park_here_button.setObjectName("selfDriveButton")
+        self.park_here_button.setIcon(
+            application_style.standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+        )
+        self.park_here_button.setCheckable(True)
+        self.park_here_button.setToolTip(
+            "Drive into the bay you selected. Forward nose-in only: a bay "
+            "needing a pull-forward-and-back shuffle is refused rather than "
+            "half-attempted. Creeps below the speed AEB arms at, so the "
+            "manoeuvre checks its own corridor. Self-driving is disengaged "
+            "first -- one thing steers the car at a time."
+        )
+        self.park_here_button.setEnabled(False)
+        self.park_here_button.clicked.connect(self._request_park_here)
+        sidebar_layout.addWidget(self.park_here_button)
 
         sidebar_layout.addWidget(self._separator())
         sensor_title = QLabel("SENSOR ARRAY")
@@ -529,6 +566,18 @@ class MainWindow(QMainWindow):
         self.self_drive_requested.connect(self.worker.set_self_driving)
         self.aeb_requested.connect(self.worker.set_aeb)
         self.rear_aeb_requested.connect(self.worker.set_rear_aeb)
+        self.parking_requested.connect(self.worker.set_parking_scan)
+        self.park_here_requested.connect(self.worker.set_parking_drive)
+        # Bays are picked in the 3D view: QML's own raycast says where the
+        # click landed, the bridge says which bay that is, and it reports the
+        # bay's WORLD centre -- never an index, which would refer to a
+        # different bay once the worker rebuilds the set.
+        self.world_view.bridge.parking_slot_clicked.connect(
+            self.worker.select_parking_slot
+        )
+        self.world_view.bridge.parking_selection_cleared.connect(
+            self.worker.clear_parking_selection
+        )
         self.worker.status_changed.connect(self._set_status)
         self.worker.launch_ready.connect(self._on_launch_ready)
         self.worker.sensors_ready.connect(self._on_sensors_ready)
@@ -537,6 +586,8 @@ class MainWindow(QMainWindow):
         self.worker.self_driving_changed.connect(self._on_self_driving_changed)
         self.worker.aeb_changed.connect(self._on_aeb_changed)
         self.worker.rear_aeb_changed.connect(self._on_rear_aeb_changed)
+        self.worker.parking_changed.connect(self._on_parking_changed)
+        self.worker.parking_drive_changed.connect(self._on_park_here_changed)
         self.worker.fatal_error.connect(self._show_error)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.start()
@@ -621,6 +672,29 @@ class MainWindow(QMainWindow):
         self._set_rear_aeb_checked(armed)
         self.rear_aeb_requested.emit(armed)
 
+    def _request_parking(self, scanning: bool) -> None:
+        # Same STREAMING gate as the other three. Arming it also selects
+        # WORLD, because that is the only view that draws bays and the only
+        # one they can be picked in -- a toggle that silently did nothing
+        # visible would read as broken.
+        if scanning and self._phase != "STREAMING":
+            self._set_parking_checked(False)
+            return
+        if scanning and not self.world_view.is_ready:
+            # WORLD failed to load this session, so there is nowhere to draw
+            # or click a bay. Say so rather than arming a scan with no output.
+            self._set_parking_checked(False)
+            self._append_log(
+                "Parking bays are shown in the 3D WORLD view, which is "
+                "unavailable this session"
+            )
+            return
+        self._set_parking_checked(scanning)
+        if scanning and self._active_visualization != "WORLD":
+            # _select_visualization syncs the view buttons itself.
+            self._select_visualization("WORLD")
+        self.parking_requested.emit(scanning)
+
     def _on_launch_ready(self) -> None:
         # Only means the process was spawned; the bridge monitor decides when
         # the port is actually listening and enables Attach then.
@@ -662,6 +736,8 @@ class MainWindow(QMainWindow):
         self._set_self_drive_enabled(True)
         self._set_aeb_enabled(True)
         self._set_rear_aeb_enabled(True)
+        self._set_parking_enabled(True)
+        self.park_here_button.setEnabled(True)
         self.vehicle_label.setText(
             f"EGO {vehicle_id}  |  {geometry.length_m:.2f} x {geometry.width_m:.2f} m"
         )
@@ -689,6 +765,10 @@ class MainWindow(QMainWindow):
         self._set_aeb_checked(False)
         self._set_rear_aeb_enabled(False)
         self._set_rear_aeb_checked(False)
+        self._set_parking_enabled(False)
+        self._set_parking_checked(False)
+        self.park_here_button.setEnabled(False)
+        self._set_park_here_checked(False)
         self.vehicle_label.setText("No vehicle attached")
         self.bev.clear()
         self.world_view.clear()
@@ -809,6 +889,10 @@ class MainWindow(QMainWindow):
             self._set_aeb_checked(False)
             self._set_rear_aeb_enabled(False)
             self._set_rear_aeb_checked(False)
+            self._set_parking_enabled(False)
+            self._set_parking_checked(False)
+            self.park_here_button.setEnabled(False)
+            self._set_park_here_checked(False)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, APP_NAME, message)
@@ -881,6 +965,48 @@ class MainWindow(QMainWindow):
             if button_style is not None:
                 button_style.unpolish(button)
                 button_style.polish(button)
+
+    def _set_parking_enabled(self, enabled: bool) -> None:
+        if enabled == self.parking_button.isEnabled():
+            return
+        self.parking_button.setEnabled(enabled)
+
+    def _set_parking_checked(self, checked: bool) -> None:
+        if self.parking_button.isChecked() != checked:
+            self.parking_button.setChecked(checked)
+        self.parking_button.setProperty(
+            "state", "engaged" if checked else "idle"
+        )
+        button_style = self.parking_button.style()
+        if button_style is not None:
+            button_style.unpolish(self.parking_button)
+            button_style.polish(self.parking_button)
+
+    def _request_park_here(self, engaged: bool) -> None:
+        if engaged and self._phase != "STREAMING":
+            self._set_park_here_checked(False)
+            return
+        self._set_park_here_checked(engaged)
+        self.park_here_requested.emit(engaged)
+
+    def _set_park_here_checked(self, checked: bool) -> None:
+        if self.park_here_button.isChecked() != checked:
+            self.park_here_button.setChecked(checked)
+        self.park_here_button.setProperty(
+            "state", "engaged" if checked else "idle"
+        )
+        style = self.park_here_button.style()
+        if style is not None:
+            style.unpolish(self.park_here_button)
+            style.polish(self.park_here_button)
+
+    def _on_park_here_changed(self, engaged: bool) -> None:
+        """The worker owns the truth: it disengages on arrival faults."""
+        self._set_park_here_checked(engaged)
+
+    def _on_parking_changed(self, scanning: bool) -> None:
+        """The worker owns the truth here too: it drops the scan on teardown."""
+        self._set_parking_checked(scanning)
 
     def _on_rear_aeb_changed(self, armed: bool) -> None:
         self._set_rear_aeb_checked(armed)
