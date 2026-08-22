@@ -240,6 +240,61 @@ def test_vision_mode_refuses_self_driving_and_both_aebs() -> None:
     assert worker._rear_aeb_enabled is False
 
 
+def test_vision_mode_refuses_the_parking_scan_and_the_parking_drive() -> None:
+    """
+    Parking is in the same position as self-driving and both brakes, and for
+    the same reason: the bay scan reads the SEMANTIC marking store, which only
+    the LiDAR set fills. The camera rig produces no returns to classify, so a
+    scan armed here would sit lit over a store that can never fill.
+
+    The WORKER has to be the one refusing. MainWindow disables the buttons in
+    Vision mode, but this codebase's rule is that the worker owns the truth and
+    the GUI mirrors it -- a guard that lives only in the window is one a queued
+    signal, a restored setting or a mid-stream mode switch can walk straight
+    past.
+    """
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    answers: list[bool] = []
+    worker.parking_changed.connect(answers.append)
+    worker.parking_drive_changed.connect(answers.append)
+
+    worker.set_parking_scan(True)
+    worker.set_parking_drive(True)
+
+    assert answers == [False, False]
+    assert worker._parking_scan is False
+    assert worker._parking_driving is False
+
+
+def test_the_parking_refusal_names_the_missing_instrument_set() -> None:
+    """
+    `set_parking_drive` already refused transitively -- no bay can be found in
+    Vision mode, so no selection can match -- but it said "select a parking
+    bay", which is unactionable in a mode where finding one is impossible.
+    """
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    messages: list[str] = []
+    worker.status_changed.connect(lambda _state, detail: messages.append(detail))
+
+    worker.set_parking_scan(True)
+    worker.set_parking_drive(True)
+
+    assert len(messages) == 2
+    assert all("Vision mode" in message for message in messages)
+
+
+def test_leaving_vision_mode_lets_the_parking_scan_arm_again() -> None:
+    """The refusal is the MODE's, not a latch: it must not outlive the mode."""
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    worker.set_parking_scan(True)
+    assert worker._parking_scan is False
+
+    worker._sensor_mode = SENSOR_MODE_LIDAR
+    worker.set_parking_scan(True)
+
+    assert worker._parking_scan is True
+
+
 def test_switching_mode_mid_stream_reattaches_through_the_one_funnel() -> None:
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     worker._sensor_mode = SENSOR_MODE_LIDAR
