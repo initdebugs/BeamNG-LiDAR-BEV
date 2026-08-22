@@ -55,6 +55,15 @@ LOGGER = logging.getLogger(__name__)
 # announced at most this often or a slow map would flood the log.
 _SCENE_BUDGET_WARN_INTERVAL_S = 15.0
 
+# How long a spawned BeamNG.tech is given to open its bridge before Launch is
+# offered again. `BeamNG.tech.exe` is a SHIM -- it spawns the real
+# `BeamNG.tech.x64`, and that is what listens -- so there is a long window in
+# which the process is alive and the port is not: measured ~60 s on this
+# machine warm, and a first run of a new version compiles shaders and takes
+# considerably longer. The window has to be generous, because re-offering
+# Launch early is exactly what invites a second instance onto the same port.
+_BRIDGE_WAIT_GRACE_S = 300.0
+
 
 def resolve_visualization(
     requested: str | None, *, world_available: bool
@@ -70,6 +79,22 @@ def resolve_visualization(
     if not world_available:
         return "RAW BEV"
     return "RAW BEV" if requested == "RAW BEV" else "WORLD"
+
+
+def bridge_wait_message(waited_s: float) -> str | None:
+    """
+    What the badge should say while a spawned simulator opens its bridge, or
+    None once the wait has run out and Launch should be offered again.
+
+    Pure, and separate from the widget for the same reason
+    `resolve_visualization` is: the offline suite has no QApplication, so this
+    is the only way the threshold itself can be pinned.
+    """
+    if waited_s < _BRIDGE_WAIT_GRACE_S:
+        return (
+            f"BeamNG.tech is starting; waiting for its bridge ({waited_s:.0f}s)"
+        )
+    return None
 
 
 def sensor_mode_for_visualization(view: str) -> str:
@@ -101,6 +126,13 @@ class MainWindow(QMainWindow):
         self.resize(1180, 820)
         self._settings = QSettings("Local BeamNG Tools", "BeamNG LiDAR BEV")
         self._bridge_ready = False
+        # Set from the moment Launch is pressed until the bridge answers, the
+        # wait runs out, or a launch fault clears it. Without it the monitor's
+        # very next 2 s tick finds the phase back at IDLE, re-enables Launch
+        # and reports "BeamNG.tech is not running" -- one second after a
+        # successful spawn, which reads as "nothing happened".
+        self._awaiting_bridge = False
+        self._launch_started_at = 0.0
         # Explicit phase rather than reusing _last_status: "READY" is emitted
         # both by a successful stop and by a failed attach, so it is ambiguous.
         self._phase = "IDLE"  # IDLE | LAUNCHING | BUSY | STREAMING
@@ -666,6 +698,8 @@ class MainWindow(QMainWindow):
 
     def _request_launch(self) -> None:
         self._phase = "LAUNCHING"
+        self._awaiting_bridge = True
+        self._launch_started_at = time.monotonic()
         self._set_launch_enabled(False)
         self._set_attach_enabled(False)
         self._append_log("Starting BeamNG.tech bridge")
@@ -746,6 +780,7 @@ class MainWindow(QMainWindow):
 
     def _on_bridge_up(self) -> None:
         self._bridge_ready = True
+        self._awaiting_bridge = False
         if self._phase != "IDLE":
             return
         self._set_attach_enabled(True)
@@ -765,6 +800,25 @@ class MainWindow(QMainWindow):
         if self._phase != "IDLE":
             return
         self._set_attach_enabled(False)
+        if self._awaiting_bridge:
+            waited = time.monotonic() - self._launch_started_at
+            message = bridge_wait_message(waited)
+            if message is not None:
+                # A spawned-but-still-booting simulator is not an absent one,
+                # and saying so is the whole point: the badge reports progress
+                # and Launch stays disabled, so the wait cannot be mistaken
+                # for a dead button and answered with a second instance.
+                self._set_launch_enabled(False)
+                self.launch_button.setToolTip(
+                    "BeamNG.tech is starting; waiting for its bridge"
+                )
+                self._set_status("STARTING", message)
+                return
+            self._awaiting_bridge = False
+            self._append_log(
+                f"BeamNG.tech did not open its bridge within {waited:.0f}s; "
+                "Launch is available again"
+            )
         self._set_launch_enabled(BEAMNG_EXE.is_file())
         self.launch_button.setToolTip("Start BeamNG.tech with the BeamNGpy bridge")
         self._set_status("OFFLINE", "BeamNG.tech is not running")
@@ -991,6 +1045,10 @@ class MainWindow(QMainWindow):
             self._set_park_here_checked(False)
 
     def _show_error(self, message: str) -> None:
+        # A fault ENDS the wait: the launch that was pending is the most
+        # likely thing to have just failed, and holding Launch disabled for
+        # the rest of the grace window would leave no way to retry.
+        self._awaiting_bridge = False
         QMessageBox.critical(self, APP_NAME, message)
 
     # The setters are idempotent because a 2 s monitor tick would otherwise
