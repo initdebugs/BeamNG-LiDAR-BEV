@@ -118,12 +118,50 @@ one 0.10–0.15 m kerb, ranges 15–30 m:
 - [ ] Verdict table per range: does the kerb face separate from the road
       surface at 15 / 20 / 25 / 30 m, and at how many sigma?
 
-Outcomes:
+### VERDICT 2026-08-23: **FAIL** — the stereo rung pivots to a hybrid
 
-- **Pass** → phase 3 proceeds as specced (stereo is the depth source).
-- **Fail** → the stereo rung pivots to a hybrid (stereo for obstacles and
-  AEB range, engine depth for the ground band) — decided now, for the cost
-  of an afternoon, instead of after the port.
+Measured with `tools/kerb_experiment.py` on a straight two-kerb street
+(west_coast_usa), one lockstep pair per configuration, the engine depth channel
+as the oracle. Separation is the stereo kerb step divided by the stereo road
+noise at that range; 3σ is the bar.
+
+| baseline | width | 15 m | 20 m | 25 m | 30 m |
+|---|---|---|---|---|---|
+| 0.6 m | 1280 | 3.6σ | no data | −3.9σ | −4.1σ |
+| 1.0 m | 1280 | 4.2σ | no data | no data | −3.1σ |
+| 1.6 m | 1280 | −1.7σ | no data | no data | no data |
+| 1.0 m | 1920 | 4.7σ | no data | no data | no data |
+| **oracle control** | 1280 | **9.4σ** | 13.8σ | 15.0σ | 16.4σ |
+
+**Stereo resolves the kerb at 15 m and nowhere beyond it.** Past 20 m it either
+produces no depth at the kerb line at all, or a physically impossible NEGATIVE
+step — the pavement reading lower than the road, which the bias table explains:
+stereo over-ranges by 0.44–0.66 m there, and a too-far point on a grazing
+surface reads as a lower one. Even at 15 m it under-reads the step, 0.077 m
+against a true 0.113.
+
+Three things this rules out as the cause:
+
+- **Not the SGBM parameters.** Swept blockSize 3–11 against two P2/uniqueness
+  settings: road depth sigma at 30 m stayed 0.87–1.53 m throughout.
+- **Not the baseline.** 1.6 m was the WORST (32% valid pixels — a wide pair
+  loses overlap and occludes more than the extra disparity buys).
+- **Not the resolution.** 1920 halved the depth noise (0.96 → 0.56 m at 30 m)
+  and still produced nothing at the kerb past 15 m. The failure at range is
+  MATCHING on low-texture asphalt, not precision.
+
+The oracle control passing at 9.4–16.4σ through the identical pipeline is what
+makes this a statement about stereo rather than about the measurement.
+
+**Consequence, as the plan already anticipated:** stereo for obstacles and AEB
+range (big vertical targets, plenty of texture), engine depth for the ground
+band. Phase 3 is re-shaped, not cancelled, and this cost an afternoon instead of
+a 3–6 week port.
+
+Caveats worth keeping: one scene, one map, one lighting condition, one kerb
+geometry. A re-run on a differently-textured road surface would strengthen it,
+and nothing here tests a kerb against a WET or high-contrast surface where
+matching would be easier.
 
 ## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks)
 
