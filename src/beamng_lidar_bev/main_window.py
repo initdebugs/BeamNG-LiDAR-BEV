@@ -925,6 +925,12 @@ class MainWindow(QMainWindow):
         # Cameras stream images, not returns; an honest dash beats a zero
         # that reads as "no data arriving".
         self.points_value.setText("—")
+        # And nothing builds a WORLD scene in Vision mode: `perception_ready`
+        # is emitted only from the LiDAR tick, so SceneWorker is idle and the
+        # last WORLD build time would otherwise sit here looking live. It was
+        # observed reading 91.2 ms minutes after the switch -- the same class
+        # of lie as a STREAMING badge over a frozen view.
+        self.scene_value.setText("—")
         self.latency_value.setText(f"{frame.poll_ms:.1f} ms")
         self.speed_value.setText(f"{frame.speed_mps * 3.6:.1f} km/h")
 

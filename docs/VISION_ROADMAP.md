@@ -47,26 +47,58 @@ Landed 2026-08-22:
 
 Still open from the original foundations list (do alongside 0v):
 
-- [ ] A virtualenv per simulator version (`.venv39` with 1.36), ending the
-      shared-global-site-packages situation that broke PyQt6 once already.
-- [ ] Pin renderer settings for capture in `launcher.py`
-      (`PostFXMotionBlurEnabled=false`; graphics preset above "Lowest").
+- [x] A virtualenv per simulator version (`.venv39` with 1.36), ending the
+      shared-global-site-packages situation that broke PyQt6 once already —
+      done 2026-08-23. Suite green in it (770 passed) and pytest-qt is absent
+      from it entirely. Both `.bat` files prefer it and fall back with a
+      message.
+- [x] Renderer settings for capture — done 2026-08-23, but as a **CHECK, not a
+      pin**: `bng.settings.change` + `apply_graphics` was measured on 0.39.4
+      and moved neither the sensor nor the game view, so setting them would
+      have been a line that quietly did nothing. `launcher.
+      capture_setting_warnings` is a pure rule over the values the worker reads
+      via `settings.getValue`, logged once per vision attach as
+      `Capture check:` and warned about only when actually wrong (the
+      black-frame presets, and motion blur). Current machine: clean.
 - [ ] Start the licence conversation.
 
 ## Phase 0v — Rung-0 live verification (~30 minutes, needs the sim)
 
 The checklist in VISION_MODE_SPEC.md §2, in short:
 
-- [ ] `Vision check:` line within ~1 s of attach; the 5 s silence warning
-      never fires on a healthy setup.
-- [ ] All eight tiles plausible: no cabin interiors, no sky-only tiles, some
-      bonnet in the wide/bumper views is correct. (First live look already
-      caught the bumper camera inside the shell — fixed with its own
-      standoff; re-check it.)
-- [ ] Sim rate near the measured 42 Hz while streaming; ACQUISITION ~16–18 Hz.
-- [ ] VISION ↔ WORLD/RAW BEV switching mid-stream re-attaches cleanly both
-      ways; self-driving/AEB re-arm on return to LiDAR.
-- [ ] Click-to-focus works on every tile and returns on the second click.
+- [x] `Vision check:` line within ~1 s of attach; the 5 s silence warning
+      never fires on a healthy setup — confirmed 2026-08-23, **0.1 s**, eight
+      cameras delivering, on three attaches (two at 1280×960). No warning, and
+      no WARN/ERROR anywhere in the day's log.
+- [x] All eight tiles plausible: no cabin interiors, no sky-only tiles, some
+      bonnet in the wide/bumper views is correct — confirmed 2026-08-23, all
+      eight stream. (First live look caught the bumper camera inside the shell
+      — fixed with its own standoff.)
+- [x] Image quality — RESOLVED 2026-08-23. "Pixelated" was the 640×480 source
+      (now 1280×960). "Grainy" was **ours**: the camera buffer's fourth byte is
+      not opacity, and `vision_view` read it as `Format_RGBA8888`, so Qt
+      composited every pixel against the dark tile — mean error 26.08 against
+      the true colour, 0.00 once read as `Format_RGBX8888`. "Washed out" is a
+      real but much milder effect than first reported (the sensor has no
+      auto-exposure; 2-13% of pixels clip on a normal street, not the 53% first
+      measured through the wrong vehicle). Spec §2 carries all three.
+- [x] ACQUISITION ~16–18 Hz — confirmed 2026-08-23 at **17.5 Hz**, at
+      1280×960, i.e. the resolution rise cost ~1 Hz as predicted.
+- [ ] Sim rate near the measured 42 Hz while streaming. **The last 0v item.**
+      Read it in BeamNG, not in the app: the `Performance Timers` UI app ships
+      with this install (`ui/modules/apps/SimplePerfTimers`, Telemetry
+      category) — add it to the layout while the rig streams. Worth having the
+      worker report this itself so it is observable during Phase 1 capture too;
+      that needs a probe for the right Lua call, which needs the bridge free.
+- [x] VISION ↔ WORLD/RAW BEV switching mid-stream re-attaches cleanly both
+      ways; self-driving/AEB re-arm on return to LiDAR — confirmed live
+      2026-08-23, all three parts: the round trip, both AEBs re-arming, and the
+      six-unit LiDAR rig attaching. This was the 0v item with real machinery
+      behind it (a re-attach through the single `_cleanup_sensors` funnel and
+      the worker's refusal list handing back), and it was the first LiDAR
+      attach since the 0.39 upgrade.
+- [x] Click-to-focus works on every tile and returns on the second click —
+      confirmed live 2026-08-23, both halves.
 
 ## Phase 1 — The kerb experiment (1 afternoon; VETO POWER over phase 3)
 
@@ -75,7 +107,12 @@ wide-baseline front stereo pair (1280×960, ~60° HFOV, baseline 0.5–1.0 m),
 one 0.10–0.15 m kerb, ranges 15–30 m:
 
 - [ ] Capture rectified pairs at several ranges (lockstep: pause → step →
-      poll both).
+      poll both). **Watch the exposure** — the Camera sensor has no
+      auto-exposure (spec §2), and a saturated region is precisely the one
+      stereo cannot correlate, so a clipped capture would measure the clipper
+      rather than the kerb. On a normal street it clips 2–13% of pixels, which
+      is tolerable; under a high sun it is much worse. Check before trusting a
+      run, rather than assuming either way.
 - [ ] Compute disparity (CPU SGBM is fine offline; the live rung uses CUDA
       SGM), unproject, accumulate into the existing 0.4 m cell machinery.
 - [ ] Verdict table per range: does the kerb face separate from the road
