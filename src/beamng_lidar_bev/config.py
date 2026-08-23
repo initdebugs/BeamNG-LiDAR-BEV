@@ -277,6 +277,14 @@ CAMERA_REAR_HFOV_DEG = 110.0
 # (pillars) and from straight behind (repeaters).
 CAMERA_PILLAR_YAW_DEG = 55.0
 CAMERA_REPEATER_YAW_DEG = 30.0
+# The bumper camera gets its OWN standoff, well past the ordinary
+# SENSOR_BODY_CLEARANCE_M: reported live (2026-08-23) that 0.08 m beyond the
+# bounding-box face still landed INSIDE the bumper shell -- the OOBB extreme is
+# set by the widest point of the car, not by the bumper face at camera height,
+# so the curved shell can enclose a point "outside" the box. The camera is
+# invisible in-world, so a generous standoff costs nothing. If the rear camera
+# is ever reported dark, it wants the same treatment.
+CAMERA_FRONT_BUMPER_STANDOFF_M = 0.30
 
 DISPLAY_RADIUS_M = 105.0
 # poll_sensors("state") is a blocking round-trip measured at 32.7 ms (p95 35.3),

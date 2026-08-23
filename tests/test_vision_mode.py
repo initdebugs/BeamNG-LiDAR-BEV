@@ -11,7 +11,7 @@ from beamng_lidar_bev.geometry import (
     derive_camera_rig,
 )
 from beamng_lidar_bev.models import VehicleGeometry, VisionFrame
-from beamng_lidar_bev.vision_view import grid_dimensions
+from beamng_lidar_bev.vision_view import grid_dimensions, toggle_focus
 from beamng_lidar_bev.worker import (
     SENSOR_MODE_LIDAR,
     SENSOR_MODE_VISION,
@@ -61,7 +61,12 @@ def test_side_cameras_sit_outside_the_body_shell() -> None:
         assert rig[name].position_vehicle[0] > geometry.left_m
     for name in ("pillar_right", "repeater_right"):
         assert rig[name].position_vehicle[0] < -geometry.right_m
-    assert rig["front_bumper"].position_vehicle[1] < -geometry.front_m
+    # The bumper camera needs a GENEROUS standoff, not just "outside the
+    # bbox": the ordinary clearance landed inside the bumper shell live,
+    # because the box face is the car's widest point, not the bumper face.
+    assert rig["front_bumper"].position_vehicle[1] <= -(
+        geometry.front_m + 0.25
+    )
     assert rig["rear"].position_vehicle[1] > geometry.rear_m
 
 
@@ -117,6 +122,17 @@ def test_a_tall_window_lays_out_in_more_rows_than_columns() -> None:
 
 def test_an_empty_grid_is_zero_by_zero() -> None:
     assert grid_dimensions(0, 800.0, 600.0) == (0, 0)
+
+
+def test_clicking_a_tile_focuses_it_and_any_click_returns_to_the_grid() -> None:
+    assert toggle_focus(None, "front_main") == "front_main"
+    # While focused there are no other tiles on screen, so EVERY click goes
+    # back to the grid -- including one that would have hit another tile.
+    assert toggle_focus("front_main", "front_main") is None
+    assert toggle_focus("front_main", "rear") is None
+    assert toggle_focus("front_main", None) is None
+    # Clicking the gap between tiles does nothing.
+    assert toggle_focus(None, None) is None
 
 
 # --- The worker's vision path -------------------------------------------------

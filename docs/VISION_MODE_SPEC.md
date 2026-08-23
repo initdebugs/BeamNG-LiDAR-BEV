@@ -92,7 +92,9 @@ it is not GUI-only: it selects the instrument set, so switching while
 streaming re-attaches through the worker's single teardown funnel. The view
 is a labelled live grid (`vision_view.VisionView`); the grid arithmetic
 (`grid_dimensions`) picks rows × columns to maximise cell area at the
-cameras' aspect. ACQUISITION counts genuinely new frames (per-camera buffer
+cameras' aspect. Clicking a tile focuses that camera full-frame and any
+click returns to the grid (`toggle_focus`, pure and pinned); focus is
+tracked by camera name so a rig change dissolves it harmlessly. ACQUISITION counts genuinely new frames (per-camera buffer
 digest), DISPLAY the paint rate; VISIBLE POINTS reads "—" honestly.
 Self-driving and both AEBs are refused by the worker and not offered by the
 GUI in this mode (they consume the LiDAR cloud; rung 0.5 restores them).

@@ -5,6 +5,11 @@ Qt-only and worker-agnostic on purpose -- it consumes `VisionFrame` the way
 `BevWidget` consumes `BevFrame` and never touches BeamNGpy. The grid geometry
 is a pure function (`grid_dimensions`) so the layout arithmetic is testable
 without a QApplication, which keeps the whole offline suite Qt-free.
+
+Clicking a tile focuses that camera full-frame; clicking again returns to the
+grid. Focus is tracked by camera NAME, not by tile index, so it survives
+frames arriving in a different order and dissolves harmlessly (back to the
+grid) if the named camera stops appearing -- a rig swap, or a mode switch.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from __future__ import annotations
 import math
 
 from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QColor, QImage, QPainter, QPaintEvent
+from PyQt6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent
 from PyQt6.QtWidgets import QWidget
 
 from .models import VisionFrame
@@ -23,6 +28,7 @@ _BORDER = QColor("#30353a")
 _LABEL_BG = QColor(13, 15, 17, 190)
 _LABEL_FG = QColor("#c7cdd2")
 _PLACEHOLDER_FG = QColor("#5c646b")
+_HINT_FG = QColor("#6d757c")
 _CELL_GAP = 6.0
 _LABEL_HEIGHT = 18.0
 
@@ -52,6 +58,20 @@ def grid_dimensions(
     return best
 
 
+def toggle_focus(current: str | None, clicked: str | None) -> str | None:
+    """
+    The focus state machine, pure so it can be pinned offline.
+
+    Any click while focused returns to the grid -- including a click that
+    would have landed on another tile, because in the focused view there are
+    no other tiles to land on. From the grid, clicking a tile focuses it and
+    clicking the gap between tiles does nothing.
+    """
+    if current is not None:
+        return None
+    return clicked
+
+
 class VisionView(QWidget):
     """Paints the most recent `VisionFrame` as a labelled camera grid."""
 
@@ -62,7 +82,13 @@ class VisionView(QWidget):
         # view must outlive them: the frame reference above is what keeps
         # every buffer alive for exactly as long as its QImage.
         self._images: list[tuple[str, QImage]] = []
+        # Which camera fills the view, by name; None means the grid. The tile
+        # rectangles are recorded at paint time so the click hit-test agrees
+        # with what is actually on screen.
+        self._focused_name: str | None = None
+        self._cell_rects: list[tuple[str, QRectF]] = []
         self.setAutoFillBackground(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_frame(self, frame: VisionFrame) -> None:
         self._frame = frame
@@ -82,12 +108,29 @@ class VisionView(QWidget):
     def clear(self) -> None:
         self._frame = None
         self._images = []
+        self._focused_name = None
+        self._cell_rects = []
         self.update()
+
+    def mousePressEvent(self, event: QMouseEvent | None) -> None:
+        if event is None or event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        clicked: str | None = None
+        position = event.position()
+        for name, rect in self._cell_rects:
+            if rect.contains(position):
+                clicked = name
+                break
+        self._focused_name = toggle_focus(self._focused_name, clicked)
+        self.update()
+        event.accept()
 
     def paintEvent(self, event: QPaintEvent | None) -> None:
         del event
         painter = QPainter(self)
         painter.fillRect(self.rect(), _BACKGROUND)
+        self._cell_rects = []
         if not self._images:
             painter.setPen(_PLACEHOLDER_FG)
             painter.drawText(
@@ -95,6 +138,18 @@ class VisionView(QWidget):
                 Qt.AlignmentFlag.AlignCenter,
                 "VISION MODE\nAttach to a vehicle to stream the camera rig",
             )
+            painter.end()
+            return
+
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        font = painter.font()
+        font.setPointSizeF(8.0)
+        font.setBold(True)
+        painter.setFont(font)
+
+        focused = self._focused_image()
+        if focused is not None:
+            self._paint_focused(painter, *focused)
             painter.end()
             return
 
@@ -109,12 +164,6 @@ class VisionView(QWidget):
         )
         cell_w = (area_w - (cols + 1) * _CELL_GAP) / cols
         cell_h = (area_h - (rows + 1) * _CELL_GAP) / rows
-
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        font = painter.font()
-        font.setPointSizeF(8.0)
-        font.setBold(True)
-        painter.setFont(font)
         for index, (name, image) in enumerate(self._images):
             row, col = divmod(index, cols)
             cell = QRectF(
@@ -123,31 +172,74 @@ class VisionView(QWidget):
                 cell_w,
                 cell_h,
             )
+            self._cell_rects.append((name, cell))
             painter.fillRect(cell, _CELL_BACKGROUND)
-            # Fit the image inside its cell, preserving aspect.
-            scale = min(cell.width() / image.width(), cell.height() / image.height())
-            draw_w = image.width() * scale
-            draw_h = image.height() * scale
-            target = QRectF(
-                cell.x() + (cell.width() - draw_w) / 2.0,
-                cell.y() + (cell.height() - draw_h) / 2.0,
-                draw_w,
-                draw_h,
-            )
+            target = self._fit(image, cell)
             painter.drawImage(target, image)
             painter.setPen(_BORDER)
             painter.drawRect(cell)
-            label = QRectF(
-                target.x(),
-                target.bottom() - _LABEL_HEIGHT,
-                target.width(),
-                _LABEL_HEIGHT,
-            )
-            painter.fillRect(label, _LABEL_BG)
-            painter.setPen(_LABEL_FG)
-            painter.drawText(
-                label.adjusted(6.0, 0.0, 0.0, 0.0),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                name.upper().replace("_", " "),
-            )
+            self._paint_label(painter, target, name)
         painter.end()
+
+    def _focused_image(self) -> tuple[str, QImage] | None:
+        """The focused camera's image, or None when the grid should draw --
+        including when the focused name stopped arriving (rig change)."""
+        if self._focused_name is None:
+            return None
+        for name, image in self._images:
+            if name == self._focused_name:
+                return name, image
+        return None
+
+    def _paint_focused(
+        self, painter: QPainter, name: str, image: QImage
+    ) -> None:
+        area = QRectF(
+            _CELL_GAP,
+            _CELL_GAP,
+            self.width() - 2.0 * _CELL_GAP,
+            self.height() - 2.0 * _CELL_GAP,
+        )
+        painter.fillRect(area, _CELL_BACKGROUND)
+        target = self._fit(image, area)
+        painter.drawImage(target, image)
+        painter.setPen(_BORDER)
+        painter.drawRect(area)
+        self._paint_label(painter, target, name)
+        painter.setPen(_HINT_FG)
+        painter.drawText(
+            area.adjusted(0.0, 0.0, -8.0, -4.0),
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+            "click to return to the grid",
+        )
+
+    @staticmethod
+    def _fit(image: QImage, box: QRectF) -> QRectF:
+        """The largest aspect-preserving placement of `image` inside `box`."""
+        if image.width() <= 0 or image.height() <= 0:
+            return box
+        scale = min(box.width() / image.width(), box.height() / image.height())
+        draw_w = image.width() * scale
+        draw_h = image.height() * scale
+        return QRectF(
+            box.x() + (box.width() - draw_w) / 2.0,
+            box.y() + (box.height() - draw_h) / 2.0,
+            draw_w,
+            draw_h,
+        )
+
+    @staticmethod
+    def _paint_label(painter: QPainter, target: QRectF, name: str) -> None:
+        label = QRectF(
+            target.x(),
+            target.bottom() - _LABEL_HEIGHT,
+            target.width(),
+            _LABEL_HEIGHT,
+        )
+        painter.fillRect(label, _LABEL_BG)
+        painter.setPen(_LABEL_FG)
+        painter.drawText(
+            label.adjusted(6.0, 0.0, 0.0, 0.0),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            name.upper().replace("_", " "),
+        )
