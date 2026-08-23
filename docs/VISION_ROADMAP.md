@@ -19,18 +19,19 @@ simulator does with it.
 | Phase | What | Effort | Gate it answers | Status |
 |-------|------|--------|-----------------|--------|
 | 0 | Foundations: beamngpy 1.36, 0.39, Vision mode rung 0 | — | Can cameras stream at all? | **DONE 2026-08-22** |
-| 0v | Rung-0 live verification | ~30 min | Do the mounts and rates hold on the real car? | in progress |
-| 1 | The kerb experiment | 1 afternoon | Is stereo good enough for the planner's kerb requirement? | **NEXT — has veto power** |
-| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | not started |
-| 3 | Rung 1: stereo depth | 3–6 weeks | The car drives on genuine vision-only geometry | blocked on phase 1 |
+| 0v | Rung-0 live verification | ~30 min | Do the mounts and rates hold on the real car? | **DONE 2026-08-23** |
+| 1 | The kerb experiment | 1 afternoon | Is stereo good enough for the planner's kerb requirement? | **DONE 2026-08-23 — FAILED, see below** |
+| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | **NEXT** |
+| 3 | Rung 1: stereo depth | 3–6 weeks | The car drives on vision geometry for OBSTACLES; the ground band stays on engine depth | re-shaped by phase 1 |
 | 4 | Rung 2: sim-trained semantics | 4–8 weeks | Meaning comes from pixels, on every map | after 3 |
 | 5 | Rung 3 decision: learned BEV / occupancy | 2–3 months | Is the true Tesla architecture worth the ML project? | decide after 4 |
 | 6 | Wild card: imitation from the LiDAR teacher | open | Side experiment only | optional |
 
 Standing item, outside every phase: **the licence question**. The tech.key
-timestamp (2026-09-22 if it is an expiry — unconfirmed) interrupts everything
-mid-phase. Chase it with whoever supplied the key before committing to phases
-2+.
+timestamp is 2026-09-22 if it is an expiry, which is unconfirmed and would
+interrupt everything mid-phase. **Deliberately deferred 2026-08-23** — the
+owner's call, not an oversight. Nothing in phase 2 depends on resolving it
+first; the risk is that it lands mid-phase rather than that it blocks a start.
 
 ---
 
@@ -60,11 +61,21 @@ Still open from the original foundations list (do alongside 0v):
       via `settings.getValue`, logged once per vision attach as
       `Capture check:` and warned about only when actually wrong (the
       black-frame presets, and motion blur). Current machine: clean.
-- [ ] Start the licence conversation.
+- [~] Start the licence conversation — **deferred by decision 2026-08-23**,
+      see the standing item above.
 
-## Phase 0v — Rung-0 live verification (~30 minutes, needs the sim)
+## Phase 0v — Rung-0 live verification (DONE 2026-08-23)
 
-The checklist in VISION_MODE_SPEC.md §2, in short:
+The checklist in VISION_MODE_SPEC.md §2, in short. Everything measurable in the
+app is confirmed; the one item needing a number from BeamNG's own HUD was
+dropped by decision rather than met.
+
+Four defects were found and fixed in the course of it, none of them predicted by
+the checklist: the 0.39 launcher aborting on a windowless parent (Launch had
+been dead since the upgrade), the camera buffer's fourth byte being read as
+opacity (the reported "noise"), a 24.5-degree blind gap either side of the rig,
+and the centreline cameras sitting on the reference node instead of the body
+centre. That ratio is the argument for live verification existing at all.
 
 - [x] `Vision check:` line within ~1 s of attach; the 5 s silence warning
       never fires on a healthy setup — confirmed 2026-08-23, **0.1 s**, eight
@@ -84,12 +95,14 @@ The checklist in VISION_MODE_SPEC.md §2, in short:
       measured through the wrong vehicle). Spec §2 carries all three.
 - [x] ACQUISITION ~16–18 Hz — confirmed 2026-08-23 at **17.5 Hz**, at
       1280×960, i.e. the resolution rise cost ~1 Hz as predicted.
-- [ ] Sim rate near the measured 42 Hz while streaming. **The last 0v item.**
-      Read it in BeamNG, not in the app: the `Performance Timers` UI app ships
-      with this install (`ui/modules/apps/SimplePerfTimers`, Telemetry
-      category) — add it to the layout while the rig streams. Worth having the
-      worker report this itself so it is observable during Phase 1 capture too;
-      that needs a probe for the right Lua call, which needs the bridge free.
+- [~] Sim rate near the measured 42 Hz while streaming — **dropped by decision
+      2026-08-23**, and 0v is called done without it. It is the one item with no
+      in-app source: `Engine.getFPS` and `Engine.Render.getFPS` do not exist on
+      0.39.4, so it has to be read from the `Performance Timers` UI app
+      (`ui/modules/apps/SimplePerfTimers`, Telemetry category) by hand. The
+      evidence that the rig keeps up is indirect but real — ACQUISITION held
+      17.5 Hz at 1280x960 against a measured 16-18 Hz expectation, and no poll
+      failure has been logged in any session.
 - [x] VISION ↔ WORLD/RAW BEV switching mid-stream re-attaches cleanly both
       ways; self-driving/AEB re-arm on return to LiDAR — confirmed live
       2026-08-23, all three parts: the round trip, both AEBs re-arming, and the
@@ -163,7 +176,12 @@ geometry. A re-run on a differently-textured road surface would strengthen it,
 and nothing here tests a kerb against a WET or high-contrast surface where
 matching would be easier.
 
-## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks)
+## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks) — **NEXT**
+
+Phase 1's verdict promotes this from scaffolding to the permanent source of the
+ground band: engine depth is no longer a stepping stone that stereo replaces,
+it is what kerbs and road surface will keep coming from. Build it accordingly —
+the oracle harness below is now load-bearing rather than a diagnostic.
 
 Turn on depth (+ annotation) and rebuild the perception waist
 (`points_world + colours + state`) from the cameras. Everything downstream —
@@ -187,10 +205,20 @@ Milestones, in order:
       phantom checklist applies (hills, brake dive, bushes, kerbs, reverse).
 - [ ] **Milestone: the car drives in Vision mode** (on engine depth).
 
-## Phase 3 — Rung 1: stereo (3–6 weeks; shape set by phase 1's verdict)
+## Phase 3 — Rung 1: stereo (3–6 weeks; RE-SHAPED by phase 1's verdict)
 
-Swap engine depth for computed stereo depth, pair by pair, with engine depth
-demoted to a hidden diff oracle. Spec §4.
+**Not** a wholesale swap any more. Phase 1 measured stereo failing to resolve a
+kerb beyond 15 m in every configuration tried, so the split is by WHAT IS BEING
+SENSED rather than by rung:
+
+- **Stereo takes obstacles and AEB range** — big, textured, mostly vertical
+  targets, which is the case it handles well.
+- **Engine depth keeps the ground band** — kerbs, road surface, the drivable
+  floor. This is permanent unless a later measurement overturns phase 1.
+
+The milestone below therefore changes: "engine depth OFF" is no longer the goal,
+and a vision-only-geometry claim cannot be made honestly on this evidence. Spec
+§4 still describes the stereo machinery; ignore its framing as a full swap.
 
 - [ ] Rig re-paired (wide-baseline 1280×960 front pair; VGA side/rear pairs).
 - [ ] CUDA SGM integrated (~2 ms/pair measured elsewhere; measure HERE under
@@ -203,8 +231,10 @@ demoted to a hidden diff oracle. Spec §4.
 - [ ] Constants retuned against stereo noise; oracle diff within budget at
       10/25/50 m.
 - [ ] Full phantom-braking checklist, again.
-- [ ] **Milestone: engine depth OFF — the car drives on vision-only
-      geometry.** A complete, publishable result with zero neural networks.
+- [ ] **Milestone: the car drives with stereo supplying obstacles and AEB
+      range**, engine depth supplying the ground band. Still a complete result
+      with zero neural networks — but NOT a vision-only-geometry claim, which
+      phase 1's measurement does not support.
 
 ## Phase 4 — Rung 2: sim-trained semantics (4–8 weeks)
 
