@@ -12,11 +12,20 @@ Python 3.12 (`py -3.12`), src-layout package `src/beamng_lidar_bev`.
 ## Commands
 
 ```powershell
-py -3.12 -m pip install -r requirements-dev.txt   # runtime deps + pytest + ruff
-py -3.12 -m pytest                                # pyproject sets pythonpath=["src"]; no PYTHONPATH needed
-py -3.12 -m pytest tests/test_geometry.py::test_transforms_world_points_to_ego_right_forward_frame
-py -3.12 -m ruff check src tests                  # E, F, I; line-length 88
+install_dependencies.bat                          # creates .venv39 and fills it
+.venv39\Scripts\python -m pytest                  # pyproject sets pythonpath=["src"]; no PYTHONPATH needed
+.venv39\Scripts\python -m pytest tests/test_geometry.py::test_transforms_world_points_to_ego_right_forward_frame
+.venv39\Scripts\python -m ruff check src tests    # E, F, I; line-length 88
 ```
+
+**There is a virtualenv now (`.venv39`, 2026-08-23) and it is per SIMULATOR
+VERSION**, because beamngpy's pin and `config.BEAMNG_EXE` move together. Both
+failures below were caused by one global site-packages shared with another
+project, and both are gone inside it — pytest-qt is simply not installed there,
+so `addopts = "-p no:pytest-qt"` is now belt-and-braces for anyone still on the
+global interpreter rather than the thing holding the suite up. `run_app.bat` and
+`install_dependencies.bat` prefer `.venv39` and fall back to `py -3.12` with a
+message. The global interpreter still works and still has both hazards.
 
 **The documented interpreter is not what is installed** (verified 2026-07-27). This machine has
 only Python **3.11.0**, so `py -3.12` silently resolves to it. PyQt6 is pinned `<6.8` in
@@ -219,6 +228,28 @@ transitions only; `MainWindow._on_bridge_up` enables Attach for any running sess
 was started. Because `quit_on_close=False` deliberately leaves BeamNG.tech running, the common
 case is that a session outlives the app — so `launch_beamng` also checks `bridge_is_reachable()`
 before spawning, or it would start a second instance fighting for port 64256.
+
+**The spawn must pass stdout and stderr EXPLICITLY, and 0.39 is where that
+started mattering** (2026-08-23). `run_app.bat` starts the GUI with `pyw`,
+which has no console: `sys.stdout` is None and the process's std handles are
+invalid. Inheriting those, the **0.39.4 launcher aborts with 0xC0000409**
+(`STATUS_STACK_BUFFER_OVERRUN`) 0.75 s in, leaves a **zero-byte
+`beamng-launcher.log`**, and never spawns the engine — 0.38.5 tolerated it,
+which is why Launch worked on 15 Aug and stopped after the 0.39 upgrade.
+Measured from a windowless parent: inherited → 0xC0000409; `DEVNULL` → boots;
+`CREATE_NEW_CONSOLE` → **still** 0xC0000409, because Python hands the parent's
+invalid handles down regardless. Giving the child a console is not the fix;
+naming the handles is.
+
+It was invisible for the same reason every regression here is: `Popen` returns
+a pid, so the launch *looked* successful, and **nothing ever asked whether the
+process was still alive**. The window waits `_BRIDGE_WAIT_GRACE_S` (300 s) for
+a slow boot with Launch disabled, so a simulator gone in under a second
+presented as five silent minutes of "BeamNG.tech is starting". `worker.
+_watch_launch` now polls the spawned process once a second until the bridge
+opens or it exits, and reports the exit code — the code IS the diagnosis, and
+no other signal in the app distinguished a death from a slow boot. A stub
+exiting 0 is a hand-off to the engine, not a failure.
 
 Self-driving and the two AEB systems are independently toggleable, and all three are gated on
 `STREAMING` because the worker needs a live vehicle and four sensors for any of them.

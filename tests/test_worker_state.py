@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -1693,3 +1694,81 @@ def test_a_scan_fault_costs_the_overlay_and_nothing_else(monkeypatch) -> None:
     assert len(snapshots) == 1
     assert snapshots[0].parking_slots == ()
     assert worker._poll_failures == 0
+
+
+class _StubTimer:
+    """A QTimer stand-in: the offline suite has no event loop to run one on."""
+
+    def __init__(self) -> None:
+        self.running = False
+
+    def start(self) -> None:
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+
+def _launch_watch_worker(exit_code: int | None, *, bridge_up: bool) -> SimpleNamespace:
+    fatal: list[str] = []
+    # The watch only ever fires while armed -- `launch_beamng` starts it the
+    # moment a process exists -- so an armed timer is the honest initial state.
+    timer = _StubTimer()
+    timer.start()
+    return SimpleNamespace(
+        _beamng_process=SimpleNamespace(poll=lambda: exit_code),
+        _launch_watch=timer,
+        _emit_fatal=fatal.append,
+        _fatal=fatal,
+        _bridge_up=bridge_up,
+    )
+
+
+def _run_watch(worker: SimpleNamespace) -> None:
+    with mock.patch.object(
+        worker_module, "bridge_is_reachable", lambda: worker._bridge_up
+    ):
+        BeamNgWorker._watch_launch(worker)  # type: ignore[arg-type]
+
+
+def test_a_simulator_that_dies_before_its_bridge_is_reported_not_waited_for() -> None:
+    """
+    The failure this exists for: BeamNG 0.39.4's launcher aborts with
+    0xC0000409 about 0.75 s in when it inherits a windowless parent's std
+    handles. `Popen` had already returned a pid, so the window sat for the full
+    300 s bridge grace saying "BeamNG.tech is starting" with Launch disabled --
+    five silent minutes for a process that was gone in under a second.
+    """
+    worker = _launch_watch_worker(3221226505, bridge_up=False)
+
+    _run_watch(worker)
+
+    assert worker._fatal, "a dead simulator must not be waited for in silence"
+    assert "0xC0000409" in worker._fatal[0], "the exit code is the diagnosis"
+    assert not worker._launch_watch.running
+    assert worker._beamng_process is None
+
+
+def test_the_launcher_stub_handing_off_to_the_engine_is_not_a_failure() -> None:
+    """
+    The stub exits 0 as soon as the engine takes over, long before the bridge
+    opens. Reporting that as a death would make every healthy launch an error.
+    """
+    worker = _launch_watch_worker(0, bridge_up=False)
+
+    _run_watch(worker)
+
+    assert not worker._fatal
+    assert not worker._launch_watch.running
+
+
+def test_the_watch_ends_when_the_bridge_opens_and_not_before() -> None:
+    still_booting = _launch_watch_worker(None, bridge_up=False)
+    _run_watch(still_booting)
+    assert still_booting._launch_watch.running, "a booting simulator is still awaited"
+    assert not still_booting._fatal
+
+    connected = _launch_watch_worker(None, bridge_up=True)
+    _run_watch(connected)
+    assert not connected._launch_watch.running
+    assert not connected._fatal
