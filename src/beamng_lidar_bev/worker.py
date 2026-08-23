@@ -106,6 +106,7 @@ from .hybrid_astar import Occupancy
 from .launcher import (
     bridge_is_reachable,
     build_launch_command,
+    capture_setting_warnings,
     start_beamng_process,
 )
 from .models import (
@@ -228,6 +229,10 @@ _VISION_SILENCE_WARN_S = 5.0
 # across the frame instead of landing on one pixel column; ~600 bytes sampled
 # from a 1.2 MB buffer per camera per tick.
 _VISION_DIGEST_STRIDE = 4093
+# How often a spawned-but-not-yet-connected simulator is checked for still
+# being alive. One second: this runs only between Launch and the bridge
+# opening, and each tick is a `poll()` plus, at most, one bounded socket probe.
+_LAUNCH_WATCH_INTERVAL_MS = 1000
 
 
 def build_road_grid(
@@ -463,6 +468,17 @@ class BeamNgWorker(QObject):
         self._poll_timer.setInterval(DISPLAY_INTERVAL_MS)
         self._poll_timer.timeout.connect(self._poll_once)
 
+        # A spawned simulator that DIED is indistinguishable, from here, from
+        # one merely slow to open its bridge -- and the window waits
+        # _BRIDGE_WAIT_GRACE_S (300 s) for the latter, with Launch disabled
+        # throughout. That is how a launcher aborting 0.75 s in presented as
+        # five silent minutes of "BeamNG.tech is starting": `Popen` had already
+        # returned a pid, so nothing ever asked whether the process was still
+        # there. This asks, once a second, until the bridge opens or it is gone.
+        self._launch_watch = QTimer(self)
+        self._launch_watch.setInterval(_LAUNCH_WATCH_INTERVAL_MS)
+        self._launch_watch.timeout.connect(self._watch_launch)
+
     @pyqtSlot()
     def launch_beamng(self) -> None:
         # bridge_is_reachable() is checked last so the cheap handle tests
@@ -498,10 +514,53 @@ class BeamNgWorker(QObject):
             return
 
         LOGGER.info("BeamNG.tech process created with PID %s", self._beamng_process.pid)
+        self._launch_watch.start()
         self.status_changed.emit(
             "LAUNCHED", "BeamNG.tech launched; load a map and player vehicle"
         )
         self.launch_ready.emit()
+
+    @pyqtSlot()
+    def _watch_launch(self) -> None:
+        """
+        Report a spawned simulator that dies before its bridge ever opens.
+
+        The exit code is the whole value of this: 0xC0000409 named the invalid
+        std handles that `start_beamng_process` now passes explicitly, and no
+        other signal in the app distinguished that from a slow boot.
+        """
+        process = self._beamng_process
+        if process is None:
+            self._launch_watch.stop()
+            return
+
+        code = process.poll()
+        if code is None:
+            # Still booting. The bridge opening is what ends the watch, not the
+            # process merely surviving -- the engine outlives the launcher stub.
+            if bridge_is_reachable():
+                self._launch_watch.stop()
+            return
+
+        self._launch_watch.stop()
+        self._beamng_process = None
+        if code == 0 or bridge_is_reachable():
+            # A launcher stub that hands off to the engine (or to a session
+            # already running) exits 0 with everything working. Not a failure.
+            LOGGER.info("BeamNG.tech launcher exited with code %s", code)
+            return
+
+        LOGGER.error(
+            "BeamNG.tech exited with code %s (0x%08X) before opening its bridge",
+            code,
+            code & 0xFFFFFFFF,
+        )
+        self._emit_fatal(
+            "BeamNG.tech closed before opening its bridge "
+            f"(exit code {code}, 0x{code & 0xFFFFFFFF:08X}).\n"
+            "Its own log is beamng-launcher.log in the BeamNG user folder; a "
+            "zero-byte one means the launcher died before writing a line."
+        )
 
     @pyqtSlot()
     def attach_to_player(self) -> None:
@@ -1264,6 +1323,7 @@ class BeamNgWorker(QObject):
             except Exception:
                 LOGGER.debug("Disconnect after bridge loss failed", exc_info=True)
             self._bng = None
+        self._launch_watch.stop()
         self._beamng_process = None
         self._first_failure_at = None
         self.status_changed.emit("OFFLINE", "BeamNG.tech is no longer running")
@@ -1272,6 +1332,7 @@ class BeamNgWorker(QObject):
     @pyqtSlot()
     def shutdown(self) -> None:
         self._poll_timer.stop()
+        self._launch_watch.stop()
         self._cleanup_sensors()
         self._state_pool.shutdown(wait=False)
         if self._bng is not None:
@@ -1911,7 +1972,61 @@ class BeamNgWorker(QObject):
                 for m in rig.values()
             ),
         )
+        self._check_capture_settings()
         return len(rig)
+
+    _CAPTURE_SETTINGS_CHUNK = (
+        "local ok, res = pcall(function() return {"
+        "overall = settings.getValue('GraphicOverallQuality'),"
+        "shader = settings.getValue('GraphicShaderQuality'),"
+        "texture = settings.getValue('GraphicTextureQuality'),"
+        "lighting = settings.getValue('GraphicLightingQuality'),"
+        "aa = settings.getValue('GraphicAntialias'),"
+        "motion_blur = settings.getValue('PostFXMotionBlurEnabled')"
+        "} end) "
+        "if ok then return jsonEncode(res) else return jsonEncode({}) end"
+    )
+
+    def _check_capture_settings(self) -> None:
+        """
+        Report the renderer settings the camera rig depends on, once per attach.
+
+        This CHECKS rather than SETS. Writing them was the original plan and it
+        was measured not to work: `bng.settings.change` plus `apply_graphics`
+        on 0.39.4 moved neither the sensor nor the game view, so a "pin" would
+        have been a line that quietly did nothing while reading as a guarantee.
+
+        Everything here is best-effort -- an unreadable setting is logged as
+        unknown and never warned about, and any failure at all leaves streaming
+        untouched. A game version that does not expose a key is not evidence of
+        a bad setting.
+        """
+        if self._bng is None:
+            return
+        try:
+            reply = self._bng.control.queue_lua_command(
+                self._CAPTURE_SETTINGS_CHUNK, response=True
+            )
+            values = json.loads(reply) if reply else {}
+        except Exception:
+            LOGGER.debug("Capture settings were not readable", exc_info=True)
+            return
+        if not isinstance(values, dict) or not values:
+            LOGGER.debug("Capture settings came back empty")
+            return
+
+        LOGGER.info(
+            "Capture check: quality overall=%s shader=%s texture=%s lighting=%s"
+            " | antialias=%s | motion blur=%s",
+            values.get("overall", "?"),
+            values.get("shader", "?"),
+            values.get("texture", "?"),
+            values.get("lighting", "?"),
+            values.get("aa", "?"),
+            values.get("motion_blur", "?"),
+        )
+        for warning in capture_setting_warnings(values):
+            LOGGER.warning("Capture check: %s", warning)
 
     def _poll_vision_once(self) -> None:
         """

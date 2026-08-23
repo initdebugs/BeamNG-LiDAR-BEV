@@ -252,7 +252,30 @@ SENSOR_BODY_CLEARANCE_M = 0.08
 # Resolution is nearly free (measured: 8 cams 320x240 -> 1280x960 costs
 # 21 -> 16 Hz -- the cost is per-camera draw submission, not per-pixel), so this
 # is NOT the dial to reach for if the sim rate drops; drop a camera instead.
-CAMERA_RESOLUTION = (640, 480)
+#
+# Back to 640x480 on 2026-08-23, and the history matters because the obvious
+# reading of it is wrong. It was raised to 1280x960 in response to "pixelated",
+# then the real defect turned out to be that `vision_view` was reading the
+# camera buffer's fourth byte as OPACITY (see its `_IMAGE_FORMAT`): every frame
+# was being composited against the dark tile, which reads as both softness and
+# heavy speckle. With that fixed the extra pixels may be buying nothing, so the
+# cheaper setting is being tried again on its merits.
+#
+# Measured either way on this machine, so the trade is known rather than
+# guessed: sim-side 18.6 Hz per camera at 640x480 against 16.2 at 1280x960
+# (live, the app read 17.5 Hz and 12.1 Hz respectively under load), and the
+# worker's own per-tick copy of all eight buffers 1.31 ms against 4.41 ms of
+# the 40 ms tick -- 9.8 MB a tick against 39.3, since every camera is copied
+# every tick whether or not it delivered a new frame.
+#
+# 960x720 since 2026-08-23: 640 was tried once the alpha bug was fixed and the
+# detail was judged too low, so this is the middle setting -- 2.25x the pixels
+# of 640x480 and 0.56x those of 1280x960, with the copy cost scaling the same
+# way (roughly 2.9 ms a tick for all eight). This is a display-quality dial with
+# a known cost, not a correctness one. If the copy ever binds at a
+# higher setting, digest the live buffer BEFORE copying and copy only the
+# cameras that changed -- they update at ~16-18 Hz against a 25 Hz tick.
+CAMERA_RESOLUTION = (960, 720)
 # MUST be positive, and this is a trap, not a tuning choice: with
 # is_streaming=True and requested_update_time=0.0 every shared-memory buffer
 # stays zero-filled forever while the read loop happily spins -- a working rig
@@ -269,14 +292,26 @@ CAMERA_NEAR_FAR_PLANES = (0.05, 300.0)
 CAMERA_FRONT_MAIN_HFOV_DEG = 50.0
 CAMERA_FRONT_WIDE_HFOV_DEG = 100.0
 CAMERA_FRONT_BUMPER_HFOV_DEG = 110.0
-CAMERA_PILLAR_HFOV_DEG = 80.0
-CAMERA_REPEATER_HFOV_DEG = 60.0
+# 90/90 rather than Tesla's 90/60, and the repeater aim moved with it, because
+# the eight apertures have to TILE THE CIRCLE and at 80/60 they did not: the
+# union left a 24.5-degree hole per side at bearings 95-120 -- over the
+# driver's shoulder, which is exactly the blind spot the repeaters exist for.
+# Reported live as the side FOVs feeling too narrow, and it is measurable
+# rather than a matter of taste. Widening the pillar alone leaves 20 degrees;
+# both to 90 leaves 5. With the repeaters re-aimed to 45 degrees off rearward
+# the union closes with a 10-degree overlap either side, and 135 degrees is a
+# better blind-spot bearing anyway. Rearward is unaffected: the 110-degree rear
+# camera spans 125-235. `test_the_rig_leaves_no_gap_all_the_way_round` pins it.
+CAMERA_PILLAR_HFOV_DEG = 90.0
+CAMERA_REPEATER_HFOV_DEG = 90.0
 CAMERA_REAR_HFOV_DEG = 110.0
 # B-pillar cameras look forward-outboard, repeaters (front fenders) look
 # rear-outboard -- the HW4 pattern. Yaw is measured from straight ahead
 # (pillars) and from straight behind (repeaters).
 CAMERA_PILLAR_YAW_DEG = 55.0
-CAMERA_REPEATER_YAW_DEG = 30.0
+# 45, not Tesla's ~30: see the FOV note above -- the aim is what closes the
+# blind-spot gap cheaply, and it costs nothing rearward.
+CAMERA_REPEATER_YAW_DEG = 45.0
 # The bumper camera gets its OWN standoff, well past the ordinary
 # SENSOR_BODY_CLEARANCE_M: reported live (2026-08-23) that 0.08 m beyond the
 # bounding-box face still landed INSIDE the bumper shell -- the OOBB extreme is

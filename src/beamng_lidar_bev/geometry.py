@@ -293,6 +293,16 @@ def derive_camera_rig(
     rear_y = geometry.rear_m + body_clearance_m
     left_x = geometry.left_m + body_clearance_m
     right_x = -(geometry.right_m + body_clearance_m)
+    # THE REFERENCE NODE IS NOT THE BODY CENTRE, so a camera meant to sit on the
+    # car's centreline cannot be placed at x = 0. Measured on the vivace the
+    # node is 0.16 m off centre, which put the bumper and rear cameras 0.16 m
+    # to one side of the car they are supposed to look straight out of. This is
+    # the same defect the WORLD ego model and the AEB corridor each had, for the
+    # same reason -- see CLAUDE.md's "anything centred on the origin is centred
+    # on the wrong thing". The outboard pairs never had it: they are placed
+    # against their OWN side's surface, so they are already symmetric about the
+    # body (measured: 0.0000 m lateral asymmetry).
+    centre_x = (geometry.left_m - geometry.right_m) / 2.0
     # The windshield pair sits ahead of the reference node, roughly at the
     # screen header; the repeaters ride the front fenders; the B-pillars sit
     # slightly behind the node, mid-cabin.
@@ -326,19 +336,19 @@ def derive_camera_rig(
         # context view.
         "front_main": mount(
             "front_main",
-            (0.08, windshield_y, windshield_z),
+            (centre_x + 0.08, windshield_y, windshield_z),
             forward,
             CAMERA_FRONT_MAIN_HFOV_DEG,
         ),
         "front_wide": mount(
             "front_wide",
-            (-0.08, windshield_y, windshield_z),
+            (centre_x - 0.08, windshield_y, windshield_z),
             forward,
             CAMERA_FRONT_WIDE_HFOV_DEG,
         ),
         "front_bumper": mount(
             "front_bumper",
-            (0.0, bumper_y, bumper_z),
+            (centre_x, bumper_y, bumper_z),
             forward,
             CAMERA_FRONT_BUMPER_HFOV_DEG,
         ),
@@ -371,7 +381,7 @@ def derive_camera_rig(
         ),
         "rear": mount(
             "rear",
-            (0.0, rear_y, rear_z),
+            (centre_x, rear_y, rear_z),
             rearward,
             CAMERA_REAR_HFOV_DEG,
         ),

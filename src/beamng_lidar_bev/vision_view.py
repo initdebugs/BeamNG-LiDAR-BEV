@@ -31,6 +31,23 @@ _PLACEHOLDER_FG = QColor("#5c646b")
 _HINT_FG = QColor("#6d757c")
 _CELL_GAP = 6.0
 _LABEL_HEIGHT = 18.0
+# RGB**X**, not RGBA: the camera buffer's fourth byte is NOT opacity.
+#
+# Measured on BeamNG 0.39.4, a single 1280x960 frame: alpha ranges 40..255 with
+# only 50.75% of pixels at 255, and what is in there tracks the scene's
+# materials. Declared as Format_RGBA8888, Qt dutifully composited every pixel
+# against the dark tile background, so wherever that channel dipped the tile
+# went dark -- which reads as heavy black speckle on textured surfaces, dark
+# outlines around buildings, and a clean sky (where alpha happens to be 255).
+# Reported live as "so much noise in the camera compared to BeamNG itself".
+#
+# It stayed hidden through a long investigation because every probe saved
+# `rgba[..., :3]` and threw the channel away, so the captured PNGs were clean
+# while the app was not -- exposure, anti-aliasing, SSAO and tile downscaling
+# were all measured and none of them was this.
+#
+# Format_RGBX8888 has the identical byte layout and ignores the fourth byte.
+_IMAGE_FORMAT = QImage.Format.Format_RGBX8888
 
 
 def grid_dimensions(
@@ -56,6 +73,32 @@ def grid_dimensions(
             best_width = cell_width
             best = (rows, cols)
     return best
+
+
+def wants_prescale(
+    source_w: int, source_h: int, target_w: float, target_h: float
+) -> bool:
+    """
+    Should this image be resampled before it is drawn?
+
+    `QPainter.drawImage` under `SmoothPixmapTransform` is BILINEAR, which reads
+    a 2x2 neighbourhood however far the image is being shrunk. That is correct
+    for magnification and wrong for MINIFICATION: shrinking 1280x960 into a
+    400x300 tile steps over roughly 3 source pixels per output pixel, so most
+    of them are never sampled and high-frequency texture -- asphalt, gravel,
+    foliage, clapboard siding -- aliases into per-pixel speckle. Reported live
+    as "so much noise in the camera compared to BeamNG itself", and the giveaway
+    was that it ARRIVED when the rig went from 640x480 (upscaled into the pane,
+    so merely soft) to 1280x960 (downscaled into it).
+
+    `QImage.scaled(..., SmoothTransformation)` area-averages instead, so the
+    detail lands as detail. It costs ~1 ms per tile, which is why it is done
+    only when shrinking and only on a size or frame change -- see the cache in
+    `VisionView`.
+    """
+    if source_w <= 0 or source_h <= 0 or target_w <= 0.0 or target_h <= 0.0:
+        return False
+    return target_w < float(source_w) or target_h < float(source_h)
 
 
 def toggle_focus(current: str | None, clicked: str | None) -> str | None:
@@ -87,12 +130,18 @@ class VisionView(QWidget):
         # with what is actually on screen.
         self._focused_name: str | None = None
         self._cell_rects: list[tuple[str, QRectF]] = []
+        # Smooth-scaled copies, keyed by camera name and the size they were
+        # made for. Resampling is ~1 ms a tile, far too much to repeat on every
+        # paint for eight cameras, and completely unnecessary: it only changes
+        # when a new frame arrives or the pane is resized.
+        self._scaled: dict[str, tuple[int, int, QImage]] = {}
         self.setAutoFillBackground(False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_frame(self, frame: VisionFrame) -> None:
         self._frame = frame
         self._images = []
+        self._scaled.clear()
         for camera in frame.images:
             height, width, _ = camera.rgba.shape
             image = QImage(
@@ -100,7 +149,7 @@ class VisionView(QWidget):
                 width,
                 height,
                 width * 4,
-                QImage.Format.Format_RGBA8888,
+                _IMAGE_FORMAT,
             )
             self._images.append((camera.name, image))
         self.update()
@@ -110,6 +159,7 @@ class VisionView(QWidget):
         self._images = []
         self._focused_name = None
         self._cell_rects = []
+        self._scaled.clear()
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent | None) -> None:
@@ -175,7 +225,7 @@ class VisionView(QWidget):
             self._cell_rects.append((name, cell))
             painter.fillRect(cell, _CELL_BACKGROUND)
             target = self._fit(image, cell)
-            painter.drawImage(target, image)
+            self._draw(painter, name, image, target)
             painter.setPen(_BORDER)
             painter.drawRect(cell)
             self._paint_label(painter, target, name)
@@ -202,7 +252,7 @@ class VisionView(QWidget):
         )
         painter.fillRect(area, _CELL_BACKGROUND)
         target = self._fit(image, area)
-        painter.drawImage(target, image)
+        self._draw(painter, name, image, target)
         painter.setPen(_BORDER)
         painter.drawRect(area)
         self._paint_label(painter, target, name)
@@ -212,6 +262,28 @@ class VisionView(QWidget):
             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
             "click to return to the grid",
         )
+
+    def _draw(
+        self, painter: QPainter, name: str, image: QImage, target: QRectF
+    ) -> None:
+        """Draw `image` into `target`, resampling first when shrinking."""
+        width = max(1, int(round(target.width())))
+        height = max(1, int(round(target.height())))
+        if not wants_prescale(image.width(), image.height(), width, height):
+            painter.drawImage(target, image)
+            return
+        cached = self._scaled.get(name)
+        if cached is None or cached[0] != width or cached[1] != height:
+            scaled = image.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._scaled[name] = (width, height, scaled)
+        else:
+            scaled = cached[2]
+        painter.drawImage(target, scaled)
 
     @staticmethod
     def _fit(image: QImage, box: QRectF) -> QRectF:

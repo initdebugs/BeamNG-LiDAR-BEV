@@ -53,8 +53,8 @@ box by `geometry.derive_camera_rig` exactly as the LiDAR mounts are:
 | `front_main` | windshield header, +8 cm | 50° | ahead (long range) |
 | `front_wide` | windshield header, −8 cm | 100° | ahead (context) |
 | `front_bumper` | front bumper | 110° | ahead (near field) |
-| `pillar_left/right` | B-pillar, just outside shell | 80° | forward-outboard ±55° |
-| `repeater_left/right` | front fender, just outside shell | 60° | rear-outboard ±30° |
+| `pillar_left/right` | B-pillar, just outside shell | 90° | forward-outboard ±55° |
+| `repeater_left/right` | front fender, just outside shell | 90° | rear-outboard ±45° |
 | `rear` | rear bumper line | 110° | behind |
 
 Facts the implementation is built on, all hit live during the feasibility
@@ -62,6 +62,32 @@ work:
 
 - **Vehicle frame forward is `(0, −1, 0)`.** The intuitive `(0, 1, 0)`
   renders the rear seats. Pinned by test.
+- **The eight apertures must TILE THE CIRCLE, and the first set did not**
+  [measured 2026-08-23]. At Tesla's own 90°/60° with the repeaters aimed 30°
+  off rearward — and worse at the 80° pillars originally shipped — the union of
+  all eight left a **24.5° hole per side at bearings 95–120°**: over the
+  driver's shoulder, precisely the blind spot the repeaters exist for. Reported
+  live as the side cameras feeling too narrow, and it is arithmetic rather than
+  taste. Widening the pillar alone leaves 20°; both to 90° leaves 5°; 90/90
+  with the repeaters re-aimed to **45° off rearward** closes it with a 10°
+  overlap either side, at 7.1 px/deg for both at 640 wide. Rearward is
+  untouched — the 110° rear camera spans 125–235°. `test_the_rig_leaves_no_gap_
+  all_the_way_round` pins the union and fails against the old values (49.8°
+  uncovered); a companion requires genuine OVERLAP rather than a hair's-breadth
+  join, because the mounts are metres apart and their coverage is not purely
+  angular at close range.
+- **A centreline camera goes on the BODY centre, never on `x = 0`** [fixed
+  2026-08-23]. The reference node is not the body centre — measured 0.16 m off
+  on the vivace — so `front_bumper` and `rear` were sitting 0.16 m to one side
+  of the car they look straight out of, and the windshield pair straddled the
+  wrong axis. This is the third time this exact defect has appeared (the WORLD
+  ego model and the AEB corridor were the first two), and it survived because
+  the rig's only test vehicle was SYMMETRIC (`left_m == right_m`), which cannot
+  distinguish the node from the centre. The outboard pairs never had it: each
+  is placed against its own side's surface, so they are symmetric about the
+  body already — measured 0.0000 m lateral asymmetry, identical y and z, which
+  is the answer to "are the repeaters in the same position" (they are; the raw
+  x values look lopsided only because the node is).
 - **`pos.z` is referenced to the vehicle ground plane**, same as the LiDAR
   mounts — never add the bbox bottom.
 - **There is no hide-ego flag**; a mount inside the glasshouse films the
@@ -84,6 +110,138 @@ work:
 - Measured rates on the target machine, 8 cams 640×480 colour: **18.6 Hz per
   camera, sim at 42 Hz**. Resolution is nearly free (1280×960 → 16.2 Hz);
   the cost is per-camera draw submission.
+- **The Camera sensor has NO auto-exposure, and the game's own view does**
+  [measured 2026-08-23]. Reported live as "washed out". With BeamNG's camera
+  placed at the *identical* vehicle-frame pose as the sensor mount, the game
+  rendered the scene at mean luma 124.8 with **0.3 %** of pixels at ≥250, while
+  the sensor rendered mean 206.7 with **53 %** — so it is the sensor pass, not
+  the scene, not the exposure of the world, and not the Qt display path (which
+  already paints with `SmoothPixmapTransform` and wraps the buffer as
+  `Format_RGBA8888`). The clipping is **hard and per-channel** (front_main: 82 %
+  of RED pegged at exactly 255 against 6 % of blue), so no software curve
+  recovers it — the detail is gone before the buffer is read.
+
+  **The 53% figure is overstated and the severity claim is withdrawn.** That
+  measurement was taken through the wrong vehicle -- `next(iter(get_current()))`
+  handed back a `simple_traffic` van facing a sunlit white wall in a car park
+  (see the fourth-byte entry above) -- and the game-view half used
+  `set_relative`, which was later found not to move the camera reliably. On the
+  PLAYER's car, re-measured 2026-08-23 on a normal street: front_main **5.3%**
+  blown, front_wide 2.3%, pillar_left 0.2%, repeater_left 5.9%, rear 13.4%,
+  means 134-159. The missing auto-exposure is real and the direction of the
+  effect holds; the magnitude does not. Re-measure against the game view at a
+  verified matching pose before planning around it.
+
+  It is **entirely scene-brightness driven**, which is what makes it workable.
+  Same camera, same pose, sweeping time of day:
+
+  | time of day | mean luma | pixels ≥250 |
+  |---|---|---|
+  | 0.00 (high sun) | 199.7 | 25.3 % |
+  | 0.05 | 179.2 | 18.6 % |
+  | 0.10 | 122.0 | 14.1 % |
+  | 0.15 | 89.5 | 5.2 % |
+  | **0.18–0.35** | 65–92 | **0.0 %** |
+  | 0.40 | 0.0 | night |
+
+  **Capture below a high sun.** This is not cosmetic: a saturated region has no
+  texture, so it is exactly where stereo matching has nothing to correlate —
+  the phase-1 kerb experiment and any phase-4 training capture must run at a
+  lower sun or they measure the clipper rather than the scene.
+- **THE CAMERA BUFFER'S FOURTH BYTE IS NOT OPACITY, and reading it as one is
+  what the reported "noise" actually was** [measured 2026-08-23]. On one
+  1280x960 frame alpha ran **40..255 with only 50.75% of pixels at 255**, and
+  what is in there tracks the scene's materials. `vision_view` declared
+  `Format_RGBA8888`, so Qt composited every pixel against the dark tile
+  background: wherever that byte dipped the tile showed through, which renders
+  as black speckle on textured surfaces, dark outlines around buildings, and a
+  clean sky (alpha 255 there). Painted against the true colour, mean error
+  **26.08 as RGBA and 0.00 as `Format_RGBX8888`** -- identical byte layout,
+  fourth byte ignored.
+
+  **It survived a long investigation for two reasons, both worth remembering.**
+  Every probe saved `rgba[..., :3]` and threw the channel away, so captured
+  PNGs were clean while the app was not -- exposure, anti-aliasing, SSAO and
+  tile downscaling were each measured, and none of them was this. And the
+  capture tool picked its vehicle with `next(iter(get_current()))`, which
+  returns an arbitrary actor: it photographed `clone2`, a `simple_traffic` van
+  parked in a car park, while the player sat on the street being complained
+  about. **A probe must select the player with `get_player_vehicle_id`, exactly
+  as the worker does, or it is not looking at the same thing the app is.**
+
+  A 1x1 image blends under BOTH formats and `pixelColor` reports the stored
+  byte under both, so neither shows the difference; only painting a multi-pixel
+  image does. `test_the_cameras_fourth_byte_is_not_treated_as_opacity` pins it
+  that way, with a guard asserting RGBA still blends.
+- **The sensor pass gets no anti-aliasing, and the main view does**
+  [measured 2026-08-23]. `GraphicAntialias` is 4 for the game; the Camera
+  sensor has no equivalent and no temporal accumulation. Against a 2x
+  supersampled render of the same view, the native frame differs by >8 levels
+  on **5.6 %** of pixels — edges: poles, railings, kerb lines, car outlines.
+  Rendering 2x and area-averaging down fixes it visibly, and is **not
+  affordable**: 8 cameras at 2560x1920 cost 18.7 ms a tick to copy and 305 ms
+  to box-average in numpy, against a 40 ms tick. If it is ever wanted, it has
+  to happen on the GPU or for one camera at a time, not per-rig on the CPU.
+
+  Reported live as "so much noise in the camera compared to BeamNG itself".
+  Three contributors, separated by measurement — and the ranking matters
+  because only one of them is worth acting on:
+
+  | contributor | evidence | lever |
+  |---|---|---|
+  | **exposure** (dominant) | the same asphalt is smooth at a low sun and harsh speckle at a high one; high-freq energy 5.86 → 7.85 | sun angle (above) |
+  | no AA | 5.6 % of pixels differ from a 2x render | none affordable |
+  | tile downscaling | grid tiles only, see below | fixed |
+
+  **SSAO is NOT a contributor**, and it took two attempts to establish that.
+  It is the obvious suspect — it ships at `quality: 0`, the fewest samples —
+  and the first test toggled it through `VariableRegistry.set` and showed
+  nothing, which was worthless because that write is INERT (see below). Re-run
+  through the mechanism the game's own options handler uses, with the toggle
+  verified by reading `isEnabled()` back as `false`: grain 4.462 → 4.316 with
+  SSAO fully off, and 4.492 at `setSamples(64)`. It is genuinely not the cause.
+
+- **`VariableRegistry.set` DOES NOT APPLY, and this invalidated three
+  experiments before it was noticed** [measured 2026-08-23]. The game's own
+  settings handler (`lua/ge/extensions/core/settings/graphic.lua`) writes the
+  registry *and then* acts on the scene object — and it is the second half that
+  takes effect:
+
+  ```lua
+  VariableRegistry.set('$SSAOPostFx::Enable', value)   -- decorative
+  scenetree.findObject("SSAOPostFx"):disable()         -- this is the one
+  ```
+
+  For `$pref::Video::defaultAnisotropy` the write does not even stick: set 16,
+  set 0, read back 8 every time. **Any postfx or graphics experiment must
+  verify its own lever before believing a null result** — read the value back,
+  and prefer the scenetree object's own methods. The HDR sweep above is
+  suspect for exactly this reason and would need re-running through
+  `scenetree.findObject("HDRPostFx")` before its null result means anything.
+
+  Note the asphalt aggregate is REAL texture, not noise — a 2x render resolves
+  *more* of it, so a high-frequency-energy metric goes UP when the image gets
+  better. Judge this one by eye against a supersampled reference; an energy
+  number will rank it backwards.
+- **Grid tiles must be resampled before they are drawn, and the focused view
+  need not be** [measured]. `QPainter.drawImage` under `SmoothPixmapTransform`
+  is bilinear at any scale, which undersamples on minification. Against an
+  area-averaged reference: at the focused pane's 0.7x it is already correct
+  (error 1.25 either way, **0 %** gained), but at a grid tile's 3x it is 10x
+  wrong (4.33 against 0.40, **91 %** better prescaled). `vision_view.
+  wants_prescale` therefore resamples only when shrinking, cached per camera
+  and target size because `QImage.scaled` is ~1 ms a tile and eight of them
+  every paint is not affordable.
+- **The HDR post-processing block does not reach either renderer, so exposure
+  cannot be fixed from there** [measured]. `$HDRPostFX::enableToneMapping`,
+  `keyValue` and `whiteCutoff` were set through `VariableRegistry` and read back
+  changed, with `extensions.client_postFx.reloadPostEffects()` after each — and
+  neither the sensor nor the game view moved by more than noise. Note BeamNG's
+  own default preset ships `enableToneMapping: false`, so the main view's
+  correct exposure comes from somewhere else. Do not repeat this sweep without
+  first proving the toggle moves the GAME view: an earlier pass concluded "the
+  sensor ignores post-processing" from toggles that turned out to be inert on
+  both renderers, which proves nothing.
 
 ### GUI (implemented)
 
@@ -107,6 +265,9 @@ GUI in this mode (they consume the LiDAR cloud; rung 0.5 restores them).
   tiles); some bonnet in `front_bumper`/`front_wide` is expected.
 - Sim rate while streaming stays near the measured 42 Hz; ACQUISITION near
   16–18 Hz.
+- The tiles are exposed, not blown white. Under a high sun a quarter to a half
+  of every frame clips (see the exposure fact above); lower the sun before
+  judging image quality or capturing anything.
 - Switching VISION ↔ WORLD/RAW BEV mid-stream re-attaches cleanly both ways,
   and self-driving/AEB re-arm on return to LiDAR.
 - Graphics preset above "Lowest" (empty camera buffers otherwise) and

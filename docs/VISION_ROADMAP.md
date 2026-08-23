@@ -19,18 +19,19 @@ simulator does with it.
 | Phase | What | Effort | Gate it answers | Status |
 |-------|------|--------|-----------------|--------|
 | 0 | Foundations: beamngpy 1.36, 0.39, Vision mode rung 0 | — | Can cameras stream at all? | **DONE 2026-08-22** |
-| 0v | Rung-0 live verification | ~30 min | Do the mounts and rates hold on the real car? | in progress |
-| 1 | The kerb experiment | 1 afternoon | Is stereo good enough for the planner's kerb requirement? | **NEXT — has veto power** |
-| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | not started |
-| 3 | Rung 1: stereo depth | 3–6 weeks | The car drives on genuine vision-only geometry | blocked on phase 1 |
+| 0v | Rung-0 live verification | ~30 min | Do the mounts and rates hold on the real car? | **DONE 2026-08-23** |
+| 1 | The kerb experiment | 1 afternoon | Is stereo good enough for the planner's kerb requirement? | **DONE 2026-08-23 — FAILED, see below** |
+| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | **NEXT** |
+| 3 | Rung 1: stereo depth | 3–6 weeks | The car drives on vision geometry for OBSTACLES; the ground band stays on engine depth | re-shaped by phase 1 |
 | 4 | Rung 2: sim-trained semantics | 4–8 weeks | Meaning comes from pixels, on every map | after 3 |
 | 5 | Rung 3 decision: learned BEV / occupancy | 2–3 months | Is the true Tesla architecture worth the ML project? | decide after 4 |
 | 6 | Wild card: imitation from the LiDAR teacher | open | Side experiment only | optional |
 
 Standing item, outside every phase: **the licence question**. The tech.key
-timestamp (2026-09-22 if it is an expiry — unconfirmed) interrupts everything
-mid-phase. Chase it with whoever supplied the key before committing to phases
-2+.
+timestamp is 2026-09-22 if it is an expiry, which is unconfirmed and would
+interrupt everything mid-phase. **Deliberately deferred 2026-08-23** — the
+owner's call, not an oversight. Nothing in phase 2 depends on resolving it
+first; the risk is that it lands mid-phase rather than that it blocks a start.
 
 ---
 
@@ -47,26 +48,70 @@ Landed 2026-08-22:
 
 Still open from the original foundations list (do alongside 0v):
 
-- [ ] A virtualenv per simulator version (`.venv39` with 1.36), ending the
-      shared-global-site-packages situation that broke PyQt6 once already.
-- [ ] Pin renderer settings for capture in `launcher.py`
-      (`PostFXMotionBlurEnabled=false`; graphics preset above "Lowest").
-- [ ] Start the licence conversation.
+- [x] A virtualenv per simulator version (`.venv39` with 1.36), ending the
+      shared-global-site-packages situation that broke PyQt6 once already —
+      done 2026-08-23. Suite green in it (770 passed) and pytest-qt is absent
+      from it entirely. Both `.bat` files prefer it and fall back with a
+      message.
+- [x] Renderer settings for capture — done 2026-08-23, but as a **CHECK, not a
+      pin**: `bng.settings.change` + `apply_graphics` was measured on 0.39.4
+      and moved neither the sensor nor the game view, so setting them would
+      have been a line that quietly did nothing. `launcher.
+      capture_setting_warnings` is a pure rule over the values the worker reads
+      via `settings.getValue`, logged once per vision attach as
+      `Capture check:` and warned about only when actually wrong (the
+      black-frame presets, and motion blur). Current machine: clean.
+- [~] Start the licence conversation — **deferred by decision 2026-08-23**,
+      see the standing item above.
 
-## Phase 0v — Rung-0 live verification (~30 minutes, needs the sim)
+## Phase 0v — Rung-0 live verification (DONE 2026-08-23)
 
-The checklist in VISION_MODE_SPEC.md §2, in short:
+The checklist in VISION_MODE_SPEC.md §2, in short. Everything measurable in the
+app is confirmed; the one item needing a number from BeamNG's own HUD was
+dropped by decision rather than met.
 
-- [ ] `Vision check:` line within ~1 s of attach; the 5 s silence warning
-      never fires on a healthy setup.
-- [ ] All eight tiles plausible: no cabin interiors, no sky-only tiles, some
-      bonnet in the wide/bumper views is correct. (First live look already
-      caught the bumper camera inside the shell — fixed with its own
-      standoff; re-check it.)
-- [ ] Sim rate near the measured 42 Hz while streaming; ACQUISITION ~16–18 Hz.
-- [ ] VISION ↔ WORLD/RAW BEV switching mid-stream re-attaches cleanly both
-      ways; self-driving/AEB re-arm on return to LiDAR.
-- [ ] Click-to-focus works on every tile and returns on the second click.
+Four defects were found and fixed in the course of it, none of them predicted by
+the checklist: the 0.39 launcher aborting on a windowless parent (Launch had
+been dead since the upgrade), the camera buffer's fourth byte being read as
+opacity (the reported "noise"), a 24.5-degree blind gap either side of the rig,
+and the centreline cameras sitting on the reference node instead of the body
+centre. That ratio is the argument for live verification existing at all.
+
+- [x] `Vision check:` line within ~1 s of attach; the 5 s silence warning
+      never fires on a healthy setup — confirmed 2026-08-23, **0.1 s**, eight
+      cameras delivering, on three attaches (two at 1280×960). No warning, and
+      no WARN/ERROR anywhere in the day's log.
+- [x] All eight tiles plausible: no cabin interiors, no sky-only tiles, some
+      bonnet in the wide/bumper views is correct — confirmed 2026-08-23, all
+      eight stream. (First live look caught the bumper camera inside the shell
+      — fixed with its own standoff.)
+- [x] Image quality — RESOLVED 2026-08-23. "Pixelated" was the 640×480 source
+      (now 1280×960). "Grainy" was **ours**: the camera buffer's fourth byte is
+      not opacity, and `vision_view` read it as `Format_RGBA8888`, so Qt
+      composited every pixel against the dark tile — mean error 26.08 against
+      the true colour, 0.00 once read as `Format_RGBX8888`. "Washed out" is a
+      real but much milder effect than first reported (the sensor has no
+      auto-exposure; 2-13% of pixels clip on a normal street, not the 53% first
+      measured through the wrong vehicle). Spec §2 carries all three.
+- [x] ACQUISITION ~16–18 Hz — confirmed 2026-08-23 at **17.5 Hz**, at
+      1280×960, i.e. the resolution rise cost ~1 Hz as predicted.
+- [~] Sim rate near the measured 42 Hz while streaming — **dropped by decision
+      2026-08-23**, and 0v is called done without it. It is the one item with no
+      in-app source: `Engine.getFPS` and `Engine.Render.getFPS` do not exist on
+      0.39.4, so it has to be read from the `Performance Timers` UI app
+      (`ui/modules/apps/SimplePerfTimers`, Telemetry category) by hand. The
+      evidence that the rig keeps up is indirect but real — ACQUISITION held
+      17.5 Hz at 1280x960 against a measured 16-18 Hz expectation, and no poll
+      failure has been logged in any session.
+- [x] VISION ↔ WORLD/RAW BEV switching mid-stream re-attaches cleanly both
+      ways; self-driving/AEB re-arm on return to LiDAR — confirmed live
+      2026-08-23, all three parts: the round trip, both AEBs re-arming, and the
+      six-unit LiDAR rig attaching. This was the 0v item with real machinery
+      behind it (a re-attach through the single `_cleanup_sensors` funnel and
+      the worker's refusal list handing back), and it was the first LiDAR
+      attach since the 0.39 upgrade.
+- [x] Click-to-focus works on every tile and returns on the second click —
+      confirmed live 2026-08-23, both halves.
 
 ## Phase 1 — The kerb experiment (1 afternoon; VETO POWER over phase 3)
 
@@ -75,20 +120,68 @@ wide-baseline front stereo pair (1280×960, ~60° HFOV, baseline 0.5–1.0 m),
 one 0.10–0.15 m kerb, ranges 15–30 m:
 
 - [ ] Capture rectified pairs at several ranges (lockstep: pause → step →
-      poll both).
+      poll both). **Watch the exposure** — the Camera sensor has no
+      auto-exposure (spec §2), and a saturated region is precisely the one
+      stereo cannot correlate, so a clipped capture would measure the clipper
+      rather than the kerb. On a normal street it clips 2–13% of pixels, which
+      is tolerable; under a high sun it is much worse. Check before trusting a
+      run, rather than assuming either way.
 - [ ] Compute disparity (CPU SGBM is fine offline; the live rung uses CUDA
       SGM), unproject, accumulate into the existing 0.4 m cell machinery.
 - [ ] Verdict table per range: does the kerb face separate from the road
       surface at 15 / 20 / 25 / 30 m, and at how many sigma?
 
-Outcomes:
+### VERDICT 2026-08-23: **FAIL** — the stereo rung pivots to a hybrid
 
-- **Pass** → phase 3 proceeds as specced (stereo is the depth source).
-- **Fail** → the stereo rung pivots to a hybrid (stereo for obstacles and
-  AEB range, engine depth for the ground band) — decided now, for the cost
-  of an afternoon, instead of after the port.
+Measured with `tools/kerb_experiment.py` on a straight two-kerb street
+(west_coast_usa), one lockstep pair per configuration, the engine depth channel
+as the oracle. Separation is the stereo kerb step divided by the stereo road
+noise at that range; 3σ is the bar.
 
-## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks)
+| baseline | width | 15 m | 20 m | 25 m | 30 m |
+|---|---|---|---|---|---|
+| 0.6 m | 1280 | 3.6σ | no data | −3.9σ | −4.1σ |
+| 1.0 m | 1280 | 4.2σ | no data | no data | −3.1σ |
+| 1.6 m | 1280 | −1.7σ | no data | no data | no data |
+| 1.0 m | 1920 | 4.7σ | no data | no data | no data |
+| **oracle control** | 1280 | **9.4σ** | 13.8σ | 15.0σ | 16.4σ |
+
+**Stereo resolves the kerb at 15 m and nowhere beyond it.** Past 20 m it either
+produces no depth at the kerb line at all, or a physically impossible NEGATIVE
+step — the pavement reading lower than the road, which the bias table explains:
+stereo over-ranges by 0.44–0.66 m there, and a too-far point on a grazing
+surface reads as a lower one. Even at 15 m it under-reads the step, 0.077 m
+against a true 0.113.
+
+Three things this rules out as the cause:
+
+- **Not the SGBM parameters.** Swept blockSize 3–11 against two P2/uniqueness
+  settings: road depth sigma at 30 m stayed 0.87–1.53 m throughout.
+- **Not the baseline.** 1.6 m was the WORST (32% valid pixels — a wide pair
+  loses overlap and occludes more than the extra disparity buys).
+- **Not the resolution.** 1920 halved the depth noise (0.96 → 0.56 m at 30 m)
+  and still produced nothing at the kerb past 15 m. The failure at range is
+  MATCHING on low-texture asphalt, not precision.
+
+The oracle control passing at 9.4–16.4σ through the identical pipeline is what
+makes this a statement about stereo rather than about the measurement.
+
+**Consequence, as the plan already anticipated:** stereo for obstacles and AEB
+range (big vertical targets, plenty of texture), engine depth for the ground
+band. Phase 3 is re-shaped, not cancelled, and this cost an afternoon instead of
+a 3–6 week port.
+
+Caveats worth keeping: one scene, one map, one lighting condition, one kerb
+geometry. A re-run on a differently-textured road surface would strengthen it,
+and nothing here tests a kerb against a WET or high-contrast surface where
+matching would be easier.
+
+## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks) — **NEXT**
+
+Phase 1's verdict promotes this from scaffolding to the permanent source of the
+ground band: engine depth is no longer a stepping stone that stereo replaces,
+it is what kerbs and road surface will keep coming from. Build it accordingly —
+the oracle harness below is now load-bearing rather than a diagnostic.
 
 Turn on depth (+ annotation) and rebuild the perception waist
 (`points_world + colours + state`) from the cameras. Everything downstream —
@@ -112,10 +205,20 @@ Milestones, in order:
       phantom checklist applies (hills, brake dive, bushes, kerbs, reverse).
 - [ ] **Milestone: the car drives in Vision mode** (on engine depth).
 
-## Phase 3 — Rung 1: stereo (3–6 weeks; shape set by phase 1's verdict)
+## Phase 3 — Rung 1: stereo (3–6 weeks; RE-SHAPED by phase 1's verdict)
 
-Swap engine depth for computed stereo depth, pair by pair, with engine depth
-demoted to a hidden diff oracle. Spec §4.
+**Not** a wholesale swap any more. Phase 1 measured stereo failing to resolve a
+kerb beyond 15 m in every configuration tried, so the split is by WHAT IS BEING
+SENSED rather than by rung:
+
+- **Stereo takes obstacles and AEB range** — big, textured, mostly vertical
+  targets, which is the case it handles well.
+- **Engine depth keeps the ground band** — kerbs, road surface, the drivable
+  floor. This is permanent unless a later measurement overturns phase 1.
+
+The milestone below therefore changes: "engine depth OFF" is no longer the goal,
+and a vision-only-geometry claim cannot be made honestly on this evidence. Spec
+§4 still describes the stereo machinery; ignore its framing as a full swap.
 
 - [ ] Rig re-paired (wide-baseline 1280×960 front pair; VGA side/rear pairs).
 - [ ] CUDA SGM integrated (~2 ms/pair measured elsewhere; measure HERE under
@@ -128,8 +231,10 @@ demoted to a hidden diff oracle. Spec §4.
 - [ ] Constants retuned against stereo noise; oracle diff within budget at
       10/25/50 m.
 - [ ] Full phantom-braking checklist, again.
-- [ ] **Milestone: engine depth OFF — the car drives on vision-only
-      geometry.** A complete, publishable result with zero neural networks.
+- [ ] **Milestone: the car drives with stereo supplying obstacles and AEB
+      range**, engine depth supplying the ground band. Still a complete result
+      with zero neural networks — but NOT a vision-only-geometry claim, which
+      phase 1's measurement does not support.
 
 ## Phase 4 — Rung 2: sim-trained semantics (4–8 weeks)
 

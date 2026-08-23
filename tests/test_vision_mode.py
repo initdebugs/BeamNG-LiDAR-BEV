@@ -11,7 +11,11 @@ from beamng_lidar_bev.geometry import (
     derive_camera_rig,
 )
 from beamng_lidar_bev.models import VehicleGeometry, VisionFrame
-from beamng_lidar_bev.vision_view import grid_dimensions, toggle_focus
+from beamng_lidar_bev.vision_view import (
+    grid_dimensions,
+    toggle_focus,
+    wants_prescale,
+)
 from beamng_lidar_bev.worker import (
     SENSOR_MODE_LIDAR,
     SENSOR_MODE_VISION,
@@ -26,6 +30,26 @@ def _geometry() -> VehicleGeometry:
         right_m=0.9,
         front_m=2.2,
         rear_m=2.3,
+        height_m=1.45,
+        mounts={},
+    )
+
+
+def _offset_geometry() -> VehicleGeometry:
+    """
+    A vehicle whose REFERENCE NODE is off the body centre, as real ones are.
+
+    `_geometry` above is symmetric (left_m == right_m), which is exactly why it
+    could never catch a camera placed at x = 0 instead of the body centreline.
+    These extents are the vivace's, measured live: 2.02 m wide with the node
+    0.16 m off centre.
+    """
+    return VehicleGeometry(
+        ground_z_vehicle=-0.248,
+        left_m=1.17,
+        right_m=0.85,
+        front_m=1.84,
+        rear_m=2.49,
         height_m=1.45,
         mounts={},
     )
@@ -347,3 +371,187 @@ def test_cleanup_forgets_the_camera_digests() -> None:
     worker._cleanup_sensors()
 
     assert worker._camera_digests == {}
+
+
+def test_shrinking_an_image_is_resampled_and_magnifying_it_is_not() -> None:
+    """
+    `drawImage` is bilinear whatever the scale, which is right going up and
+    wrong coming down: shrinking 1280x960 into a 400x300 tile steps over ~3
+    source pixels per output pixel, so asphalt and foliage alias into speckle.
+    Reported live as camera "noise" -- and it appeared when the rig went from
+    640x480 (upscaled, merely soft) to 1280x960 (downscaled).
+    """
+    assert wants_prescale(1280, 960, 400.0, 300.0), "a grid tile shrinks 3x"
+    assert wants_prescale(1280, 960, 900.0, 675.0), "even the focused pane shrinks"
+    assert not wants_prescale(640, 480, 900.0, 675.0), "magnifying needs no resample"
+    assert not wants_prescale(1280, 960, 1280.0, 960.0), "1:1 needs no resample"
+
+
+def test_a_single_shrunk_axis_still_resamples() -> None:
+    """A pane can be wide and short; either axis shrinking causes the aliasing."""
+    assert wants_prescale(1280, 960, 1400.0, 300.0)
+    assert wants_prescale(1280, 960, 400.0, 1000.0)
+
+
+def test_a_degenerate_size_never_resamples() -> None:
+    """Zero-sized panes happen mid-layout; they must not reach QImage.scaled."""
+    assert not wants_prescale(0, 0, 400.0, 300.0)
+    assert not wants_prescale(1280, 960, 0.0, 300.0)
+    assert not wants_prescale(1280, 960, 400.0, 0.0)
+
+
+def test_the_cameras_fourth_byte_is_not_treated_as_opacity() -> None:
+    """
+    BeamNG's colour buffer carries something scene-dependent in its fourth
+    byte, not opacity: measured on one 1280x960 frame it ran 40..255 with only
+    50.75% of pixels at 255. Read as RGBA, Qt composites every pixel against
+    the tile background and the view fills with black speckle -- the reported
+    camera "noise". RGBX has the identical layout and ignores that byte.
+
+    Measured by PAINTING a multi-pixel image, which is the only form that
+    shows it: `pixelColor` reports the stored byte under either format, and a
+    1x1 image blends under BOTH (a degenerate path that misled this test once).
+    On the real frame: mean error against the true colour 26.08 as RGBA, 0.00
+    as RGBX.
+    """
+    from PyQt6.QtCore import QRectF
+    from PyQt6.QtGui import QImage, QPainter
+
+    from beamng_lidar_bev.vision_view import _IMAGE_FORMAT
+
+    size = 8
+    rgb = np.full((size, size, 3), 128, dtype=np.uint8)
+    alpha = np.full((size, size), 40, dtype=np.uint8)
+    buffer = np.dstack([rgb, alpha]).copy()
+
+    def painted(fmt: QImage.Format) -> float:
+        source = QImage(buffer.data, size, size, size * 4, fmt)
+        canvas = QImage(size, size, QImage.Format.Format_RGB32)
+        canvas.fill(0xFF000000)
+        painter = QPainter(canvas)
+        painter.drawImage(QRectF(0, 0, size, size), source)
+        painter.end()
+        return float(canvas.pixelColor(size // 2, size // 2).red())
+
+    assert painted(_IMAGE_FORMAT) == 128.0, (
+        "the camera's own colour must survive painting untouched"
+    )
+    blended = painted(QImage.Format.Format_RGBA8888)
+    assert blended < 60.0, (
+        "guard: RGBA really does blend with that byte -- a mid-grey pixel goes "
+        f"nearly black over a dark tile (measured {blended}), which is the "
+        "speckle. Without this the test could pass against any format."
+    )
+
+
+def _bearing_deg(direction: tuple[float, float, float]) -> float:
+    """Compass bearing in the vehicle frame: forward 0, LEFT +90, rear 180."""
+    return math.degrees(math.atan2(direction[0], -direction[1]))
+
+
+def _uncovered_bearings(rig, step_deg: float = 0.1) -> list[tuple[float, float]]:
+    """Runs of bearing no camera sees, as (start, end) in degrees."""
+    slots = int(round(360.0 / step_deg))
+    covered = [False] * slots
+    for mount in rig.values():
+        centre = _bearing_deg(mount.direction_vehicle)
+        half = mount.horizontal_fov_deg / 2.0
+        first = int(round((centre - half) / step_deg))
+        last = int(round((centre + half) / step_deg))
+        for index in range(first, last + 1):
+            covered[index % slots] = True
+    runs: list[tuple[float, float]] = []
+    index = 0
+    while index < slots:
+        if not covered[index]:
+            start = index
+            while index < slots and not covered[index]:
+                index += 1
+            runs.append((start * step_deg, (index - 1) * step_deg))
+        else:
+            index += 1
+    return runs
+
+
+def test_the_rig_leaves_no_gap_all_the_way_round() -> None:
+    """
+    The eight apertures have to TILE THE CIRCLE, and at the first FOVs they did
+    not: 80-degree pillars and 60-degree repeaters aimed 30 off rearward left a
+    **24.5-degree hole per side at bearings 95-120** -- over the driver's
+    shoulder, the blind spot the repeaters exist for. Reported live as the side
+    cameras feeling too narrow, which turned out to be measurable rather than a
+    matter of taste.
+    """
+    geometry = _offset_geometry()
+
+    assert _uncovered_bearings(derive_camera_rig(geometry)) == []
+
+
+def test_the_side_gap_closes_with_margin_not_by_a_hair() -> None:
+    """
+    Closing it exactly would be one per-vehicle tweak away from reopening, and
+    the mounts are metres apart so their coverage is not purely angular anyway.
+    The pillar and repeater on each side must genuinely overlap.
+    """
+    rig = derive_camera_rig(_offset_geometry())
+    pillar, repeater = rig["pillar_left"], rig["repeater_left"]
+
+    pillar_outer = (
+        _bearing_deg(pillar.direction_vehicle) + pillar.horizontal_fov_deg / 2.0
+    )
+    repeater_inner = (
+        _bearing_deg(repeater.direction_vehicle) - repeater.horizontal_fov_deg / 2.0
+    )
+
+    assert pillar_outer - repeater_inner >= 5.0, (
+        f"pillar reaches {pillar_outer:.1f} deg, repeater starts at "
+        f"{repeater_inner:.1f} -- they must overlap, not merely touch"
+    )
+
+
+def test_the_outboard_cameras_are_symmetric_about_the_body_not_the_node() -> None:
+    """
+    A pair placed against its own side's surface is symmetric about the BODY
+    even though the raw x values look lopsided, because the reference node is
+    off centre (measured 0.16 m on the vivace).
+    """
+    geometry = _offset_geometry()
+    rig = derive_camera_rig(geometry)
+    centre_x = (geometry.left_m - geometry.right_m) / 2.0
+
+    for left_name, right_name in (
+        ("pillar_left", "pillar_right"),
+        ("repeater_left", "repeater_right"),
+    ):
+        left, right = rig[left_name], rig[right_name]
+        offsets = (
+            left.position_vehicle[0] - centre_x,
+            right.position_vehicle[0] - centre_x,
+        )
+        assert offsets[0] == pytest.approx(-offsets[1], abs=1e-9), (
+            f"{left_name}/{right_name} sit at {offsets} from the body centreline"
+        )
+        assert left.position_vehicle[1] == pytest.approx(right.position_vehicle[1])
+        assert left.position_vehicle[2] == pytest.approx(right.position_vehicle[2])
+
+
+def test_a_centreline_camera_sits_on_the_body_centre_not_the_reference_node() -> None:
+    """
+    The node is not the body centre, so `x = 0` is 0.16 m off on the vivace --
+    the same defect the WORLD ego model and the AEB corridor each had. A bumper
+    camera looking straight ahead must do so from the middle of the car.
+    """
+    geometry = _offset_geometry()
+    rig = derive_camera_rig(geometry)
+    centre_x = (geometry.left_m - geometry.right_m) / 2.0
+    assert centre_x != 0.0, "guard: this vehicle must be off-centre to test it"
+
+    for name in ("front_bumper", "rear"):
+        assert rig[name].position_vehicle[0] == pytest.approx(centre_x), (
+            f"{name} is on the reference node, not the body centreline"
+        )
+    # The windshield pair straddles that centre rather than the node.
+    straddle = (
+        rig["front_main"].position_vehicle[0] + rig["front_wide"].position_vehicle[0]
+    ) / 2.0
+    assert straddle == pytest.approx(centre_x)
