@@ -46,8 +46,9 @@ The visualization header switches between:
   planner candidates, sensor mounts, AEB corridors, and performance metrics.
 - **VISION** — the eight-camera rig (Tesla HW4 layout: windshield main + wide,
   front bumper, two B-pillars, two fender repeaters, rear) streamed live as a
-  labelled grid. This is rung 0 of the vision-only ladder; see
-  `docs/VISION_MODE_SPEC.md`.
+  labelled grid; click a camera to view it full-frame, click again to return.
+  This is rung 0 of the vision-only ladder; see `docs/VISION_MODE_SPEC.md`
+  for the spec and `docs/VISION_ROADMAP.md` for the development roadmap.
 
 Switching between WORLD and RAW BEV is instantaneous and does not restart
 sensors or change driving state. Switching to or from VISION swaps the

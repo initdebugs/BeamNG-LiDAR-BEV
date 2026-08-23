@@ -1,0 +1,440 @@
+<title>The Vision-Only Ladder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Source+Serif+4:opsz,ital,wght@8..60,0,300..700;8..60,1,300..700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f6f8f8;
+    --card: #ffffff;
+    --card-soft: #eef3f3;
+    --ink: #1c2428;
+    --muted: #5b6a70;
+    --faint: #8b9a9e;
+    --border: #dce4e5;
+    --border-strong: #c2cfd1;
+    --accent: #0e7a8a;
+    --accent-ink: #0a5d6a;
+    --accent-soft: #e2eff1;
+    --amber: #a76a1c;
+    --amber-soft: #f5ecdc;
+    --red: #a63d2f;
+    --red-soft: #f6e5e1;
+    --code-bg: #eef3f3;
+    --shadow: 0 1px 2px rgba(28,36,40,.05), 0 4px 14px rgba(28,36,40,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101718;
+      --card: #182022;
+      --card-soft: #1e282a;
+      --ink: #e6ecec;
+      --muted: #9db0b3;
+      --faint: #6f8386;
+      --border: #263336;
+      --border-strong: #35474b;
+      --accent: #4fc3d5;
+      --accent-ink: #7dd6e4;
+      --accent-soft: #16323a;
+      --amber: #d9a35b;
+      --amber-soft: #322817;
+      --red: #d97e6c;
+      --red-soft: #37201b;
+      --code-bg: #1e282a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #101718;
+    --card: #182022;
+    --card-soft: #1e282a;
+    --ink: #e6ecec;
+    --muted: #9db0b3;
+    --faint: #6f8386;
+    --border: #263336;
+    --border-strong: #35474b;
+    --accent: #4fc3d5;
+    --accent-ink: #7dd6e4;
+    --accent-soft: #16323a;
+    --amber: #d9a35b;
+    --amber-soft: #322817;
+    --red: #d97e6c;
+    --red-soft: #37201b;
+    --code-bg: #1e282a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 14px rgba(0,0,0,.25);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+    font-size: 1.05rem;
+    line-height: 1.65;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 76rem; margin: 0 auto; padding: 0 1.25rem 5rem; }
+  .col { max-width: 46rem; margin-left: auto; margin-right: auto; }
+
+  h1, h2, h3, h4 {
+    font-family: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+    line-height: 1.15;
+    text-wrap: balance;
+    margin: 0;
+  }
+  p { margin: 0 0 1rem; }
+  a { color: var(--accent-ink); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  strong { font-weight: 650; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .72rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  header.masthead { padding: 4.5rem 0 2.5rem; }
+  .masthead .eyebrow { display: flex; gap: 1.25rem; flex-wrap: wrap; margin-bottom: 1.75rem; }
+  .masthead .eyebrow span + span::before { content: "·"; margin-right: 1.25rem; color: var(--faint); }
+  .masthead h1 {
+    font-size: clamp(2.6rem, 7vw, 4.6rem);
+    font-weight: 750;
+    font-variation-settings: "opsz" 96;
+    letter-spacing: -0.015em;
+    max-width: 20ch;
+  }
+  .masthead .dek {
+    font-size: clamp(1.1rem, 2.2vw, 1.3rem);
+    color: var(--muted);
+    max-width: 52ch;
+    margin-top: 1.5rem;
+    line-height: 1.55;
+  }
+  .masthead .dek em { color: var(--ink); font-style: italic; }
+
+  .statband {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: .6rem;
+    overflow: hidden;
+    margin: 2.5rem 0 3.5rem;
+    box-shadow: var(--shadow);
+  }
+  .stat { background: var(--card); padding: 1.1rem 1.2rem 1rem; }
+  .stat .n {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-size: 1.9rem; font-weight: 700; letter-spacing: -.01em;
+    color: var(--accent-ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .l { font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--muted); margin-top: .3rem; line-height: 1.45; }
+
+  section { margin: 3.5rem 0; }
+  .kicker {
+    display: flex; align-items: baseline; gap: .9rem;
+    margin-bottom: 1.4rem;
+  }
+  .kicker h2 { font-size: clamp(1.5rem, 3.4vw, 2.1rem); font-weight: 700; letter-spacing: -.01em; }
+  .kicker .tag { font-family: "IBM Plex Mono", monospace; font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent-ink); white-space: nowrap; }
+
+  .lede { font-size: 1.14rem; }
+
+  /* Rungs */
+  .rung {
+    display: grid;
+    grid-template-columns: 4.2rem 1fr;
+    border: 1px solid var(--border);
+    border-radius: .7rem;
+    background: var(--card);
+    box-shadow: var(--shadow);
+    margin: 0 0 1.4rem;
+    overflow: hidden;
+  }
+  .rung .rail {
+    background: var(--card-soft);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center;
+    padding-top: 1.5rem; gap: .5rem;
+  }
+  .rung .rail .num {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-size: 1.6rem; font-weight: 750; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .rung.hero-rung .rail .num { color: var(--accent-ink); }
+  .rung .body { padding: 1.5rem 1.7rem 1.2rem; min-width: 0; }
+  .rung h3 { font-size: 1.35rem; font-weight: 700; margin-bottom: .2rem; }
+  .rung .sub { color: var(--muted); font-style: italic; margin-bottom: 1rem; }
+  .rung p { margin-bottom: .85rem; }
+  .rung .meta {
+    display: flex; flex-wrap: wrap; gap: .5rem .6rem;
+    margin: 0 0 1.1rem;
+  }
+  .chip {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .72rem; font-weight: 500;
+    padding: .22rem .6rem;
+    border-radius: 99px;
+    border: 1px solid var(--border-strong);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .chip.ok    { background: var(--accent-soft); border-color: transparent; color: var(--accent-ink); font-weight: 600; }
+  .chip.warn  { background: var(--amber-soft);  border-color: transparent; color: var(--amber); font-weight: 600; }
+  .chip.no    { background: var(--red-soft);    border-color: transparent; color: var(--red); font-weight: 600; }
+
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin: 1rem 0 .4rem; }
+  .duo .cell h4 {
+    font-size: .78rem; font-family: "IBM Plex Mono", monospace; font-weight: 600;
+    letter-spacing: .1em; text-transform: uppercase; margin-bottom: .4rem;
+  }
+  .duo .cell.up h4 { color: var(--accent-ink); }
+  .duo .cell.down h4 { color: var(--amber); }
+  .duo .cell ul { margin: 0; padding-left: 1.05rem; }
+  .duo .cell li { margin-bottom: .4rem; font-size: .97rem; }
+  .duo .cell li:last-child { margin-bottom: 0; }
+  @media (max-width: 40rem) {
+    .duo { grid-template-columns: 1fr; }
+    .rung { grid-template-columns: 2.6rem 1fr; }
+    .rung .body { padding: 1.2rem 1.1rem 1rem; }
+  }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: .6rem; background: var(--card); box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  th, td { text-align: left; padding: .7rem .95rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  th {
+    font-family: "IBM Plex Mono", monospace; font-size: .7rem; font-weight: 600;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+    background: var(--card-soft);
+  }
+  td.num { font-family: "IBM Plex Mono", monospace; font-size: .85rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td .v { font-family: "IBM Plex Mono", monospace; font-size: .74rem; font-weight: 600; padding: .12rem .5rem; border-radius: 99px; white-space: nowrap; }
+  td .v.no { background: var(--red-soft); color: var(--red); }
+  td .v.ok { background: var(--accent-soft); color: var(--accent-ink); }
+
+  .pull {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 0 .6rem .6rem 0;
+    padding: 1.1rem 1.4rem;
+    margin: 1.6rem 0;
+    font-size: 1.08rem;
+  }
+  .pull p:last-child { margin-bottom: 0; }
+
+  .note {
+    border-left: 3px solid var(--amber);
+    background: var(--amber-soft);
+    border-radius: 0 .6rem .6rem 0;
+    padding: 1rem 1.3rem;
+    margin: 1.4rem 0;
+    font-size: .98rem;
+  }
+  .note p:last-child { margin-bottom: 0; }
+
+  code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .84em;
+    background: var(--code-bg);
+    padding: .1em .35em;
+    border-radius: .3em;
+  }
+
+  ol.pathlist { margin: 0; padding-left: 1.3rem; }
+  ol.pathlist > li { margin-bottom: 1rem; padding-left: .3rem; }
+  ol.pathlist > li::marker { font-family: "Bricolage Grotesque", sans-serif; font-weight: 700; color: var(--accent-ink); }
+
+  ul.plain { margin: 0 0 1rem; padding-left: 1.1rem; }
+  ul.plain li { margin-bottom: .55rem; }
+
+  footer.colophon {
+    margin-top: 4.5rem; padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: .88rem; color: var(--muted);
+  }
+  footer.colophon p { margin-bottom: .5rem; }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead col">
+    <div class="eyebrow"><span>Research &amp; brainstorm</span><span>Follow-up to “Eight Cameras, No LiDAR”</span><span>21 Aug 2026</span></div>
+    <h1>The Vision-Only Ladder</h1>
+    <p class="dek">How far can the car go on cameras <em>alone</em> — no depth buffer, no annotation channel, no laser anywhere? Much further than the last report implied. There are four honest rungs between “LiDAR in disguise” and “true Tesla”, and three of them fit your machine.</p>
+  </header>
+
+  <div class="statband">
+    <div class="stat"><div class="n">~2 ms</div><div class="l">to compute depth from one stereo camera pair, no AI involved</div></div>
+    <div class="stat"><div class="n">2.5–5 ms</div><div class="l">for a full Tesla-style occupancy network (FlashOcc, measured on an RTX 3090)</div></div>
+    <div class="stat"><div class="n">~5 min</div><div class="l">of driving to capture a research-grade training dataset, labels included</div></div>
+    <div class="stat"><div class="n">hours</div><div class="l">to train each small network on your own GPU, not days</div></div>
+    <div class="stat"><div class="n">±4.5 m</div><div class="l">error of the best mono-depth AI at 30 m — why single-camera braking stays dead</div></div>
+  </div>
+
+  <section class="col">
+    <div class="kicker"><span class="tag">The idea</span><h2>“Vision only” is a ladder, not a switch</h2></div>
+    <p class="lede">The last report treated cameras as one decision. It isn’t — it’s a ladder of increasingly honest vision, and each rung is a separate, testable project. At the bottom, the camera secretly reads the simulator’s depth buffer (which is what your LiDAR always did). At the top, a neural network looks at pixels and imagines the world, which is what Tesla actually ships. The new research maps every rung in between, with measured speeds for each.</p>
+    <p>The one-line summary of days of research: <strong>a car that genuinely drives on cameras alone is achievable on your PC</strong> — and the best route there uses no neural network at all for the safety-critical part.</p>
+    <div class="pull"><p>The single biggest finding: <strong>stereo vision — two cameras acting like two eyes — is nearly free, needs zero AI, and meets your braking-accuracy requirement on paper.</strong> Real Tesla can’t use it (they refused to mount camera pairs). You can, because in a simulator a perfectly calibrated pair with any spacing you like costs nothing.</p></div>
+  </section>
+
+  <section>
+    <div class="col"><div class="kicker"><span class="tag">The ladder</span><h2>Five rungs, bottom to top</h2></div></div>
+
+    <div class="rung">
+      <div class="rail"><span class="num">0</span></div>
+      <div class="body">
+        <h3>Engine depth — the previous report’s plan</h3>
+        <p class="sub">Cameras in Tesla’s geometry, but range and labels come straight from the simulator.</p>
+        <div class="meta"><span class="chip ok">Fits easily</span><span class="chip">no AI</span><span class="chip">already measured live</span></div>
+        <p>This is the baseline from last time: eight cameras whose depth and semantic labels are read from the engine. It looks like vision and drives on perfect data. Nothing new here — except a new role. Every higher rung can be switched on <strong>one piece at a time</strong> and compared against this rung’s perfect answer, frame by frame. That turns rung 0 from “the cheat” into <strong>the measuring instrument</strong> — a luxury no real-world team has.</p>
+      </div>
+    </div>
+
+    <div class="rung hero-rung">
+      <div class="rail"><span class="num">1</span></div>
+      <div class="body">
+        <h3>Stereo — real vision, zero neural networks</h3>
+        <p class="sub">Pair the cameras up. Depth comes from geometry, the way your own eyes do it.</p>
+        <div class="meta"><span class="chip ok">Fits easily</span><span class="chip">~2 ms per pair on GPU</span><span class="chip">meets AEB spec on paper</span><span class="chip">proven drivable (Daimler, 2013)</span></div>
+        <p>Two cameras a known distance apart see every object shifted slightly between them; the shift gives the distance. The classic GPU algorithm for this (semi-global matching) costs <strong>about 1.5–2 milliseconds per camera pair</strong> on a card weaker than yours — so your whole eight-camera rig, rebuilt as four stereo pairs, computes depth for roughly 13% of one GPU. The output is a metric 3D point cloud: <strong>exactly the data structure your entire existing pipeline already eats.</strong></p>
+        <p>Accuracy is set by how far apart the pair sits. Real cars are stuck with ~30 cm behind a windshield; you can mount a pair 0.5–1 m apart with perfect calibration and zero lens distortion. At 1280×960 with a forward-looking pair, the math gives <strong>under 1 m of range error at 50 m</strong> — which is the emergency-braking requirement, met without any AI. This isn’t speculative territory either: Daimler drove 100 km of public German roads in 2013 on essentially this method.</p>
+        <div class="duo">
+          <div class="cell up"><h4>What you gain</h4>
+            <ul>
+              <li>Genuine vision-only depth — nothing read from the engine</li>
+              <li>Dense measurement (every pixel), where LiDAR gave you rings with gaps</li>
+              <li>Hills handled by methods (“stixels”, road-profile fitting) that map directly onto your existing cell-referenced ground logic</li>
+            </ul>
+          </div>
+          <div class="cell down"><h4>What it costs</h4>
+            <ul>
+              <li>Depth gets noisy with distance — ~10× noisier per point than LiDAR, so your existing per-cell accumulation becomes mandatory, not optional</li>
+              <li>The kerb-at-25 m requirement sits at the <em>edge</em> of what stereo has ever published (~20 m is typical) — reachable on paper, unproven in practice</li>
+              <li>A new phantom-obstacle type: depth “smears” at object edges, which your LiDAR-tuned filters were never designed for (a known, cheap fix exists)</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="rung">
+      <div class="rail"><span class="num">2</span></div>
+      <div class="body">
+        <h3>Small AI, trained on BeamNG’s own free labels</h3>
+        <p class="sub">Replace the annotation channel: a network learns to see road, cars, lanes, kerbs — from pixels.</p>
+        <div class="meta"><span class="chip ok">Fits</span><span class="chip">~6–9 ms for all 8 cameras</span><span class="chip">data capture ≈ minutes</span><span class="chip">training ≈ hours</span></div>
+        <p>Here the semantic understanding becomes learned instead of given. The trick that makes this cheap: BeamNG will render a <strong>perfectly labelled version of every camera frame for free</strong>. Drive around for five minutes recording eight cameras, and you have a dataset the size of ones research papers are built on — with pixel-perfect labels, for your exact rig, your exact renderer. There is no “will it transfer to the real world” problem, because the sim <em>is</em> the world.</p>
+        <p>The speeds are comfortable: a modern small segmentation network plus a nano object detector plus a lane detector, batched across all eight cameras, lands around <strong>6–9 ms total</strong> — inside the budget the simulator leaves you. And in-domain results from comparable synthetic datasets suggest ~84% accuracy from a vanilla network, before any tuning. Combined with rung 1 you get the honest division of labour: <strong>geometry from stereo, meaning from AI</strong> — which is how most real (non-Tesla) autonomy stacks actually work.</p>
+        <p>One bonus that matters to this project: a segmentation network reads lane paint from the <em>colour image</em>, so markings work on every map — including the ones where the annotation channel calls the paint “asphalt”.</p>
+      </div>
+    </div>
+
+    <div class="rung">
+      <div class="rail"><span class="num">3</span></div>
+      <div class="body">
+        <h3>A real Tesla-style network — smaller than we thought</h3>
+        <p class="sub">One network watches all eight cameras and directly outputs the bird’s-eye world.</p>
+        <div class="meta"><span class="chip warn">Fits, with care</span><span class="chip">2.5–8 ms measured elsewhere</span><span class="chip">revises the last report</span></div>
+        <p><strong>This is the finding that changes the previous report’s verdict.</strong> Last time, “occupancy networks” were declared impossible — correctly, for the famous ones (340–555 ms each). But the research turned up their fast siblings, and they are startlingly quick: <strong>FlashOcc runs a full six-camera occupancy pipeline in 2.5–5 ms</strong> on an RTX 3090 — a card comparable to yours. BEVDet with TensorRT: ~7 ms. These are measured numbers from deployed code, not paper claims.</p>
+        <p>The catch is not speed — it’s everything around speed. You would need a training pipeline for 3D labels (your accumulated LiDAR voxel store could generate them, a neat full-circle), a TensorRT deployment on Windows, and headroom for the fact that all published numbers came from GPUs doing <em>nothing else</em>, while yours also renders the game. Evidence says the data side is fine — comparable models train on a few thousand frames when train and test share a world — but this rung is a real machine-learning project, not an integration.</p>
+        <p>If it works, this is the genuine article: pixels in, drivable-space out, one network — the same architecture family Tesla describes, at hobby scale.</p>
+      </div>
+    </div>
+
+    <div class="rung">
+      <div class="rail"><span class="num">4</span></div>
+      <div class="body">
+        <h3>End-to-end — pixels in, steering out</h3>
+        <p class="sub">The network doesn’t just see; it drives.</p>
+        <div class="meta"><span class="chip warn">Surprisingly cheap to run</span><span class="chip no">Expensive to trust</span><span class="chip">wild-card idea</span></div>
+        <p>The famous end-to-end systems (UniAD and friends) stay impossible — half a second per frame on datacenter hardware. But the research found a twist: the <em>winning</em> agent on the CARLA simulator leaderboard, TCP, is a <strong>single camera and a small network that would run in well under 10 ms on your card</strong>. End-to-end driving isn’t compute-limited at all. It’s limited by training data and by brittleness — and by the fact that it outputs steering, not an inspectable world, so your planner, AEB, overlays and BEV all become bystanders.</p>
+        <p>The brainstorm-grade idea hiding here: <strong>your current LiDAR stack could be the driving teacher.</strong> Let it drive for hours, record camera frames alongside its steering and pedals, and train a small network to imitate it — the exact “privileged teacher” recipe the CARLA winners use. Not the recommended path, because one un-debuggable network replaces your entire legible pipeline. But as a side experiment — “can a network learn to drive by watching my planner?” — it is genuinely within reach, and almost nobody can say that.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="col">
+    <div class="kicker"><span class="tag">Dead ends</span><h2>What stays impossible — and why it’s fine</h2></div>
+    <p>Knowing what <em>not</em> to attempt is half the value of the research. Each of these was checked, and each has a cheaper substitute on the ladder.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Idea</th><th>Verdict</th><th>In simple terms</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>One camera guessing distance</strong> (mono-depth AI) for braking</td>
+            <td><span class="v no">Dead</span></td>
+            <td>The best models are off by 2–7 m at braking ranges; your AEB needs ~1 m. Worse, the error is a per-scene bias, not random noise — it fools the exact same way every frame. Stereo replaces it outright.</td>
+          </tr>
+          <tr>
+            <td><strong>Depth from a single moving camera</strong> (motion parallax)</td>
+            <td><span class="v no">Dead ahead</span></td>
+            <td>The geometry is blind precisely in the direction of travel — the one place AEB threats live — and a car moving with you produces no parallax at all, so it reconstructs at infinity. Fine as side-view bonus evidence; never the main ranging channel.</td>
+          </tr>
+          <tr>
+            <td><strong>Time-to-contact from optical flow</strong></td>
+            <td><span class="v no">Not for AEB</span></td>
+            <td>Tells you <em>when</em> you’d hit, never <em>how far</em> — and your entire brake trigger, standoff and phantom filtering are built on distance. Cheap enough (6 ms) to keep as a second-opinion channel, nothing more.</td>
+          </tr>
+          <tr>
+            <td><strong>Flat-ground projection</strong> (the classic lane-detection shortcut)</td>
+            <td><span class="v no">Dead on hills</span></td>
+            <td>Assumes the world is a billiard table. On a 3% grade it places the road at 30 m out at 75 m — a 45 m error. Your project made hills a first-class requirement; this fails them structurally.</td>
+          </tr>
+          <tr>
+            <td><strong>The big-name networks</strong> (SurroundOcc, UniAD, full occupancy transformers)</td>
+            <td><span class="v no">Still dead</span></td>
+            <td>40–555 ms per frame on hardware better than yours. Unchanged verdict — but their fast siblings on rung 3 do fit.</td>
+          </tr>
+          <tr>
+            <td><strong>Tesla’s literal 36 Hz</strong></td>
+            <td><span class="v no">Capped</span></td>
+            <td>The sensor transport tops out at 16–18 Hz regardless of what consumes the frames. Everything above assumes ~16 Hz; your LiDAR loop runs 25 Hz today, so the control loop retuning from the last report still applies.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="col">
+    <div class="kicker"><span class="tag">Unfair advantages</span><h2>Three things you have that Tesla doesn’t</h2></div>
+    <ul class="plain">
+      <li><strong>Perfect stereo, any spacing.</strong> Real cars fight calibration drift, windshield distortion and packaging; you type a number into a mount definition. This one advantage is what makes braking-grade vision possible without AI.</li>
+      <li><strong>Free perfect labels, forever.</strong> Every frame can be born with pixel-perfect depth and semantics. Data volume is a solved problem before you start — five minutes of driving equals a published research dataset. The variable that matters is variety (maps, weather, times of day), not quantity.</li>
+      <li><strong>A built-in oracle.</strong> At any moment you can render what the AI <em>should</em> have answered and diff it, per pixel, per frame, live. Every rung can be validated against the rung below before you trust it. Real-world teams pay millions for pale imitations of this loop.</li>
+    </ul>
+    <p>One more, worth naming: as far as the research could find, <strong>nobody has published a project that trains perception networks on BeamNG’s own ground truth and drives on them in the loop.</strong> The recipe is proven in CARLA and GTA V; for this engine, you’d be first.</p>
+  </section>
+
+  <section class="col">
+    <div class="kicker"><span class="tag">Honest risks</span><h2>What could still sink it</h2></div>
+    <ul class="plain">
+      <li><strong>The shared GPU is the unmeasured number.</strong> Every speed above was measured on a GPU doing nothing else. Yours renders BeamNG, eight camera views, <em>and</em> runs the vision stack, and Windows slices the card between them rather than sharing nicely. All the arithmetic says it fits with ~2× headroom; only a live measurement says it truly does.</li>
+      <li><strong>The kerb question from the last report is still the kerb question.</strong> Stereo improves the odds (denser than LiDAR, and the pair geometry is yours to choose), and the math says a 10 cm kerb at 25 m is ~6 standard deviations above the noise with the right pair — but published stereo work rarely goes past 20 m. This remains the first thing to measure, and it now has a concrete test: one wide-baseline pair, one kerb, one afternoon.</li>
+      <li><strong>New phantom-braking homework.</strong> Stereo’s edge-smearing produces coherent streaks of false points behind objects — a failure type your despeckle/support/porosity filters never met, and one that <em>survives</em> them because it isn’t speckle. The standard fix (discard points near depth discontinuities) is cheap, but the AEB checklist re-run is not optional.</li>
+      <li><strong>Everything from the last report still applies.</strong> The beamngpy upgrade, the licence clock, the 3–4 month re-derivation of planner and AEB constants against a new sampling pattern — the ladder sits on top of that work, it doesn’t replace it.</li>
+    </ul>
+  </section>
+
+  <section class="col">
+    <div class="kicker"><span class="tag">Recommendation</span><h2>Climb in order, validate at every rung</h2></div>
+    <p>The ladder isn’t just a taxonomy — it’s the build order. Each rung swaps one component and keeps the rung below as its regression test:</p>
+    <ol class="pathlist">
+      <li><strong>Build rung 0 first</strong> (the last report’s plan, unchanged). It gets the whole stack driving on cameras and becomes the oracle for everything after.</li>
+      <li><strong>Run the kerb measurement before anything else</strong> — one stereo pair against one kerb at 20–30 m. It’s the cheapest experiment with the most veto power over the whole design.</li>
+      <li><strong>Swap engine depth for stereo depth</strong> (rung 1), pair by pair, diffing against the oracle. Add the edge-culling filter; re-run the phantom-braking checklist. At the end of this step the car is <em>genuinely driving on vision</em> — a complete, publishable result with zero neural networks.</li>
+      <li><strong>Swap engine labels for a trained segmentation network</strong> (rung 2). Capture, train overnight, A/B against the annotation channel live. Lane paint on every map comes with it.</li>
+      <li><strong>Then decide</strong> whether rung 3 (the true Tesla architecture) or the rung 4 wild card (teach a network to imitate your planner) is the more interesting summit — by then you’ll have the data pipeline, the deployment tooling, and the measurements to choose with numbers instead of guesses.</li>
+    </ol>
+    <div class="pull"><p>Realistic effort on top of the base camera port: <strong>rung 1 ≈ +3–6 weeks, rung 2 ≈ +4–8 weeks, rung 3 ≈ +2–3 months.</strong> But rungs 1–2 already deliver the headline: a car driving BeamNG on cameras alone, with braking accuracy that comes from geometry you can prove rather than a network you have to trust.</p></div>
+  </section>
+
+  <footer class="colophon col">
+    <p>Compiled 21 August 2026 from four parallel research sweeps: real-time perception networks; fast bird’s-eye-view and occupancy architectures; simulator-supervised training; and classical stereo geometry. Speed figures are published measurements on named hardware (RTX 3090 / 4090 / A4000 class), scaled conservatively to the RTX 5070 Ti; nothing in this report was measured live against the simulator, and the shared-GPU contention figure is explicitly flagged as unmeasured. Companion to “Eight Cameras, No LiDAR” (20 Aug 2026), whose live measurements and blockers all still stand.</p>
+  </footer>
+
+</div>

@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import (
     CAMERA_FRONT_BUMPER_HFOV_DEG,
+    CAMERA_FRONT_BUMPER_STANDOFF_M,
     CAMERA_FRONT_MAIN_HFOV_DEG,
     CAMERA_FRONT_WIDE_HFOV_DEG,
     CAMERA_PILLAR_HFOV_DEG,
@@ -281,10 +282,14 @@ def derive_camera_rig(
     windshield_z = 0.90 * height
     pillar_z = 0.80 * height
     repeater_z = 0.60 * height
-    bumper_z = max(0.45, 0.32 * height)
+    # Higher than the first attempt (0.32 * height) and pushed well clear of
+    # the shell: at the ordinary clearance the camera sat INSIDE the bumper
+    # mesh -- the bbox face is the car's widest point, not the bumper face at
+    # this height. See CAMERA_FRONT_BUMPER_STANDOFF_M.
+    bumper_z = max(0.50, 0.38 * height)
+    bumper_y = -(geometry.front_m + CAMERA_FRONT_BUMPER_STANDOFF_M)
     rear_z = 0.75 * height
     # Just outside each surface, reusing the LiDAR body clearance.
-    front_y = -(geometry.front_m + body_clearance_m)
     rear_y = geometry.rear_m + body_clearance_m
     left_x = geometry.left_m + body_clearance_m
     right_x = -(geometry.right_m + body_clearance_m)
@@ -333,7 +338,7 @@ def derive_camera_rig(
         ),
         "front_bumper": mount(
             "front_bumper",
-            (0.0, front_y, bumper_z),
+            (0.0, bumper_y, bumper_z),
             forward,
             CAMERA_FRONT_BUMPER_HFOV_DEG,
         ),
