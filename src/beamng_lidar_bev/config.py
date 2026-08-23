@@ -268,11 +268,14 @@ SENSOR_BODY_CLEARANCE_M = 0.08
 # the 40 ms tick -- 9.8 MB a tick against 39.3, since every camera is copied
 # every tick whether or not it delivered a new frame.
 #
-# Raise it again if the detail is genuinely too low; this is a display-quality
-# dial with a known cost, not a correctness one. If the copy ever binds at a
+# 960x720 since 2026-08-23: 640 was tried once the alpha bug was fixed and the
+# detail was judged too low, so this is the middle setting -- 2.25x the pixels
+# of 640x480 and 0.56x those of 1280x960, with the copy cost scaling the same
+# way (roughly 2.9 ms a tick for all eight). This is a display-quality dial with
+# a known cost, not a correctness one. If the copy ever binds at a
 # higher setting, digest the live buffer BEFORE copying and copy only the
 # cameras that changed -- they update at ~16-18 Hz against a 25 Hz tick.
-CAMERA_RESOLUTION = (640, 480)
+CAMERA_RESOLUTION = (960, 720)
 # MUST be positive, and this is a trap, not a tuning choice: with
 # is_streaming=True and requested_update_time=0.0 every shared-memory buffer
 # stays zero-filled forever while the read loop happily spins -- a working rig
