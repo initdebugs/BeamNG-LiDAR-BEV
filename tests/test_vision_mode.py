@@ -324,6 +324,22 @@ class InvalidColourCameraStub(StreamingCameraStub):
         return self._raw  # type: ignore[return-value]
 
 
+class ByteMutatingCameraStub(StreamingCameraStub):
+    """A shared colour buffer whose caller can change one exact byte."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        width, height = self.resolution
+        self._colour = bytearray([17]) * (width * height * 4)
+
+    def mutate_byte(self, index: int, value: int) -> None:
+        self._colour[index] = value
+
+    def stream_raw(self) -> dict[str, bytes]:
+        self.stream_raw_calls += 1
+        return {"colour": self._colour}  # type: ignore[return-value]
+
+
 def _stub_mount(name: str, width: int, height: int) -> CameraMount:
     return CameraMount(
         name=name,
@@ -660,6 +676,19 @@ def test_unchanged_hybrid_colour_is_not_counted_as_a_new_frame() -> None:
     assert (first, second, third) == (True, False, True)
 
 
+def test_a_single_changed_hybrid_colour_byte_is_fresh() -> None:
+    """Freshness must cover all copied bytes, not a sparse byte sample."""
+    camera = ByteMutatingCameraStub()
+    worker = _armed_hybrid_camera_worker([camera])
+
+    _, first = worker._acquire_hybrid_camera_images(time.perf_counter())
+    _, second = worker._acquire_hybrid_camera_images(time.perf_counter())
+    camera.mutate_byte(1, 99)
+    _, third = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert (first, second, third) == (True, False, True)
+
+
 def test_hybrid_malformed_colour_buffers_are_omitted_without_failing() -> None:
     cameras = [
         InvalidColourCameraStub({}),
@@ -685,6 +714,20 @@ def test_hybrid_non_buffer_colour_is_omitted_without_failing() -> None:
     assert images == []
     assert fresh is False
     assert worker._poll_failures == 0
+
+
+def test_typed_hybrid_colour_with_the_wrong_byte_size_does_not_hide_a_peer() -> None:
+    malformed = InvalidColourCameraStub(
+        {"colour": np.zeros(48, dtype=np.uint16)}
+    )
+    worker = _armed_hybrid_camera_worker([malformed, StreamingCameraStub()])
+
+    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert [image.name for image in images] == ["a_pillar_right"]
+    assert fresh is True
+    assert worker._poll_failures == 0
+    assert worker._hybrid_camera_failures == set()
 
 
 def test_one_hybrid_camera_failure_does_not_hide_the_other() -> None:
@@ -755,6 +798,7 @@ def test_hybrid_liveness_warns_about_silent_colour_frames(
 
     assert any(
         "no camera has delivered a new colour frame" in record.getMessage()
+        and "HYBRID_CAMERA_UPDATE_TIME_S" in record.getMessage()
         for record in caplog.records
     )
 

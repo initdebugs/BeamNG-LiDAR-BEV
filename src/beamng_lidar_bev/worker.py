@@ -9,6 +9,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from dataclasses import replace
+from hashlib import blake2b
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -2124,21 +2125,30 @@ class BeamNgWorker(QObject):
             try:
                 width, height = camera.resolution
                 colour = raw.get("colour")
-                if colour is None or len(colour) != width * height * 4:
+                colour_view = memoryview(colour)
+                if (
+                    colour_view.nbytes != width * height * 4
+                    or not colour_view.contiguous
+                ):
                     continue
-                pixels = np.frombuffer(colour, dtype=np.uint8).copy()
+                pixels = np.frombuffer(colour_view, dtype=np.uint8).copy()
+                rgba = pixels.reshape((height, width, 4))
+                digest = blake2b(pixels, digest_size=16).digest()
             except (AttributeError, BufferError, TypeError, ValueError):
                 continue
 
-            digest = bytes(pixels[::_VISION_DIGEST_STRIDE])
             if digest != self._hybrid_camera_digests.get(name):
                 self._hybrid_camera_digests[name] = digest
                 any_fresh = True
-            images.append(
-                CameraImage(name=name, rgba=pixels.reshape((height, width, 4)))
-            )
+            images.append(CameraImage(name=name, rgba=rgba))
 
-        self._watch_vision_liveness(now, any_fresh, images, channel="colour")
+        self._watch_vision_liveness(
+            now,
+            any_fresh,
+            images,
+            channel="colour",
+            update_time_name="HYBRID_CAMERA_UPDATE_TIME_S",
+        )
         return images, any_fresh
 
     @staticmethod
@@ -2426,6 +2436,7 @@ class BeamNgWorker(QObject):
         any_fresh: bool,
         images: list[CameraImage],
         channel: str = "colour + depth + annotation",
+        update_time_name: str = "CAMERA_UPDATE_TIME_S",
     ) -> None:
         """
         One line when the rig comes alive, one warning if it never does.
@@ -2463,20 +2474,22 @@ class BeamNgWorker(QObject):
                 LOGGER.warning(
                     "Vision check: no camera has delivered a new frame in %.0f s. "
                     "Known trap: streaming buffers stay zero-filled when "
-                    "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
+                    "requested_update_time is 0.0 (%s must be "
                     "positive); also check the graphics preset is above 'Lowest', "
                     "which returns empty camera buffers.",
                     _VISION_SILENCE_WARN_S,
+                    update_time_name,
                 )
             else:
                 LOGGER.warning(
                     "Vision check: no camera has delivered a new %s frame in %.0f s. "
                     "Known trap: streaming buffers stay zero-filled when "
-                    "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
+                    "requested_update_time is 0.0 (%s must be "
                     "positive); also check the graphics preset is above 'Lowest', "
                     "which returns empty camera buffers.",
                     channel,
                     _VISION_SILENCE_WARN_S,
+                    update_time_name,
                 )
 
     def _scan_for_parking(
