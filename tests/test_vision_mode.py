@@ -341,25 +341,26 @@ def test_a_camera_without_depth_still_reaches_the_grid_but_not_the_cloud() -> No
     assert bev_frames[0].raw_point_count == 12
 
 
-def test_self_driving_and_aeb_lift_their_refusal_when_the_gate_opens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_vision_mode_offers_driving_by_default_since_milestone_5() -> None:
     """
-    The refusal is ONE rule for every slot, gated on VISION_DRIVING_ENABLED:
-    flipping that constant is the whole code change of roadmap milestone 5.
+    Milestone 5's code change: VISION_DRIVING_ENABLED ships True, earned by
+    the phase-2 measurements (ground band -1..-2 cm against the LiDAR floor
+    out to 60 m, staging ~= 0, zero-mean detection jitter after the
+    seen-time centring). The refusal machinery stays -- the closed-gate test
+    below pins the other direction -- and TRUST is gated on the live phantom
+    checklist, which is driving, not code.
     """
-    import beamng_lidar_bev.worker as worker_module
-
-    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", True)
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
 
     worker.set_aeb(True)
     worker.set_rear_aeb(True)
     worker.set_self_driving(True)
+    worker.set_parking_scan(True)
 
     assert worker._aeb_enabled is True
     assert worker._rear_aeb_enabled is True
     assert worker._self_driving is True
+    assert worker._parking_scan is True
 
 
 def test_porosity_reasons_from_the_tallest_camera_in_vision_mode() -> None:
@@ -446,7 +447,15 @@ def test_a_fresh_frames_seen_time_is_centred_between_the_last_two_looks() -> Non
     assert seen == pytest.approx((checked_before + checked_after) / 2.0)
 
 
-def test_vision_mode_refuses_self_driving_and_both_aebs() -> None:
+def test_the_closed_vision_gate_still_refuses_every_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate ships OPEN now, but it stays the shut-off: closed, all three
+    slots must bounce through the WORKER's own refusal -- a guard living
+    only in the window is one a queued signal walks straight past."""
+    import beamng_lidar_bev.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     answers: list[bool] = []
     worker.self_driving_changed.connect(answers.append)
@@ -463,19 +472,19 @@ def test_vision_mode_refuses_self_driving_and_both_aebs() -> None:
     assert worker._rear_aeb_enabled is False
 
 
-def test_vision_mode_refuses_the_parking_scan_and_the_parking_drive() -> None:
+def test_the_closed_gate_refuses_the_parking_scan_and_the_parking_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    Parking is in the same position as self-driving and both brakes, and for
-    the same reason: the bay scan reads the SEMANTIC marking store, which only
-    the LiDAR set fills. The camera rig produces no returns to classify, so a
-    scan armed here would sit lit over a store that can never fill.
+    Parking sits behind the SAME gate as self-driving and both brakes -- one
+    constant, four slots -- so with the gate shut it must bounce exactly as
+    they do, through the WORKER's own refusal. (The original rationale, that
+    the camera rig produced nothing to classify, died with rung 0.5: the
+    annotation channel fills the marking store in both modes now.)
+    """
+    import beamng_lidar_bev.worker as worker_module
 
-    The WORKER has to be the one refusing. MainWindow disables the buttons in
-    Vision mode, but this codebase's rule is that the worker owns the truth and
-    the GUI mirrors it -- a guard that lives only in the window is one a queued
-    signal, a restored setting or a mid-stream mode switch can walk straight
-    past.
-    """
+    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     answers: list[bool] = []
     worker.parking_changed.connect(answers.append)
@@ -489,12 +498,17 @@ def test_vision_mode_refuses_the_parking_scan_and_the_parking_drive() -> None:
     assert worker._parking_driving is False
 
 
-def test_the_parking_refusal_names_the_missing_instrument_set() -> None:
+def test_the_parking_refusal_names_the_missing_instrument_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    `set_parking_drive` already refused transitively -- no bay can be found in
-    Vision mode, so no selection can match -- but it said "select a parking
-    bay", which is unactionable in a mode where finding one is impossible.
+    `set_parking_drive` already refused transitively -- no bay can be found
+    behind a closed gate, so no selection can match -- but it said "select a
+    parking bay", which is unactionable when finding one is impossible.
     """
+    import beamng_lidar_bev.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     messages: list[str] = []
     worker.status_changed.connect(lambda _state, detail: messages.append(detail))
@@ -506,8 +520,13 @@ def test_the_parking_refusal_names_the_missing_instrument_set() -> None:
     assert all("Vision mode" in message for message in messages)
 
 
-def test_leaving_vision_mode_lets_the_parking_scan_arm_again() -> None:
+def test_leaving_vision_mode_lets_the_parking_scan_arm_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The refusal is the MODE's, not a latch: it must not outlive the mode."""
+    import beamng_lidar_bev.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     worker.set_parking_scan(True)
     assert worker._parking_scan is False

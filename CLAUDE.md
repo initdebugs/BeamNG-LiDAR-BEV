@@ -320,19 +320,25 @@ views draw whichever cloud the live set produces. Five things are load-bearing:
   teardown funnel (`_cleanup_sensors`) is the only path between rigs and a
   half-swapped set cannot exist. `sensor_mode_changed` is emitted before
   `sensors_ready` so the GUI knows which controls to enable.
-- **Self-driving, both AEBs and BOTH PARKING controls refuse in vision mode
-  behind ONE gate, `VISION_DRIVING_ENABLED`** (`worker._vision_refuses_driving`,
-  mirrored by `main_window.controls_offered`). Rung 0.5 gives them a real cloud
-  to read, but every band was fitted to LiDAR sampling and the camera lattice is
-  a new distribution — no azimuth stripes, density falling as 1/r² — so the
-  phantom-braking checklist has to be re-run live before a full-authority
-  brake reads it. Flipping the constant is the whole code change of roadmap
-  milestone 5. The GUI doesn't offer the buttons and the worker refuses anyway
-  (belt and braces, worker wins) — and the worker's half is the load-bearing
-  one, because a guard living only in the window is one a queued signal, a
-  restored setting or a mid-stream mode switch walks straight past. Attach
-  runs the SAME two `_set_aeb(True)` calls in both modes and lets the slot
-  refuse, rather than carrying a second branch that could drift from it.
+- **Self-driving, both AEBs and BOTH PARKING controls share ONE vision gate,
+  `VISION_DRIVING_ENABLED` — OPEN since 2026-08-24** (milestone 5's code
+  change, earned by the phase-2 measurements: ground band −1…−2 cm against
+  the LiDAR floor to 60 m, staging ≈ 0, registration jitter zero-mean after
+  the seen-time centring, one perception waist from `points_world + colours`
+  on). **TRUST is still gated on the live phantom checklist** — hills, brake
+  dive, bushes, kerbs, reverse, plus the low-canopy and rear-glass sampling
+  differences the oracle measured — because every band was fitted to LiDAR
+  sampling and the camera lattice is a new distribution (no azimuth stripes,
+  density falling as 1/r²), which is where every LiDAR-era phantom hid. The
+  machinery keeps its shape so ONE constant shuts all four slots again:
+  `worker._vision_refuses_driving` is the load-bearing half (a guard living
+  only in the window is one a queued signal, a restored setting or a
+  mid-stream mode switch walks straight past), mirrored by
+  `main_window.controls_offered` (belt and braces, worker wins). Attach runs
+  the SAME two `_set_aeb(True)` calls in both modes and lets the slot decide
+  rather than carrying a second branch that could drift from it — so in
+  vision mode both AEBs now ARM at attach exactly as on LiDAR, which is the
+  first thing to know before the checklist drive.
 - **`stream_raw()` returns a memoryview of the LIVE shared buffer** — the
   simulator keeps writing into it — so the COLOUR image is copied exactly once
   before anything reads twice; `test_the_image_is_a_private_copy...` pins it.

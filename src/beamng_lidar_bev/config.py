@@ -416,13 +416,22 @@ CAMERA_DEPTH_MIN_M = 0.30
 # into the world stores.
 CAMERA_FRAME_STAGING_S = 0.0
 # Whether self-driving, both AEBs and parking may engage on the unprojected
-# camera cloud. OFF until the phase-2 live checklist has been run: the bands
-# were fitted to LiDAR sampling and the camera lattice is a new distribution
-# (no azimuth stripes, density falling as 1/r^2), so every phantom-braking case
-# -- hills, brake dive, bushes, kerbs, reverse -- has to be re-proved live
-# before a full-authority brake is allowed to read it. Flipping this is the
-# whole of roadmap milestone 5's code change; the rest of it is driving.
-VISION_DRIVING_ENABLED = False
+# camera cloud. ON since 2026-08-24 -- roadmap milestone 5's code change,
+# earned by the phase-2 measurements: the camera ground band agrees with the
+# LiDAR floor to -1..-2 cm on every ring out to 60 m (street oracle),
+# registration is measured (staging ~= 0; detection jitter zero-mean and
+# half-tick bounded after the seen-time centring), and everything from
+# `points_world + colours` on is the LiDAR path's own code. TRUST is still
+# gated on the live phantom checklist -- hills, brake dive, bushes, kerbs,
+# reverse, plus the two measured sampling differences (low canopy entering
+# the planner band from the repeaters; a car's rear glass reading one 0.4 m
+# cell nearer than its bumper) -- because the camera lattice is a new
+# distribution (no azimuth stripes, density falling as 1/r^2) and every
+# LiDAR-era phantom hid exactly there. This constant stays as the SHUT-OFF:
+# one flip closes all four slots (self-driving, both AEBs, parking) through
+# the one gate, worker-side (_vision_refuses_driving, the load-bearing half)
+# and GUI-side (controls_offered) at once.
+VISION_DRIVING_ENABLED = True
 
 DISPLAY_RADIUS_M = 105.0
 # poll_sensors("state") is a blocking round-trip measured at 32.7 ms (p95 35.3),

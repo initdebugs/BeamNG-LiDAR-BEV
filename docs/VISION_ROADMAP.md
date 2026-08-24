@@ -394,11 +394,44 @@ Milestones, in order:
       `test_the_far_road_band_rows_are_sampled_at_full_density`. Still
       open: the live look — the vision WORLD's far road visibly filling
       to ~45 m single-frame on a street.
-- [ ] Re-enable self-driving + AEB in Vision mode behind the full live
+- [~] Re-enable self-driving + AEB in Vision mode behind the full live
       checklist re-run — the sampling distribution is new, so the whole AEB
       phantom checklist applies (hills, brake dive, bushes, kerbs, reverse,
       and the tree case above). The code change is flipping
       `VISION_DRIVING_ENABLED`; the rest is driving.
+
+      **Flipped 2026-08-24** — earned by the measurements: ground band
+      −1…−2 cm to 60 m, staging ≈ 0, jitter zero-mean after the centring,
+      stationary rig coherent to ±1.5 cm, one perception waist. All four
+      slots (self-driving, both AEBs, parking) open together; the gate
+      machinery stays and one constant shuts them all again, pinned both
+      directions by `test_vision_mode_offers_driving_by_default_since_
+      milestone_5` and the closed-gate tests. **The LIVE CHECKLIST is now
+      the whole remaining milestone.** BeamNG window visible; both AEBs
+      arm at attach on their own; drive with self-driving OFF first:
+      - flat empty road well over the 40 km/h cap, crests, dips, corners
+        near the kerb, hard manual braking (the brake-dive case) — the
+        AEB metric never leaves ARMED;
+      - a hill at 40–70 km/h, and reversing up a ramp — the
+        cell-referenced extent test is what should hold it ARMED, and
+        `AEB evidence:` says so if not (small height spread = the ground
+        arrived in the band, a sampling phantom; large = genuinely solid);
+      - roadside bushes and scrub — porosity now reasons from the 1.3 m
+        camera eye, not the roof unit;
+      - the two measured sampling differences: low canopy over the road
+        (the repeaters see branches the LiDAR rings missed — watch for a
+        flinch or a brake under trees), and reversing toward a car (its
+        rear glass reads one 0.4 m cell nearer than its bumper — the
+        SAFE direction, but confirm the rear brake is not early);
+      - then that it still FIRES: a wall and a stopped car, forward and
+        reversing;
+      - then self-driving ON: lane keeping on a street, free distance
+        near the horizon on an empty straight, a corner braked for
+        early and smoothly, and the junction/route behaviour unchanged
+        in character from LiDAR mode.
+      One flip of `VISION_DRIVING_ENABLED` closes everything if any of
+      it misbehaves — say what fired and the `AEB evidence:` line says
+      why.
 - [ ] **Milestone: the car drives in Vision mode** (on engine depth).
 
 Also landed alongside, by request: the rear camera is 130° and pitched 15°
