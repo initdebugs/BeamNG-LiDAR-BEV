@@ -284,6 +284,17 @@ CAMERA_RESOLUTION = (960, 720)
 # ~18 Hz, so the request is not the bottleneck.
 CAMERA_UPDATE_TIME_S = 0.05
 CAMERA_NEAR_FAR_PLANES = (0.05, 300.0)
+
+# --- Vision mode rung 1: LiDAR-first hybrid A-pillar camera pair -------------
+HYBRID_CAMERA_RESOLUTION = (1280, 960)
+HYBRID_CAMERA_UPDATE_TIME_S = 0.10
+HYBRID_CAMERA_HFOV_DEG = 105.0
+HYBRID_CAMERA_YAW_DEG = 37.0
+HYBRID_CAMERA_PITCH_DEG = 7.0
+HYBRID_CAMERA_HEIGHT_FRACTION = 0.88
+HYBRID_CAMERA_FRONT_FRACTION = 0.25
+HYBRID_CAMERA_BODY_CLEARANCE_M = 0.12
+
 # Per-mount horizontal FOVs. The Camera constructor takes a VERTICAL field of
 # view (field_of_view_y); geometry.camera_vertical_fov_deg derives it from
 # these and the aspect ratio, because the horizontal aperture is what the rig

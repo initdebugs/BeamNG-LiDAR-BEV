@@ -22,6 +22,13 @@ from .config import (
     CAMERA_REPEATER_YAW_DEG,
     CAMERA_RESOLUTION,
     CAMERA_SAMPLE_STRIDES,
+    HYBRID_CAMERA_BODY_CLEARANCE_M,
+    HYBRID_CAMERA_FRONT_FRACTION,
+    HYBRID_CAMERA_HFOV_DEG,
+    HYBRID_CAMERA_HEIGHT_FRACTION,
+    HYBRID_CAMERA_PITCH_DEG,
+    HYBRID_CAMERA_RESOLUTION,
+    HYBRID_CAMERA_YAW_DEG,
     LIDAR_FRONT_DENSITY,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
@@ -259,6 +266,8 @@ CAMERA_NAMES = (
     "rear",
 )
 
+HYBRID_CAMERA_NAMES = ("a_pillar_left", "a_pillar_right")
+
 
 def camera_vertical_fov_deg(
     horizontal_fov_deg: float, resolution: tuple[int, int]
@@ -426,6 +435,54 @@ def derive_camera_rig(
             CAMERA_REAR_HFOV_DEG,
         ),
     }
+
+
+def derive_hybrid_camera_rig(
+    geometry: VehicleGeometry,
+    resolution: tuple[int, int] = HYBRID_CAMERA_RESOLUTION,
+) -> dict[str, CameraMount]:
+    yaw = math.radians(HYBRID_CAMERA_YAW_DEG)
+    pitch = math.radians(HYBRID_CAMERA_PITCH_DEG)
+    horizontal = math.cos(pitch)
+    y = -HYBRID_CAMERA_FRONT_FRACTION * geometry.front_m
+    z = HYBRID_CAMERA_HEIGHT_FRACTION * geometry.height_m
+    left = CameraMount(
+        name="a_pillar_left",
+        position_vehicle=(
+            geometry.left_m + HYBRID_CAMERA_BODY_CLEARANCE_M,
+            y,
+            z,
+        ),
+        direction_vehicle=(
+            math.sin(yaw) * horizontal,
+            -math.cos(yaw) * horizontal,
+            -math.sin(pitch),
+        ),
+        horizontal_fov_deg=HYBRID_CAMERA_HFOV_DEG,
+        vertical_fov_deg=camera_vertical_fov_deg(
+            HYBRID_CAMERA_HFOV_DEG, resolution
+        ),
+        resolution=resolution,
+    )
+    right = CameraMount(
+        name="a_pillar_right",
+        position_vehicle=(
+            -(geometry.right_m + HYBRID_CAMERA_BODY_CLEARANCE_M),
+            y,
+            z,
+        ),
+        direction_vehicle=(
+            -math.sin(yaw) * horizontal,
+            -math.cos(yaw) * horizontal,
+            -math.sin(pitch),
+        ),
+        horizontal_fov_deg=HYBRID_CAMERA_HFOV_DEG,
+        vertical_fov_deg=camera_vertical_fov_deg(
+            HYBRID_CAMERA_HFOV_DEG, resolution
+        ),
+        resolution=resolution,
+    )
+    return {left.name: left, right.name: right}
 
 
 def camera_basis(mount: CameraMount) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

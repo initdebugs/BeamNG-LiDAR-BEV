@@ -10,6 +10,8 @@ from beamng_lidar_bev.geometry import (
     CAMERA_NAMES,
     camera_vertical_fov_deg,
     derive_camera_rig,
+    HYBRID_CAMERA_NAMES,
+    derive_hybrid_camera_rig,
 )
 from beamng_lidar_bev.models import (
     BevFrame,
@@ -70,6 +72,54 @@ def test_the_rig_is_the_eight_hw4_cameras_in_a_stable_order() -> None:
     rig = derive_camera_rig(_geometry())
     assert tuple(rig) == CAMERA_NAMES
     assert len(rig) == 8
+
+
+def test_the_hybrid_rig_is_exactly_the_two_a_pillar_cameras() -> None:
+    rig = derive_hybrid_camera_rig(_offset_geometry())
+    assert tuple(rig) == HYBRID_CAMERA_NAMES
+    assert tuple(rig) == ("a_pillar_left", "a_pillar_right")
+
+
+def test_hybrid_cameras_are_mirrored_outboard_a_pillar_mounts() -> None:
+    geometry = _offset_geometry()
+    rig = derive_hybrid_camera_rig(geometry)
+    left, right = rig.values()
+    centre_x = (geometry.left_m - geometry.right_m) / 2.0
+
+    assert left.position_vehicle[0] > geometry.left_m
+    assert right.position_vehicle[0] < -geometry.right_m
+    assert left.position_vehicle[1] == pytest.approx(-0.25 * geometry.front_m)
+    assert right.position_vehicle[1] == pytest.approx(left.position_vehicle[1])
+    assert left.position_vehicle[2] == pytest.approx(0.88 * geometry.height_m)
+    assert right.position_vehicle[2] == pytest.approx(left.position_vehicle[2])
+    assert left.position_vehicle[0] - centre_x == pytest.approx(
+        -(right.position_vehicle[0] - centre_x)
+    )
+
+
+def test_hybrid_pair_covers_the_front_half_circle_with_overlap() -> None:
+    left, right = derive_hybrid_camera_rig(_geometry()).values()
+    left_centre = _bearing_deg(left.direction_vehicle)
+    right_centre = _bearing_deg(right.direction_vehicle)
+    assert left_centre == pytest.approx(37.0)
+    assert right_centre == pytest.approx(-37.0)
+    assert left.horizontal_fov_deg == pytest.approx(105.0)
+    assert right.horizontal_fov_deg == pytest.approx(105.0)
+    assert left_centre + left.horizontal_fov_deg / 2.0 == pytest.approx(89.5)
+    assert right_centre - right.horizontal_fov_deg / 2.0 == pytest.approx(-89.5)
+    overlap = (
+        right_centre + right.horizontal_fov_deg / 2.0
+        - (left_centre - left.horizontal_fov_deg / 2.0)
+    )
+    assert overlap == pytest.approx(31.0)
+
+
+def test_hybrid_pair_is_high_quality_and_pitched_toward_the_road() -> None:
+    for mount in derive_hybrid_camera_rig(_geometry()).values():
+        assert mount.resolution == (1280, 960)
+        assert mount.direction_vehicle[2] < 0.0
+        pitch = math.degrees(math.asin(-mount.direction_vehicle[2]))
+        assert pitch == pytest.approx(7.0)
 
 
 def test_forward_is_negative_y_never_the_intuitive_positive() -> None:
