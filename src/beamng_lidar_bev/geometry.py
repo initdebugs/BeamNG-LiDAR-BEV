@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import (
     CAMERA_DEFAULT_SAMPLE_STRIDE,
+    CAMERA_FAR_ROAD_BAND_M,
     CAMERA_FRONT_BUMPER_HFOV_DEG,
     CAMERA_FRONT_BUMPER_STANDOFF_M,
     CAMERA_FRONT_MAIN_HFOV_DEG,
@@ -330,6 +331,7 @@ def derive_camera_rig(
         position: tuple[float, float, float],
         direction: tuple[float, float, float],
         hfov: float,
+        far_road_band: tuple[float, float] | None = None,
     ) -> CameraMount:
         return CameraMount(
             name=name,
@@ -341,6 +343,7 @@ def derive_camera_rig(
             sample_stride=tuple(
                 CAMERA_SAMPLE_STRIDES.get(name, CAMERA_DEFAULT_SAMPLE_STRIDE)
             ),
+            far_road_band_m=far_road_band,
         )
 
     # The reversing camera looks DOWN as well as back. Its job is the ground
@@ -359,6 +362,11 @@ def derive_camera_rig(
             (centre_x + 0.08, windshield_y, windshield_z),
             forward,
             CAMERA_FRONT_MAIN_HFOV_DEG,
+            # The far-road instrument: the rows where 20-100 m of level
+            # ground land are sampled at full density. See
+            # CAMERA_FAR_ROAD_BAND_M for the street-capture measurement
+            # behind it.
+            far_road_band=CAMERA_FAR_ROAD_BAND_M,
         ),
         "front_wide": mount(
             "front_wide",

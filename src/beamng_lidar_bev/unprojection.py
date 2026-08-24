@@ -25,16 +25,21 @@ Four facts the module is built on, all measured live:
 * **`pos.z` is referenced to the vehicle's ground plane** (the body-frame
   bounding-box bottom), not to the reference node -- the same rule every
   LiDAR mount follows, see `derive_vehicle_geometry`.
-* **The per-camera frames carry no timestamp** and are staged a frame or two
-  behind. The worker measures the part of each frame's age it can see (how
-  long since the buffer changed) and this module places the cloud from the
-  pose the car had THEN, so a 40 km/h car does not smear a wall 0.4 m down
-  the road between two cameras. The fixed staging part is
-  `CAMERA_FRAME_STAGING_S`, unmeasured as of 2026-08-23 and zero until
-  tools/unprojection_oracle.py measures it.
+* **The per-camera frames carry no timestamp**. The worker measures the part
+  of each frame's age it can see (how long since the buffer changed) and this
+  module places the cloud from the pose the car had THEN, so a 40 km/h car
+  does not smear a wall 0.4 m down the road between two cameras. The fixed
+  staging part is `CAMERA_FRAME_STAGING_S`, still 0.0: the 2026-08-24
+  staging-probe run bounded it well under one camera period (a buffer
+  followed a swung camera within 5-8 ms, which frames staged 1-2 behind
+  could never do), and the definitive instrument is
+  tools/ghosting_probe.py's moving case -- a systematic per-camera
+  along-travel offset at speed IS staging x speed. Note the lockstep oracle
+  cannot measure it; a paused capture has no skew to reveal.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +49,7 @@ import numpy as np
 from .config import (
     CAMERA_DEPTH_FAR_FRACTION,
     CAMERA_DEPTH_MIN_M,
+    CAMERA_FAR_ROAD_ROW_STRIDE,
     CAMERA_NEAR_FAR_PLANES,
     LIDAR_RANGE_M,
 )
@@ -89,6 +95,50 @@ def focal_length_px(horizontal_fov_deg: float, width: int) -> float:
     return (width / 2.0) / np.tan(np.radians(horizontal_fov_deg) / 2.0)
 
 
+def _far_road_rows(
+    mount: CameraMount, focal_px: float, height: int
+) -> np.ndarray:
+    """Every image row where LEVEL ground in the mount's far-road band lands,
+    at CAMERA_FAR_ROAD_ROW_STRIDE.
+
+    Rows are the range axis for ground and a coarse row stride is what
+    starves the far road: rings land `(r^2/h) x row pitch` apart -- 2.3 m at
+    40 m from front_main's stride-2 rows, against WORLD's 1.5 m road bridge.
+    The street oracle capture (2026-08-24) measured the band accurate to
+    -1..-2 cm out to 60 m with ~175 returns per 4 m ring at 20-24 m against
+    the road-scan unit's ~1300: density, not accuracy, is the binder. All
+    ground from `near` to `far` lives in the thin strip just under the
+    horizon (planar geometry: normalised image y = h / r for a level axis),
+    so full density there is ~7k samples on the 283k lattice and moves the
+    single-frame road edge from ~30 m to ~45 m, where stride-1 rings outrun
+    the bridge.
+    """
+    direction = mount.direction_vehicle
+    if abs(direction[2]) > 1e-6 * math.hypot(direction[0], direction[1]):
+        raise ValueError(
+            "far_road_band_m assumes a LEVEL optical axis (image y = h/r is "
+            f"planar geometry) and {mount.name!r} is pitched"
+        )
+    assert mount.far_road_band_m is not None
+    near_m, far_m = mount.far_road_band_m
+    eye_height = float(mount.position_vehicle[2])
+    if near_m <= 0.0 or far_m <= near_m or eye_height <= 0.0:
+        raise ValueError(
+            f"Implausible far-road band {mount.far_road_band_m!r} at eye "
+            f"height {eye_height!r}"
+        )
+    # Ground at range r sits at normalised image y = h / r below the axis;
+    # the row whose pixel CENTRE lands there is row = H/2 - 0.5 + y * f.
+    centre = height / 2.0 - 0.5
+    first = max(0, int(math.floor(centre + eye_height / far_m * focal_px)))
+    last = min(
+        height - 1, int(math.ceil(centre + eye_height / near_m * focal_px))
+    )
+    return np.arange(
+        first, last + 1, CAMERA_FAR_ROAD_ROW_STRIDE, dtype=np.int64
+    )
+
+
 def build_camera_rays(mount: CameraMount) -> CameraRays:
     """
     The strided sample lattice and its ray table for one mount.
@@ -113,6 +163,8 @@ def build_camera_rays(mount: CameraMount) -> CameraRays:
     focal = float(focal_length_px(mount.horizontal_fov_deg, width))
     cols = np.arange(col_stride // 2, width, col_stride, dtype=np.int64)
     rows = np.arange(row_stride // 2, height, row_stride, dtype=np.int64)
+    if mount.far_road_band_m is not None:
+        rows = np.union1d(rows, _far_road_rows(mount, focal, height))
     grid_rows, grid_cols = np.meshgrid(rows, cols, indexing="ij")
     flat_rows = grid_rows.reshape(-1)
     flat_cols = grid_cols.reshape(-1)

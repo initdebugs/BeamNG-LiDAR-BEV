@@ -58,6 +58,12 @@ class CameraMount:
     annotation images at. Per mount because rows are the RANGE axis for ground
     seen from a camera, and only the long-range windshield camera needs them
     fine (see config.CAMERA_SAMPLE_STRIDES)."""
+    far_road_band_m: tuple[float, float] | None = None
+    """Ground-range band (near, far) whose image rows are sampled at FULL
+    density regardless of the row stride -- the far-road densification,
+    front_main only. Requires a LEVEL optical axis (the row for ground at
+    range r is planar geometry, image y = h/r). See
+    config.CAMERA_FAR_ROAD_BAND_M."""
 
 
 @dataclass(frozen=True)

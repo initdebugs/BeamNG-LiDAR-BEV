@@ -376,6 +376,22 @@ CAMERA_SAMPLE_STRIDES = {
     "rear": (6, 4),
 }
 CAMERA_DEFAULT_SAMPLE_STRIDE = (6, 4)
+# The far-road row band, front_main only: every image row where LEVEL ground
+# from 20 to 100 m lands is sampled at full density, overriding the coarse
+# row stride there. Rows are the range axis and ring spacing goes as
+# (r^2/h) x row pitch, so stride-2 rows put rings 2.3 m apart at 40 m against
+# WORLD's 1.5 m road bridge -- the street oracle capture (2026-08-24,
+# tools/oracle_data/street.npz) measured the camera ground band ACCURATE to
+# -1..-2 cm against the LiDAR floor on every ring out to 60 m but STARVED
+# past 20 m (~175 returns per 4 m ring at 20-24 m against the road-scan
+# unit's ~1300, ~30 by 50 m): density, not accuracy, is the binder. The whole
+# 20-100 m band is ~54 rows just under the horizon (planar geometry,
+# image y = h/r), so full density there costs ~7k samples on a 283k lattice
+# and moves the single-frame road edge from ~30 m to ~45 m, where stride-1
+# rings outrun the bridge. Beyond that, accumulation while driving fills the
+# road exactly as it did for the pre-road-scan LiDAR rig.
+CAMERA_FAR_ROAD_BAND_M = (20.0, 100.0)
+CAMERA_FAR_ROAD_ROW_STRIDE = 1
 # Depth decodes as raw float32 x far plane, in linear metres of PLANAR Z
 # (measured: 10 m read 9.65, 25 m -> 24.17, 50 m -> 49.51). Sky and anything
 # past the far plane come back AT the far plane, so a sample within this
@@ -386,16 +402,18 @@ CAMERA_DEPTH_FAR_FRACTION = 0.98
 # A sample nearer than this is bodywork or the lens's own housing (the bumper
 # camera sees bonnet; the repeaters see the fender) and never a return.
 CAMERA_DEPTH_MIN_M = 0.30
-# The fixed part of each camera frame's age: the simulator stages frames "a
-# frame or two" behind with no timestamp, and the worker can only measure the
-# part AFTER the buffer changed (the digest age). UNMEASURED as of 2026-08-23
-# and therefore zero -- roadmap phase 2's ego-motion milestone is the
-# measurement, and tools/camera_staging_probe.py is how it is taken (it needs
-# the simulator window VISIBLE: covered, the renderer throttles to ~2 Hz and
-# every latency reads as ~700 ms). Points are placed from the pose the car had
-# `age` ago; at the 40 km/h cap an unmodelled 60 ms is 0.66 m, in the late
-# direction for AEB -- and in a turn, every unmodelled millisecond rotates the
-# cloud about the car before it is stamped into the world stores.
+# The fixed part of each camera frame's age: the simulator stages frames with
+# no timestamp, and the worker can only measure the part AFTER the buffer
+# changed (the digest age). MEASURED ~= 0 on 2026-08-24, two independent ways
+# -- tools/camera_staging_probe.py (a swung camera's buffer follows within
+# 5-8 ms, which frames staged 1-2 behind could never do) and
+# tools/ghosting_probe.py's fence-run regression (+32 +/- 17 ms of total
+# speed-scaled age error, of which the probe's own detection latency predicts
+# ~17-20) -- so zero is a measured value, not a default. Points are placed
+# from the pose the car had `age` ago; at the 40 km/h cap an unmodelled 60 ms
+# would be 0.66 m, in the late direction for AEB -- and in a turn, every
+# unmodelled millisecond rotates the cloud about the car before it is stamped
+# into the world stores.
 CAMERA_FRAME_STAGING_S = 0.0
 # Whether self-driving, both AEBs and parking may engage on the unprojected
 # camera cloud. OFF until the phase-2 live checklist has been run: the bands

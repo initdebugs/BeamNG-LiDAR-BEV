@@ -474,3 +474,69 @@ def test_the_rear_camera_reaches_the_ground_close_behind_the_bumper() -> None:
     )
     behind_lens = -(points[:, 1] - _level_state()["pos"][1]) - rear.position_vehicle[1]
     assert behind_lens.min() < 1.0, behind_lens.min()
+
+
+def test_the_far_road_band_rows_are_sampled_at_full_density() -> None:
+    """
+    The street oracle capture (2026-08-24) measured the camera ground band
+    ACCURATE to -1..-2 cm against the LiDAR floor on every ring out to 60 m
+    but STARVED past 20 m: ~175 returns per 4 m ring at 20-24 m against the
+    road-scan unit's ~1300, because rows are the range axis and stride-2
+    rows land rings 2.3 m apart at 40 m against WORLD's 1.5 m road bridge.
+    All ground from 20 to 100 m lives in a ~54-row band just under the
+    horizon (planar geometry, image y = h/r), so that band is sampled at
+    full density: consecutive rings must stay inside the bridge out to
+    40 m, which is what moves the single-frame road edge from ~30 to ~45 m.
+    """
+    import numpy as np
+
+    from beamng_lidar_bev.config import (
+        WORLD_CELL_SIZE_M,
+        WORLD_ROAD_BRIDGE_CELLS,
+    )
+    from beamng_lidar_bev.geometry import camera_vertical_fov_deg
+    from beamng_lidar_bev.models import CameraMount
+    from beamng_lidar_bev.unprojection import (
+        build_camera_rays,
+        focal_length_px,
+    )
+
+    eye = 1.3
+    resolution = (960, 720)
+
+    def make(band):
+        return CameraMount(
+            name="front_main",
+            position_vehicle=(0.0, -1.0, eye),
+            direction_vehicle=(0.0, -1.0, 0.0),
+            horizontal_fov_deg=50.0,
+            vertical_fov_deg=camera_vertical_fov_deg(50.0, resolution),
+            resolution=resolution,
+            sample_stride=(4, 2),
+            far_road_band_m=band,
+        )
+
+    rays = build_camera_rays(make((20.0, 100.0)))
+    rows = np.unique(rays.pixel_index // resolution[0])
+    focal = focal_length_px(50.0, resolution[0])
+    centre = resolution[1] / 2.0 - 0.5
+    in_band = rows[
+        (rows >= centre + eye / 100.0 * focal)
+        & (rows <= centre + eye / 20.0 * focal)
+    ]
+    assert len(in_band) >= 40
+    assert np.all(np.diff(in_band) == 1), "the band is full density"
+
+    # The rings those rows lay on level ground: every gap out to 40 m must
+    # stay inside the road bridge or the far road still fragments.
+    ranges = np.sort(eye * focal / (in_band + 0.5 - resolution[1] / 2.0))
+    gaps = np.diff(ranges)
+    bridge_m = WORLD_CELL_SIZE_M * WORLD_ROAD_BRIDGE_CELLS
+    assert gaps[ranges[:-1] <= 40.0].max() < bridge_m
+
+    # A mount with no band keeps the plain strided lattice bit for bit.
+    plain = build_camera_rays(make(None))
+    assert np.array_equal(
+        np.unique(plain.pixel_index // resolution[0]),
+        np.arange(1, resolution[1], 2),
+    )
