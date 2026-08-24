@@ -78,7 +78,7 @@ Rectangle {
             clipNear: 0.1
             // Must clear WORLD_RADIUS_M plus the trailing camera distance, or
             // the far field is clipped away exactly where the scene is trying
-            // to show reach. 150 m of scene, up to 66 m of chase distance.
+            // to show reach. 190 m of scene, up to 66 m of chase distance.
             clipFar: 420
 
             Behavior on x { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }

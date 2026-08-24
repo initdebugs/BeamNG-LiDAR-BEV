@@ -1331,9 +1331,14 @@ every large surface is a `NoLighting` material and those skip the lighting path 
 `receivesShadows: true` on the road mesh is a no-op.
 
 **There are THREE radii, because structure, road and open ground are not observable to the same
-distance.** `WORLD_RADIUS_M` is 150 m and covers structure, traffic and actors: the front
-unit reaches 200 m, a wall is a big vertical target, and azimuth spacing (which grows only as
-`r`) still puts several returns on a building at 150 m. `WORLD_ROAD_RADIUS_M` is 100 m and covers
+distance.** `WORLD_RADIUS_M` is **190 m** — the merged cloud's own cull, `LIDAR_RANGE_M`
+(2026-08-24) — and covers structure, traffic and actors: the front unit reaches 200 m, a wall is
+a big vertical target, and azimuth spacing (which grows only as `r`) still puts several returns
+on a building out there. It was 150 m, which threw away the outer 40 m of the only unit that
+reaches that far; nothing beyond the cull exists downstream, so matching it is the ceiling. Only
+the front wedge sees past `LIDAR_MAX_DISTANCE_M` (120 m) at all, so the gain is forward
+structure specifically, and the QML camera's `clipFar` (420) must keep clearing this plus the
+chase distance. `WORLD_ROAD_RADIUS_M` is 100 m and covers
 the ground, and since 2026-08-10 the ground is TWO instruments: the roof unit owns the near bowl
 and the terrain (6–55 m annulus, all around), and the **road-scan unit** owns the far road (20–
 100 m annulus through an 80° forward wedge — rings 0.20 m at 50 m and 0.78 m at 100, single-frame
@@ -2908,7 +2913,7 @@ The parking constants have the same "looks like one quantity, is two" trap:
 The WORLD constants have a trap of their own: **several of them are sized by the SENSOR and one
 is sized by the RENDERER, and it is no longer the renderer that binds.**
 
-- `WORLD_RADIUS_M` (150) vs `WORLD_ROAD_RADIUS_M` (100) vs `WORLD_SURFACE_RADIUS_M` (40) are three
+- `WORLD_RADIUS_M` (190) vs `WORLD_ROAD_RADIUS_M` (100) vs `WORLD_SURFACE_RADIUS_M` (55) are three
   different questions — how far STRUCTURE is observable, how far the ROAD is, and how far OPEN
   GROUND is. Collapsing any pair either shreds a surface into rings or throws away the reach. The
   road outreaches the terrain because it is driven along and accumulation fills it in; the terrain

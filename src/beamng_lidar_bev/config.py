@@ -411,9 +411,19 @@ WORLD_STORE_REFRESH_INTERVAL_S = 0.12
 #
 # STRUCTURE is observable a long way out. The front unit reaches 200 m, a wall
 # is a big vertical target, and azimuth spacing (which goes as r) still puts
-# several returns on a building at 150 m. Drawing it is what makes the view feel
-# like it can see, and it is the half the driver actually reads at speed.
-WORLD_RADIUS_M = 150.0
+# several returns on a building at that range. Drawing it is what makes the view
+# feel like it can see, and it is the half the driver actually reads at speed.
+#
+# Set to the CULL (LIDAR_RANGE_M, 2026-08-24), so the view draws everything the
+# merged cloud can contain rather than discarding the outer 40 m of the front
+# unit's reach. Note only the front wedge reaches past ~120 m at all (the side
+# and rear units stop at LIDAR_MAX_DISTANCE_M), so what this buys is forward
+# structure specifically. Two things move with it: the QML camera's clipFar,
+# which must clear this plus the chase distance, and the voxel store, whose
+# radius cull now admits 1.6x the area -- WORLD_COLUMN_MEMORY_M (90 m of
+# travel) is still the binding window behind the car, but a long straight
+# approach can now hold more, so watch WORLD_MAX_COLUMNS and SCENE BUILD.
+WORLD_RADIUS_M = 190.0
 # The ROAD SURFACE is not, and the bound is the sampling, not taste. Ahead,
 # the ROAD unit's 20-100 m annulus puts rings 0.78 m apart at 100 m and its
 # 80 deg wedge keeps azimuth stripes inside the 1.5 m bridge, so the road in
