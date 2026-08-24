@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from hashlib import blake2b
 from types import SimpleNamespace
 
 import numpy as np
@@ -281,6 +282,12 @@ class StreamingCameraStub:
         raise AssertionError(
             "The display loop must not issue blocking camera polls"
         )
+
+
+class ExplodingCameraStub(StreamingCameraStub):
+    def stream_raw(self) -> dict[str, bytes]:
+        self.stream_raw_calls += 1
+        raise RuntimeError("camera gone")
 
 
 class RemovableCameraStub(StreamingCameraStub):
@@ -831,6 +838,38 @@ class VehicleStub:
         del names
 
 
+class HybridLidarStub:
+    def __init__(self, x: float) -> None:
+        self.x = x
+        self.stream_calls = 0
+
+    def stream(self) -> dict[str, np.ndarray]:
+        self.stream_calls += 1
+        return {
+            "pointCloud": np.asarray(((self.x, 12.0, 3.0),), dtype=np.float32),
+            "colours": np.asarray(((255, 0, 0),), dtype=np.uint8),
+        }
+
+
+def _armed_hybrid_tick_worker(
+    cameras: list[StreamingCameraStub],
+) -> tuple[BeamNgWorker, list[HybridLidarStub]]:
+    lidars = [HybridLidarStub(float(index)) for index in range(6)]
+    worker = BeamNgWorker()
+    worker._sensor_mode = SENSOR_MODE_HYBRID
+    worker._bng = object()  # type: ignore[assignment]
+    worker._vehicle = VehicleStub()  # type: ignore[assignment]
+    worker._sensors = lidars  # type: ignore[assignment]
+    worker._sensor_names = [f"lidar_{index}" for index in range(6)]
+    worker._hybrid_cameras = cameras  # type: ignore[assignment]
+    worker._hybrid_camera_names = list(HYBRID_CAMERA_NAMES)
+    worker._geometry = _geometry()
+    worker._palette = SemanticPalette.from_annotations(
+        {"STREET": (255, 0, 0), "CAR": (0, 255, 0)}
+    )
+    return worker, lidars
+
+
 def _armed_vision_worker(
     cameras: list[StreamingCameraStub],
 ) -> tuple[BeamNgWorker, list[VisionFrame]]:
@@ -880,6 +919,145 @@ def test_a_vision_tick_streams_every_camera_and_emits_both_frames() -> None:
     bev = bev_frames[0]
     assert bev.raw_point_count == 8 * 4 * 3
     assert bev.speed_mps == pytest.approx(5.0)
+
+
+def test_hybrid_tick_emits_camera_feed_but_only_lidar_perception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cameras = [
+        StreamingCameraStub(depth_m=1.0, annotation=(0, 255, 0)),
+        StreamingCameraStub(depth_m=250.0, annotation=(0, 255, 0)),
+    ]
+    worker, lidars = _armed_hybrid_tick_worker(cameras)
+    # The RGB buffers are deliberately unchanged: LiDAR freshness must still
+    # advance HYBRID's acquisition clock.
+    unchanged = blake2b(bytes([17]) * (4 * 3 * 4), digest_size=16).digest()
+    worker._hybrid_camera_digests = {
+        name: unchanged for name in HYBRID_CAMERA_NAMES
+    }
+    bev_frames: list[BevFrame] = []
+    vision_frames: list[VisionFrame] = []
+    snapshots: list[object] = []
+    extraction_inputs: list[tuple[np.ndarray, np.ndarray]] = []
+    planning_inputs: list[np.ndarray] = []
+    aeb_inputs: list[np.ndarray] = []
+    parking_inputs: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    planner_band = np.asarray(((2.0, 9.0),), dtype=np.float32)
+    aeb_band = np.asarray(((-2.0, 11.0),), dtype=np.float32)
+
+    def capture_extraction(
+        bev: np.ndarray,
+        heights: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        del args, kwargs
+        extraction_inputs.append((bev.copy(), heights.copy()))
+        return planner_band, aeb_band
+
+    def capture_plan(
+        state: dict[str, object],
+        obstacles: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        del state, args, kwargs
+        planning_inputs.append(obstacles)
+
+    def capture_aeb(
+        system: object,
+        obstacles: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        del system, args, kwargs
+        aeb_inputs.append(obstacles)
+
+    def capture_parking(
+        state: dict[str, object],
+        bev: np.ndarray,
+        heights: np.ndarray,
+        materials: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[()]:
+        del state, args, kwargs
+        parking_inputs.append((bev.copy(), heights.copy(), materials.copy()))
+        return ()
+
+    monkeypatch.setattr(worker_module, "geometric_obstacle_sets", capture_extraction)
+    worker._compute_plan = capture_plan  # type: ignore[method-assign]
+    worker._compute_aeb = capture_aeb  # type: ignore[method-assign]
+    worker._scan_for_parking = capture_parking  # type: ignore[method-assign]
+    worker._self_driving = True
+    worker._aeb_enabled = True
+    worker._parking_scan = True
+    worker.frame_ready.connect(bev_frames.append)
+    worker.vision_frame_ready.connect(vision_frames.append)
+    worker.perception_ready.connect(snapshots.append)
+
+    worker._poll_once()
+
+    expected_world = np.asarray(
+        [(float(index), 12.0, 3.0) for index in range(6)], dtype=np.float32
+    )
+    expected_bev = np.column_stack(
+        (np.arange(-1.0, 5.0, dtype=np.float32), np.full(6, 10.0, np.float32))
+    )
+    assert [lidar.stream_calls for lidar in lidars] == [1] * 6
+    assert [camera.stream_raw_calls for camera in cameras] == [1, 1]
+    assert len(worker._frame_times) == 1
+    assert len(bev_frames) == len(vision_frames) == len(snapshots) == 1
+    assert bev_frames[0].raw_point_count == 6
+    assert np.array_equal(bev_frames[0].road_points, expected_bev)
+    assert bev_frames[0].obstacle_points.shape == (0, 2)
+    assert np.array_equal(snapshots[0].points_world, expected_world)
+    assert np.array_equal(snapshots[0].semantic_groups, np.zeros(6, np.uint8))
+    assert np.array_equal(snapshots[0].surface_materials, np.ones(6, np.uint8))
+    assert [image.name for image in vision_frames[0].images] == list(
+        HYBRID_CAMERA_NAMES
+    )
+    assert np.array_equal(extraction_inputs[0][0], expected_bev)
+    assert np.array_equal(extraction_inputs[0][1], np.zeros(6, np.float32))
+    assert planning_inputs == [planner_band]
+    assert aeb_inputs == [aeb_band]
+    assert np.array_equal(parking_inputs[0][0], expected_bev)
+    assert np.array_equal(parking_inputs[0][1], np.zeros(6, np.float32))
+    assert np.array_equal(parking_inputs[0][2], np.ones(6, np.uint8))
+
+
+def test_hybrid_tick_contains_one_camera_failure_beside_lidar_frames() -> None:
+    cameras = [ExplodingCameraStub(), StreamingCameraStub()]
+    worker, lidars = _armed_hybrid_tick_worker(cameras)
+    worker._first_failure_at = 0.0
+    bev_frames: list[BevFrame] = []
+    vision_frames: list[VisionFrame] = []
+    snapshots: list[object] = []
+    stopped: list[None] = []
+    fatals: list[str] = []
+    worker.frame_ready.connect(bev_frames.append)
+    worker.vision_frame_ready.connect(vision_frames.append)
+    worker.perception_ready.connect(snapshots.append)
+    worker.sensors_stopped.connect(lambda: stopped.append(None))
+    worker.fatal_error.connect(fatals.append)
+
+    worker._poll_once()
+
+    assert [lidar.stream_calls for lidar in lidars] == [1] * 6
+    assert [camera.stream_raw_calls for camera in cameras] == [1, 1]
+    assert len(bev_frames) == len(vision_frames) == len(snapshots) == 1
+    assert bev_frames[0].raw_point_count == 6
+    assert snapshots[0].points_world.shape == (6, 3)
+    assert [image.name for image in vision_frames[0].images] == [
+        "a_pillar_right"
+    ]
+    assert worker._poll_failures == 0
+    assert worker._first_failure_at is None
+    assert worker._bng is not None
+    assert worker._sensors == lidars
+    assert worker._hybrid_cameras == cameras
+    assert stopped == []
+    assert fatals == []
 
 
 def test_the_unprojected_cloud_lands_where_the_depth_says_and_is_classified() -> None:

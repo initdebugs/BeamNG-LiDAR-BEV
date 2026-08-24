@@ -1426,6 +1426,7 @@ class BeamNgWorker(QObject):
             return
 
         vision = self._sensor_mode == SENSOR_MODE_VISION
+        hybrid = self._sensor_mode == SENSOR_MODE_HYBRID
         started = time.perf_counter()
         geometry = self._geometry
         road_points = _EMPTY_BEV
@@ -1463,6 +1464,10 @@ class BeamNgWorker(QObject):
                 )
             else:
                 point_chunks, colour_chunks = self._acquire_lidar_cloud(state)
+                if hybrid:
+                    vision_images, _camera_fresh = (
+                        self._acquire_hybrid_camera_images(started)
+                    )
                 fresh = bool(point_chunks)
 
             if point_chunks:
@@ -1858,7 +1863,7 @@ class BeamNgWorker(QObject):
             self._poll_failures = 0
             self._first_failure_at = None
             self.frame_ready.emit(frame)
-            if vision:
+            if vision or hybrid:
                 # The camera grid keeps its own frame beside the BEV one: the
                 # images are what the CAMERAS view draws, and the metrics it
                 # used to carry now ride on the BevFrame like everything else.
