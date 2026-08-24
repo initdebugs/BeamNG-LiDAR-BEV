@@ -404,18 +404,46 @@ carrying that frame's metrics. Five things are load-bearing:
   mirrored, negate `right` in `camera_basis` and nowhere else.
 - **Each camera's cloud is placed from the pose the car had when its frame
   changed** (`pose_from_state(state, age)`, velocity × age rewound). The
-  simulator stamps nothing and stages frames "a frame or two" behind; the
-  worker can measure only the part after the buffer changed, and
-  `CAMERA_FRAME_STAGING_S` (zero, UNMEASURED) is the fixed remainder. A
-  lockstep capture has no skew, so a live run that disagrees with the oracle
-  by a range-dependent amount is measuring that constant. Unmodelled, 60 ms
-  at the 40 km/h cap is 0.66 m in the LATE direction for AEB.
+  simulator stamps nothing; the worker can measure only the part after the
+  buffer changed, and `CAMERA_FRAME_STAGING_S` (zero) is the fixed
+  remainder. The 2026-08-24 staging-probe run bounded it WELL UNDER one
+  camera period (a swung probe camera's buffer followed within 5–8 ms,
+  which frames staged 1–2 behind could never do; the stepped count, 3–4 sim
+  steps, is the camera's own 0.05 s update period in steps, so that
+  instrument measures period + staging and cannot isolate staging). The
+  moving case then MEASURED it, same day (`tools/ghosting_probe.py`, a
+  drive at a fence): regressing the tracked structure's normal offset
+  against the speed the car crossed it at gave **+32 ± 17 ms of total
+  age error, of which the probe's own detection latency predicts
+  ~17–20 — staging ≈ 0**, two independent instruments agreeing, so 0.0
+  is a measured value now. (A lockstep capture has no skew to reveal, so
+  the oracle cannot measure it; and a naive offset-over-speed conflates
+  any static offset of the tracked structure into fake milliseconds —
+  the regression against crossing speed is what separates them.) What
+  remains of the ghost clutter is the ONE-TICK DETECTION JITTER — the
+  digest sees a frame change only on the 40 ms tick, ±0.2 m per frame at
+  the cap — plus torn depth reads; the seen-time centring (a fresh frame
+  is stamped at the MIDPOINT of the last two looks, `_camera_frame_
+  checked`) landed 2026-08-24 and removes the mean half-tick of that,
+  leaving the residual jitter for the acceptance re-drive to judge.
+  The probe's STATIONARY case is measured (2026-08-24):
+  three cameras on one pole agree to ±1.5 cm with a 1.0x ghost-column
+  ratio, so the live "multiple poles" clutter report is motion
+  registration, not rig geometry — see the roadmap's ghosting milestones.
 - **The lattice is the ONLY thing that sets the cloud's size**, per camera
   `(column, row)` strides on `CameraMount.sample_stride` from
   `CAMERA_SAMPLE_STRIDES`. Rows are the RANGE axis for ground seen from a
   camera — `(r²/h)·Δθ` with the row stride as the channel pitch, the LiDAR
   ring arithmetic again — so `front_main` keeps the finest row stride (2) and
-  the rest are coarser. 283k lattice samples at 960×720, roughly half sky;
+  the rest are coarser. Since 2026-08-24 front_main additionally samples its
+  FAR-ROAD BAND at full density (`CAMERA_FAR_ROAD_BAND_M`,
+  `CameraMount.far_road_band_m`): all level ground from 20–100 m lives in
+  ~54 rows just under the horizon (image y = h/r, level axis required — the
+  builder raises on a pitched camera), so stride 1 there is ~7k samples and
+  moves the single-frame road edge from ~30 m to ~45 m. The street oracle
+  capture forced it: the band was accurate to −1…−2 cm out to 60 m and
+  starved past 20 m — density, not accuracy, was the binder.
+  283k lattice samples at 960×720, roughly half sky;
   `test_the_rig_sample_budget_is_bounded` holds it in 150–320k so a stride
   edit cannot blow the tick silently. Measured: 5.5 ms per tick for the whole
   rig's unprojection (12.6 before going float32 end to end and gathering the
@@ -498,21 +526,32 @@ dropped — the cameras see low branches the rings miss. The far road could
 not be judged on that scene (things at 10–15 m ahead); the ground-band reach
 past 25 m wants a street capture.
 
+**Done since (2026-08-24):** the STREET oracle capture
+(`tools/oracle_data/street.npz`) — the camera ground band agrees with the
+LiDAR floor to −1…−2 cm on EVERY ring out to 60 m, but starves past 20 m
+(~175 returns per 4 m ring at 20–24 m against the road-scan unit's ~1300),
+which is what `CAMERA_FAR_ROAD_BAND_M` answers: front_main samples the
+~54-row strip where 20–100 m of level ground lands at full density (~7k
+samples), moving the single-frame road edge from ~30 m to ~45 m. And
+milestone 4: staging measured ≈ 0 (see `CAMERA_FRAME_STAGING_S`), the
+seen-time centring landed, the stationary ghosting case measured clean
+(±1.5 cm cross-camera, 1.0x ghost columns).
+
 **Live checklist still open for this rung:** the `Unprojection check:` line
-on a vision attach in the APP, with every camera delivering and the total in
-the 100–150k band; the oracle capture on a STREET with a kerb and a clear road
-ahead (ground bias per ring out to 60 m; planner/AEB cells only one rig
-produces, listed by range); RAW BEV and WORLD on the camera rig reading like
-the LiDAR's in character — road surface filling, kerbs as a line, walls as
-slabs — with SCENE BUILD not logging over budget; the `Marking check:` line on
-a marked road; the rear camera's tiles showing ground just behind the bumper;
-a mode switch mid-stream both ways still clean; and then milestone 4 (the
-staging measurement: a live drive's cloud against a lockstep one) before
-milestone 5 (flip `VISION_DRIVING_ENABLED` and re-run the whole AEB phantom
-checklist — hills, brake dive, bushes, kerbs, reverse — plus the tree case
-above). `vehicle_fit` still clusters in the LiDAR's polar lattice and will
-behave differently on the denser camera cloud; that re-derivation is spec §4's
-and is not done.
+on a vision attach in the APP, with every camera delivering; RAW BEV and
+WORLD on the camera rig reading like the LiDAR's in character — road surface
+filling (to ~45 m single-frame now, the far-road band's live check), kerbs
+as a line, walls as slabs — with SCENE BUILD not logging over budget; the
+ghosting acceptance re-drive (one pole laid down ONCE at speed; "a lot
+better, still some hiccups" on the first look — the torn-read question is
+next if the residual still smears); the `Marking check:` line on a marked
+road; the rear camera's tiles showing ground just behind the bumper; a mode
+switch mid-stream both ways still clean; then milestone 5 (flip
+`VISION_DRIVING_ENABLED` and re-run the whole AEB phantom checklist — hills,
+brake dive, bushes, kerbs, reverse — plus the tree case above).
+`vehicle_fit` still clusters in the LiDAR's polar lattice and will behave
+differently on the denser camera cloud; that re-derivation is spec §4's and
+is not done.
 
 ### Frame pipeline
 

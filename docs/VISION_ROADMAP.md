@@ -223,7 +223,7 @@ Milestones, in order:
         behind-left enters the planner band from `repeater_left` (554
         returns at 1.8–6.6 m) where the LiDAR's 61 canopy returns were
         dropped — the cameras see low branches the rings miss.
-- [~] Per-camera ego-motion compensation measured and applied (frames are
+- [x] Per-camera ego-motion compensation measured and applied (frames are
       staged ~1–2 frames apart; ~1.9 m at speed). The measurable half — the
       time since each camera's depth lattice last changed — is applied per
       camera, position AND heading (`pose_from_state(state, age, yaw_rate)`;
@@ -232,7 +232,168 @@ Milestones, in order:
       until measured; `tools/camera_staging_probe.py` measures it (swing a
       probe camera, count stepped frames until the buffer follows) and
       REFUSES while the simulator window is covered — in that state the
-      renderer throttles to ~2 Hz and every latency reads as throttle.
+      renderer throttles to ~2 Hz and every latency reads as throttle. The
+      probe now also refuses to recommend a global constant unless four
+      stepped trials and four real-time trials are stable and agree within
+      one camera frame; contradictory timing evidence leaves the constant
+      untouched.
+
+      **Run 2026-08-24, and the refusal rule fired correctly.** Stepped:
+      3, 4, 4, 3 sim steps — which is the camera's own 0.05 s update
+      period expressed in steps, so the stepped instrument measures
+      period + staging and bounds staging at ≤ ~1 step, it cannot isolate
+      it. Real time: 5, 8, 106, 100 ms — bimodal, which is the swing
+      landing at a random phase of the 50 ms camera cycle, not noise; the
+      5–8 ms responses are the strong half of the evidence, because a
+      buffer staged 1–2 frames behind can never follow a swing within
+      8 ms. Conclusion: staging on 0.39.4 is bounded well under one
+      camera period; `CAMERA_FRAME_STAGING_S` stays 0.0 for now, and the
+      DEFINITIVE instrument is the ghosting probe's moving case below —
+      a systematic per-camera along-travel offset at speed IS
+      staging × speed, measured on the thing the constant exists to fix.
+
+      **And it was, the same day (the fence run under the ghosting
+      milestone): +32 ± 17 ms of total speed-scaled age error, of which
+      the probe's own detection latency predicts ~17–20 — staging ≈ 0,
+      two independent instruments agreeing. `CAMERA_FRAME_STAGING_S`
+      stays 0.0 as a MEASURED value, closing this milestone.**
+- [ ] WORLD ghosting from MOTION registration error — reported live
+      2026-08-24 as one pole drawn several times near the same spot, and as
+      the vision scene reading cluttered and less crisp than the LiDAR's.
+      LiDAR points arrive from the engine already world-registered, so the
+      90 m scenery memory only ever sharpens them; camera points are
+      reconstructed against an ESTIMATED pose, and every pose error paints
+      a displaced copy that the store then faithfully keeps. Three
+      mechanisms, sized at the 40 km/h cap:
+      - the unmeasured `CAMERA_FRAME_STAGING_S` (1–2 frames ≈ 60–120 ms)
+        misplaces every moving capture by 0.7–1.3 m along the direction of
+        travel — the staging milestone above removes this one, which is
+        why it comes first;
+      - the freshness digest sees a frame change only on the 40 ms tick,
+        and the beat between that tick and the ~57 ms camera period sweeps
+        the detection latency over 0–40 ms: up to 0.44 m of frame-to-frame
+        jitter that no constant can remove;
+      - a depth read overlapping the simulator's write mixes two frames
+        ~57 ms apart along one row boundary (depth is deliberately not
+        copied), splitting one object by ~0.6 m inside a single frame.
+      Candidate mitigations — ingesting into the WORLD stores only on
+      fresh-frame ticks, copying or tear-detecting depth, a shorter
+      scenery memory in vision mode — are chosen from the RESIDUAL measured
+      after the staging constant lands, never from appearance.
+      Discriminators that cost nothing: RAW BEV draws one pole (no
+      accumulation), and a pole observed from a standstill stays single —
+      every mechanism above is motion × time.
+- [ ] Cross-camera spatial fusion and WORLD ghosting validation. The eight
+      overlapping camera clouds are concatenated before the shared semantic
+      and WORLD pipeline, so observations of one narrow static object can
+      occupy adjacent 0.125 m columns and the 90 m scenery memory can preserve
+      offset copies. Measure disagreement before choosing a fusion radius —
+      nearby real objects must never be merged just to make the view cleaner.
+      Acceptance has two live cases on the same isolated pole or bollard:
+      **stationary**, every camera overlap resolves to one connected structure;
+      **moving turn**, repeated observations leave no persistent parallel copy
+      after the pole has crossed an overlap seam. Capture per-camera point
+      provenance and report lateral/radial spread for both cases so any later
+      deduplication threshold is derived from evidence rather than appearance.
+
+      `tools/ghosting_probe.py` is the instrument (auto-picks the nearest
+      narrow tall isolated structure, or `--target X Y`; culls each
+      camera's cloud to a cylinder around it with per-camera/per-tick
+      provenance; reports along/cross centroid offsets, per-tick jitter,
+      and the ghost-column ratio — distinct 0.125 m columns painted over
+      the capture against one tick's worth, the store's-eye view of the
+      smear). **The STATIONARY half is measured (2026-08-24**, a 3.5 m
+      pole 18.8 m away, 186 ticks): three cameras on the structure agree
+      to **±1.5 cm** — a tenth of a voxel column — tick jitter ≤ 19 mm,
+      ghost ratio **1.0x**. A parked rig resolves ONE structure, so the
+      multi-pole clutter is motion registration, not rig geometry. The
+      report separates the structure from the ground inside the cylinder,
+      because a camera whose frame misses the object still lands road
+      returns there (front_main's whole contribution was a 3 cm slice of
+      tarmac that read as a 1.26 m offset until split out).
+
+      **The first MOVING run (2026-08-24, a drive-by at ~40 km/h) caught
+      the instrument, not the answer, and taught it three things.** The
+      only returns in the cylinder were a planter kerb ~1 m from the pole,
+      whose VISIBLE WINDOW slides with the car (per-frame offsets marched
+      −0.43 → +1.20 m in lockstep with the ego — 1.66 m of frame spread
+      against a 0.25 m physical jitter bound of v × one loop tick), and
+      the pole itself gave zero moving returns — either the coarse column
+      strides miss a thin post beyond ~10 m (repeaters sample every 0.56°)
+      or its copies were displaced outside the 1.5 m cylinder, which the
+      capture culled and so could not distinguish. The probe now measures
+      offsets from the target's REST position (its own parked first frame;
+      pooled-centre offsets subtract away exactly the common bias when one
+      camera contributes), groups by camera FRAME rather than tick, warns
+      when the tracked returns exceed the jitter bound (the slide
+      signature), and defaults the moving cylinder to 3.5 m. What the run
+      DID establish: the stale-frame pose rewind is sound (within-frame
+      drift 0.05 m over 66 ms at 7 m/s), and with both rigs attached the
+      cameras delivered at ~10 Hz, not 17.5 — ages reach ~100 ms, so
+      age-dependent error is roughly twice the single-rig arithmetic.
+      **The second MOVING run (2026-08-24, `--ahead` at a fence) closed
+      the staging question, after one more instrument confound.** The
+      tracked returns were again a LINE — a second structure ~2.3 m from
+      the picked face — and dividing its offset by the speed
+      manufactured +125…+475 ms of fake age error, because a static
+      offset does not scale with speed and a registration error does.
+      The report now separates them: it decomposes on the structure's
+      own NORMAL (the window slide lives entirely on the tangent —
+      nothing can slide a straight line through itself) and REGRESSES
+      per-frame normal offset against crossing speed. Result over 43
+      crossing frames: **static −2.33 m + 32 ± 17 ms × speed, residual
+      0.43 m rms**. The probe loop's own detection latency predicts a
+      ~17–20 ms mean (half its 34 ms tick), so staging ≈ 14 ± 17 ms —
+      zero, corroborating the swing probe. The ghost clutter therefore
+      has NO large constant behind it: what remains is the one-tick
+      detection jitter (the digest sees a frame change only on the
+      40 ms tick — up to ±0.2 m per frame at the 40 km/h cap) and the
+      torn depth reads. The evidence-backed first mitigation — SEEN-TIME
+      CENTRING, stamping a fresh frame at the MIDPOINT of the last two
+      looks (the true change time is uniform over the interval between
+      them, so the midpoint zeroes the mean error and halves the worst
+      case), worth ~20 of the ~32 ms — **LANDED the same day**: worker
+      (`_camera_frame_checked`, pinned by `test_a_fresh_frames_seen_
+      time_is_centred_between_the_last_two_looks`) and mirrored in the
+      probe, so future captures measure the residual the app actually
+      carries. Still open: the acceptance re-drive — one pole laid down
+      ONCE at speed in WORLD — and only if its residual still smears,
+      the torn-read question.
+- [~] The vision ground band's REACH is bounded by ROW sampling, and the
+      arithmetic puts the single-frame edge near 30 m — reported live
+      2026-08-24 as "less range than the LiDAR world". Rows are the range
+      axis and rings land `(r²/h)·Δθ` apart: from the 1.30 m eye at
+      front_main's row stride that is ~0.6 m at 20 m, ~1.3 m at 30 m and
+      ~2.3 m at 40 m — against the road-scan unit's 0.20 m at 50 m — and
+      `WORLD_ROAD_BRIDGE_CELLS` closes only 1.5 m, so the single-frame
+      camera road fragments past ~30 m (sooner on the coarser side and
+      rear strides), where the LiDAR rig carries a unit fitted to 20–100 m.
+      Accumulation fills it while DRIVING, exactly as the pre-road-scan
+      LiDAR road did. Measure on the street oracle capture first (the open
+      item above), then decide: a horizon-weighted row stride (finer rows
+      only where they map to 20 m+, paid for by coarsening the near
+      field), a ninth narrow far-road camera, or accepting accumulation.
+      Any stride change is bounded by the 150–320k sample-budget test.
+
+      **Measured 2026-08-24 (street capture,
+      `tools/oracle_data/street.npz`): the band is ACCURATE to −1…−2 cm
+      against the LiDAR floor on every ring out to 60 m — density, not
+      accuracy, is the binder — with ~175 returns per 4 m ring at
+      20–24 m against the road-scan unit's ~1300, thinning to ~30 by
+      50 m.** The decision fell to the horizon-weighted stride and it
+      LANDED the same day (`CAMERA_FAR_ROAD_BAND_M`,
+      `CameraMount.far_road_band_m`, `unprojection._far_road_rows`): all
+      level ground from 20 to 100 m lives in a ~54-row strip just under
+      front_main's horizon (planar geometry, image y = h/r; the builder
+      raises on a pitched camera), so that strip is sampled at stride
+      1 — ~7k samples on the 283k lattice — halving the far ring spacing
+      and moving the single-frame road edge from ~30 m to ~45 m, where
+      stride-1 rings outrun the 1.5 m bridge. Beyond ~45 m accumulation
+      while driving fills the road; a ninth camera or a taller front_main
+      resolution remain the levers if that is ever not enough. Pinned by
+      `test_the_far_road_band_rows_are_sampled_at_full_density`. Still
+      open: the live look — the vision WORLD's far road visibly filling
+      to ~45 m single-frame on a street.
 - [ ] Re-enable self-driving + AEB in Vision mode behind the full live
       checklist re-run — the sampling distribution is new, so the whole AEB
       phantom checklist applies (hills, brake dive, bushes, kerbs, reverse,
@@ -273,8 +434,11 @@ from the log and live probes; all fixes landed, none vision-specific:
   streaming.
 
 Still open from that session: the staging measurement itself (the probe
-needs the sim window focused), and a re-drive to confirm the turn artefact
-and the frame rate are gone.
+needs the sim window focused). The 2026-08-24 re-drive reported neither of
+the old complaints; what it reported instead — ghost copies of narrow
+objects, and shorter ground reach than the LiDAR view — is diagnosed and
+queued as the two milestones above (motion registration error, row-sampling
+reach).
 
 ## Phase 3 — Rung 1: stereo (3–6 weeks; RE-SHAPED by phase 1's verdict)
 
