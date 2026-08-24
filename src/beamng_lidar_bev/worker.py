@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 from collections import deque
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from dataclasses import replace
@@ -17,7 +18,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 
 if TYPE_CHECKING:
     from beamngpy import BeamNGpy, Vehicle
-    from beamngpy.sensors import Lidar
+    from beamngpy.sensors import Camera, Lidar
 
 from .aeb import (
     FORWARD,
@@ -42,11 +43,12 @@ from .config import (
     BEAMNG_HOME,
     BEAMNG_HOST,
     BEAMNG_PORT,
-    CAMERA_FRAME_STAGING_S,
     CAMERA_NEAR_FAR_PLANES,
-    CAMERA_UPDATE_TIME_S,
     CONTROL_INTERVAL_MS,
     DISPLAY_INTERVAL_MS,
+    HYBRID_CAMERA_AUTO_EXPOSURE,
+    HYBRID_CAMERA_MANUAL_EV,
+    HYBRID_CAMERA_UPDATE_TIME_S,
     LIDAR_RANGE_M,
     LIDAR_ROAD_VISUAL_COLOUR,
     LIDAR_UPDATE_HZ,
@@ -84,7 +86,6 @@ from .config import (
     STALL_SPEED_MPS,
     STEERING_SIGN,
     TRANSITION_DISTANCES_M,
-    VISION_DRIVING_ENABLED,
     WORLD_ACTOR_FADE_S,
     WORLD_ACTOR_REGISTRY_INTERVAL_S,
     WORLD_ACTOR_RETRY_S,
@@ -99,7 +100,7 @@ from .controller import (
     gear_is_engaged,
 )
 from .geometry import (
-    derive_camera_rig,
+    derive_hybrid_camera_rig,
     derive_vehicle_geometry,
     outside_ego_body,
     rotate_about_up,
@@ -172,12 +173,6 @@ from .semantics import (
     pack_rgb,
     pack_rgb_rows,
 )
-from .unprojection import (
-    CameraRays,
-    build_rig_rays,
-    pose_from_state,
-    unproject_frame,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -186,7 +181,7 @@ LOGGER = logging.getLogger(__name__)
 # sensor_mode_changed, and the mode only takes physical effect at attach (a
 # switch mid-stream re-attaches through the same single funnel).
 SENSOR_MODE_LIDAR = "LIDAR"
-SENSOR_MODE_VISION = "VISION"
+SENSOR_MODE_HYBRID = "HYBRID"
 
 UNKNOWN_SEMANTIC_RGB = np.asarray((1, 2, 3), dtype=np.uint8)
 _EMPTY_BEV = np.empty((0, 2), dtype=np.float32)
@@ -241,15 +236,25 @@ _MEMORY_LOG_INTERVAL_S = 5.0
 # -- a working rig producing black frames, which cost a full benchmark round
 # to diagnose live.
 _VISION_SILENCE_WARN_S = 5.0
-# Stride for the per-camera freshness digest, over the LATTICE indices the
-# unprojection gathers anyway. A prime, so the samples drift across the frame
-# instead of landing on one pixel column. It went 4093 -> 61 with rung 0.5:
-# at 4093 a small camera's digest was SEVEN depth samples, few enough to miss
-# real frame changes for seconds at a stretch -- and a missed change grows the
-# frame's measured age, which the pose rewind then multiplies by velocity, so
-# the whole camera's cloud slid backwards down the road. ~1.4k samples for the
-# largest camera now, a 6 KB gather against the 40 ms tick.
-_VISION_DIGEST_STRIDE = 61
+# How many bytes of a colour buffer the freshness test reads. A camera frame is
+# 4.9 MB at HYBRID_CAMERA_RESOLUTION and the tick re-reads it faster than the
+# camera updates, so digesting the whole thing cost a measured 9.8 ms of the
+# 40 ms tick for the pair -- ahead of _actuate, so it delayed every control and
+# AEB command. 64 KB spread evenly over the frame is ~1 in 75 pixels: far more
+# than enough to see a scene change, and a buffer smaller than the budget is
+# read whole, which keeps freshness exact where a test can check it.
+_CAMERA_DIGEST_BYTES = 65_536
+# The throwaway camera that measures where the simulator reads a vehicle-space
+# `pos` from (see _measure_sensor_origin). Nothing reads its pixels, so it is
+# as small as a camera can be and neither streams nor takes shared memory; the
+# long update time keeps it from ever costing the renderer a frame.
+_SENSOR_ORIGIN_PROBE_RESOLUTION = (16, 16)
+_SENSOR_ORIGIN_PROBE_UPDATE_S = 10.0
+# How far a mount may land from where it was asked before the Mount check line
+# escalates to a warning. Well under the body clearance, so a mount that ends
+# up inside the shell -- which is what an uncorrected sensor origin does to the
+# unit on the narrow side -- always trips it.
+_MOUNT_PLACEMENT_TOLERANCE_M = 0.03
 # How often a spawned-but-not-yet-connected simulator is checked for still
 # being alive. One second: this runs only between Launch and the bridge
 # opening, and each tick is a `poll()` plus, at most, one bounded socket probe.
@@ -343,19 +348,19 @@ class BeamNgWorker(QObject):
         # update, and counting re-reads would report the tick rate as the
         # acquisition rate.
         self._sensor_mode = SENSOR_MODE_LIDAR
-        self._camera_digests: dict[str, bytes] = {}
+        # HYBRID owns its RGB-only cameras separately: the LiDAR list remains
+        # the six-mount cloud source in its existing order.
+        self._hybrid_cameras: list[Camera] = []
+        self._hybrid_camera_names: list[str] = []
+        self._hybrid_camera_digests: dict[str, bytes] = {}
+        self._hybrid_camera_failures: set[str] = set()
+        # The last colour frame each camera delivered, so a tick on which a
+        # camera has not refreshed re-shows what it last sent rather than
+        # dropping the tile out of the grid.
+        self._hybrid_camera_frames: dict[str, np.ndarray] = {}
         self._vision_streaming_since: float | None = None
         self._logged_vision_check = False
         self._logged_vision_silence = False
-        # Rung 0.5: the per-camera ray tables, built once at attach, and when
-        # each camera's depth buffer was last seen to CHANGE -- the only part
-        # of a frame's age the worker can measure, since the simulator stamps
-        # nothing. The eye height is the tallest camera's, for porosity.
-        self._camera_rays: dict[str, CameraRays] = {}
-        self._camera_frame_seen: dict[str, float] = {}
-        self._camera_frame_checked: dict[str, float] = {}
-        self._vision_eye_height_m = 0.0
-        self._logged_unprojection = False
         self._frame_times: deque[float] = deque(maxlen=60)
         self._poll_failures = 0
         self._first_failure_at: float | None = None
@@ -686,7 +691,12 @@ class BeamNgWorker(QObject):
             self._vehicle_model = str(getattr(vehicle, "model", "") or "")
             self._attach_electrics(vehicle)
             state = self._get_vehicle_state()
-            geometry = derive_vehicle_geometry(state, vehicle.get_bbox())
+            # Before the geometry, because it is what every mount built from a
+            # body face is expressed in -- see _measure_sensor_origin.
+            sensor_origin = self._measure_sensor_origin(vehicle, state)
+            geometry = derive_vehicle_geometry(
+                state, vehicle.get_bbox(), sensor_origin=sensor_origin
+            )
             self._log_vehicle_check(geometry)
 
             sensor_prefix = f"bev_{os.getpid()}_{int(time.monotonic() * 1000)}"
@@ -709,28 +719,10 @@ class BeamNgWorker(QObject):
                 in (MARKING_CLASSES | {"DRIVING_INSTRUCTIONS", "SPEED_BUMP"})
             }
 
-            if self._sensor_mode == SENSOR_MODE_VISION:
-                # Rung 0.5 of the vision ladder: every camera renders depth
-                # and annotation beside colour, and the tick unprojects them
-                # into the same cloud the LiDAR set produces.
-                mount_count = self._attach_camera_rig(
-                    vehicle, geometry, sensor_prefix
-                )
-                self._camera_digests = {}
-                self._camera_frame_seen = {}
-                self._vision_streaming_since = time.perf_counter()
-                self._logged_vision_check = False
-                self._logged_vision_silence = False
-                self._logged_unprojection = False
-            else:
-                mount_count = len(geometry.mounts)
+            hybrid_camera_count = 0
+            mount_count = len(geometry.mounts)
             bbox_z = self._bbox_bottom(vehicle)
-            lidar_mounts = (
-                ()
-                if self._sensor_mode == SENSOR_MODE_VISION
-                else tuple(geometry.mounts.values())
-            )
-            for index, mount in enumerate(lidar_mounts):
+            for index, mount in enumerate(geometry.mounts.values()):
                 self.status_changed.emit(
                     "ATTACHING",
                     f"Attaching {mount.name} LiDAR ({index + 1}/{mount_count})",
@@ -743,7 +735,20 @@ class BeamNgWorker(QObject):
                 )
                 self._sensor_names.append(mount.name)
                 self._sensors.append(sensor)
-                self._verify_mount_height(sensor, bbox_z, mount)
+                self._verify_mount_placement(
+                    sensor, bbox_z, mount, state, sensor_origin
+                )
+
+            if self._sensor_mode == SENSOR_MODE_HYBRID:
+                hybrid_camera_count = self._attach_hybrid_camera_rig(
+                    vehicle, geometry, sensor_prefix
+                )
+                self._hybrid_camera_digests = {}
+                self._hybrid_camera_failures = set()
+                self._hybrid_camera_frames = {}
+                self._vision_streaming_since = time.perf_counter()
+                self._logged_vision_check = False
+                self._logged_vision_silence = False
 
             self._geometry = geometry
             self._palette = palette
@@ -762,11 +767,15 @@ class BeamNgWorker(QObject):
             )
             return
 
-        vision = self._sensor_mode == SENSOR_MODE_VISION
+        hybrid = self._sensor_mode == SENSOR_MODE_HYBRID
+        active_sensors = (
+            f"{mount_count} LiDAR sensors + {hybrid_camera_count} cameras"
+            if hybrid
+            else f"{mount_count} LiDAR sensors"
+        )
         self.status_changed.emit(
             "STREAMING",
-            f"{mount_count} {'cameras' if vision else 'LiDAR sensors'} active "
-            f"on {player_vid}",
+            f"{active_sensors} active on {player_vid}",
         )
         # Before sensors_ready, so the GUI knows which instrument set it is
         # enabling controls for when that signal lands.
@@ -779,11 +788,10 @@ class BeamNgWorker(QObject):
         # mean the safety net is missing exactly when nobody thought about it.
         # Self-driving stays opt-in, because that one changes what the car does.
         #
-        # In Vision mode the same two calls run and `_set_aeb` refuses them
-        # until VISION_DRIVING_ENABLED: the camera lattice is a new sampling
-        # distribution and the phantom-braking checklist has not been re-run
-        # on it. One arming path, one refusal, rather than a second branch
-        # here that could drift from the slot's own rule.
+        # HYBRID arms them exactly as LIDAR does, and that is the whole point
+        # of the mode: its two cameras render colour only and reach nothing
+        # but the view, so the cloud both brakes scan is the same six-unit
+        # LiDAR cloud either way.
         self._set_aeb(True, rearward=False)
         self._set_aeb(True, rearward=True)
 
@@ -799,7 +807,7 @@ class BeamNgWorker(QObject):
         `_cleanup_sensors`, so a half-swapped rig cannot exist.
         """
         mode = str(mode).upper()
-        if mode not in (SENSOR_MODE_LIDAR, SENSOR_MODE_VISION):
+        if mode not in (SENSOR_MODE_LIDAR, SENSOR_MODE_HYBRID):
             LOGGER.warning("Ignoring unknown sensor mode %r", mode)
             return
         if mode == self._sensor_mode:
@@ -814,16 +822,6 @@ class BeamNgWorker(QObject):
     def set_self_driving(self, enabled: bool) -> None:
         if not enabled:
             self._disengage_self_driving("Self-driving disengaged")
-            return
-        if self._vision_refuses_driving():
-            # The camera cloud exists now (rung 0.5), but the planner's band
-            # was fitted to LiDAR sampling and has not been re-proved on it
-            # live. VISION_DRIVING_ENABLED is the gate.
-            self.self_driving_changed.emit(False)
-            self.status_changed.emit(
-                "STREAMING" if self._sensors else "READY",
-                "Self-driving needs the LiDAR set; switch out of Vision mode",
-            )
             return
         if (
             self._vehicle is None
@@ -926,17 +924,6 @@ class BeamNgWorker(QObject):
         drops the accumulated paint as well as the bays, so re-arming starts
         from what the sensors can see now rather than from a stale lot.
         """
-        if enabled and self._vision_refuses_driving():
-            # The bay scan reads the SEMANTIC marking store. The camera rig
-            # fills it now (the annotation channel labels decals exactly as
-            # the LiDAR's does), but the parking manoeuvre drives on the
-            # planner's band, which is behind the same live gate.
-            self.parking_changed.emit(False)
-            self.status_changed.emit(
-                "STREAMING" if self._sensors else "READY",
-                "Parking needs the LiDAR set; switch out of Vision mode",
-            )
-            return
         if enabled and not self._sensor_set_is_complete():
             self.parking_changed.emit(False)
             self.status_changed.emit(
@@ -985,16 +972,6 @@ class BeamNgWorker(QObject):
             self._logged_park_phase = ""
             if was:
                 self.parking_drive_changed.emit(False)
-            return
-        if self._vision_refuses_driving():
-            # Reached only if a bay somehow survived the mode switch; the scan
-            # itself is already refused above. Say which system is missing
-            # rather than "select a bay", which would be unactionable here.
-            self.parking_drive_changed.emit(False)
-            self.status_changed.emit(
-                "STREAMING" if self._sensors else "READY",
-                "Parking needs the LiDAR set; switch out of Vision mode",
-            )
             return
         matched = (
             None
@@ -1116,13 +1093,6 @@ class BeamNgWorker(QObject):
         if not enabled:
             self._disengage_aeb(f"{label} disabled", rearward=rearward)
             return
-        if self._vision_refuses_driving():
-            changed.emit(False)
-            self.status_changed.emit(
-                "STREAMING" if self._sensors else "READY",
-                f"{label} needs the LiDAR set; switch out of Vision mode",
-            )
-            return
         if (
             self._vehicle is None
             or self._geometry is None
@@ -1164,21 +1134,9 @@ class BeamNgWorker(QObject):
         changed.emit(True)
         self.status_changed.emit("STREAMING", f"{label} armed")
 
-    def _vision_refuses_driving(self) -> bool:
-        """
-        Whether the control systems are refused because the cloud is the
-        camera rig's. One rule for all four slots (self-driving, both AEBs,
-        parking) so they cannot drift: Vision mode AND the live gate still
-        closed. See VISION_DRIVING_ENABLED.
-        """
-        return (
-            self._sensor_mode == SENSOR_MODE_VISION and not VISION_DRIVING_ENABLED
-        )
-
     def _porosity_sensor_height(self, geometry: VehicleGeometry) -> float:
         """
-        The eye height AEB's porosity test reasons from: the ROOF unit, or in
-        Vision mode the tallest camera (the windshield pair).
+        The eye height AEB's porosity test reasons from: the ROOF unit.
 
         It has to be the roof unit and not one of the 0.20 m mounts, because
         those sit BELOW anything worth testing -- a 0.6 m bush hides the ground
@@ -1190,8 +1148,6 @@ class BeamNgWorker(QObject):
         the conservative direction, since the test can only ever remove
         obstacles.
         """
-        if self._sensor_mode == SENSOR_MODE_VISION:
-            return float(self._vision_eye_height_m)
         roof = geometry.mounts.get("roof")
         return float(roof.position_vehicle[2]) if roof is not None else 0.0
 
@@ -1371,16 +1327,14 @@ class BeamNgWorker(QObject):
     @pyqtSlot()
     def _poll_once(self) -> None:
         """
-        One display tick, for EITHER instrument set.
+        One display tick, for either instrument set.
 
-        The two sets differ only in acquisition -- the LiDAR units stream a
-        cloud, the cameras stream depth and annotation images that
-        `unprojection` turns into one -- and everything from the concatenated
-        `points_world + colours` on is shared: the BEV split, the semantic
-        pass, both bands, the plan, AEB, the frame and the snapshot. That is
-        the perception waist the vision ladder is built to refill, and
-        keeping it one code path is what makes "the car drives in Vision
-        mode" the same car, not a second implementation of it.
+        The six LiDAR units are the whole of perception in both: everything
+        from the concatenated `points_world + colours` on -- the BEV split,
+        the semantic pass, both bands, the plan, AEB, the frame and the
+        snapshot -- runs identically. HYBRID adds one thing and it is
+        strictly additive: the A-pillar cameras' colour frames, emitted as a
+        `VisionFrame` AFTER the `BevFrame`, for the CAMERAS view to draw.
         """
         if (
             self._bng is None
@@ -1391,7 +1345,7 @@ class BeamNgWorker(QObject):
         ):
             return
 
-        vision = self._sensor_mode == SENSOR_MODE_VISION
+        hybrid = self._sensor_mode == SENSOR_MODE_HYBRID
         started = time.perf_counter()
         geometry = self._geometry
         road_points = _EMPTY_BEV
@@ -1422,14 +1376,11 @@ class BeamNgWorker(QObject):
                 np.degrees(np.arcsin(np.clip(forward_axis[2], -1.0, 1.0)))
             )
             self._watch_manual_braking(started)
-            vision_images: list[CameraImage] = []
-            if vision:
-                point_chunks, colour_chunks, vision_images, fresh = (
-                    self._acquire_vision_cloud(state, started)
-                )
-            else:
-                point_chunks, colour_chunks = self._acquire_lidar_cloud(state)
-                fresh = bool(point_chunks)
+            camera_images: list[CameraImage] = []
+            point_chunks, colour_chunks = self._acquire_lidar_cloud(state)
+            if hybrid:
+                camera_images = self._acquire_hybrid_camera_images(started)
+            fresh = bool(point_chunks)
 
             if point_chunks:
                 had_returns = True
@@ -1824,13 +1775,13 @@ class BeamNgWorker(QObject):
             self._poll_failures = 0
             self._first_failure_at = None
             self.frame_ready.emit(frame)
-            if vision:
+            if hybrid:
                 # The camera grid keeps its own frame beside the BEV one: the
                 # images are what the CAMERAS view draws, and the metrics it
                 # used to carry now ride on the BevFrame like everything else.
                 self.vision_frame_ready.emit(
                     VisionFrame(
-                        images=tuple(vision_images),
+                        images=tuple(camera_images),
                         acquisition_fps=frame.acquisition_fps,
                         poll_ms=frame.poll_ms,
                         speed_mps=frame.speed_mps,
@@ -1883,7 +1834,7 @@ class BeamNgWorker(QObject):
             # touch a socket again until the next tick joins this future.
             self._prefetch_vehicle_state()
         except Exception as exc:
-            self._note_poll_failure(exc, "Camera" if vision else "LiDAR")
+            self._note_poll_failure(exc, "LiDAR")
 
     def _acquire_lidar_cloud(
         self, state: dict[str, Any]
@@ -1933,138 +1884,96 @@ class BeamNgWorker(QObject):
             )
         return point_chunks, colour_chunks
 
-    def _acquire_vision_cloud(
-        self, state: dict[str, Any], now: float
-    ) -> tuple[list[np.ndarray], list[np.ndarray], list[CameraImage], bool]:
-        """
-        Stream every camera: the unprojected cloud, the colour images for the
-        grid, and whether any camera delivered a genuinely new frame.
 
-        Three channels, three different treatments. COLOUR is copied whole,
-        once, because the grid paints all of it and stream_raw hands back a
-        view of the live buffer the simulator keeps writing into. DEPTH and
-        ANNOTATION are never copied: the ray table's lattice is gathered
-        straight from the live view, one vectorised read per channel, which
-        is ~1/24th of the bytes at the default strides. A torn depth read --
-        the simulator landing a frame mid-gather -- mixes two frames a
-        sixtieth of a second apart along one row boundary, which the
-        accumulation stores absorb; copying 2.7 MB per camera per tick to
-        prevent it would not fit the tick.
-
-        Each frame's AGE is measured from when its depth lattice last changed
-        (the digest), so the cloud is placed from the pose the car had then
-        rather than now -- see CAMERA_FRAME_STAGING_S for the part that
-        cannot be measured from here.
+    def _acquire_hybrid_camera_images(self, now: float) -> list[CameraImage]:
         """
-        assert self._geometry is not None
-        geometry = self._geometry
-        point_chunks: list[np.ndarray] = []
-        colour_chunks: list[np.ndarray] = []
+        HYBRID's RGB frames, without letting one camera stop its peer.
+
+        **The freshness test reads a STRIDED sample of the live buffer and the
+        full copy is made only when that sample changed.** The cameras update
+        at `HYBRID_CAMERA_UPDATE_TIME_S` while the tick runs at
+        `DISPLAY_INTERVAL_MS`, so most ticks are re-reads of a frame already
+        held. Digesting the whole buffer instead cost a measured 9.8 ms of the
+        40 ms tick for the pair (4.9 MB each, blake2b ~8.7 ms of it) -- and it
+        sits ahead of `_actuate`, so it delayed every control and AEB command
+        in the mode advertised as having unchanged LiDAR perception. The
+        vision path took the same strided shortcut for the same reason.
+
+        A camera that has not refreshed re-shows its last frame from
+        `_hybrid_camera_frames` rather than dropping out of the grid, so the
+        tile count is stable even though the copy is not made every tick.
+        """
         images: list[CameraImage] = []
         any_fresh = False
-        reach: list[tuple[str, int, float, float]] = []
-        origin = vec3(state["pos"])
 
-        for index, camera in enumerate(self._sensors):
+        for index, camera in enumerate(self._hybrid_cameras):
             name = (
-                self._sensor_names[index]
-                if index < len(self._sensor_names)
+                self._hybrid_camera_names[index]
+                if index < len(self._hybrid_camera_names)
                 else str(index)
             )
-            raw = camera.stream_raw()
-            width, height = camera.resolution
+            try:
+                raw = camera.stream_raw()
+            except Exception as exc:
+                if name not in self._hybrid_camera_failures:
+                    LOGGER.warning("Hybrid camera %s failed: %s", name, exc)
+                self._hybrid_camera_failures.add(name)
+                continue
 
-            colour = raw.get("colour")
-            if colour is not None and len(colour) == width * height * 4:
-                # Copied exactly once, here, before anything reads it twice.
-                pixels = np.frombuffer(colour, dtype=np.uint8).copy()
-                images.append(
-                    CameraImage(
-                        name=name, rgba=pixels.reshape((height, width, 4))
+            try:
+                width, height = camera.resolution
+                expected = width * height * 4
+                colour_view = memoryview(raw.get("colour"))
+                if colour_view.nbytes != expected or not colour_view.contiguous:
+                    raise ValueError(
+                        f"{colour_view.nbytes} bytes, expected {expected}"
                     )
-                )
+                live = np.frombuffer(colour_view, dtype=np.uint8)
+                # The sample, not the frame, and the only thing read on a tick
+                # where nothing changed. The stride is derived from a byte
+                # BUDGET rather than fixed, so a 4.9 MB frame costs a bounded
+                # 64 KB while a small buffer is sampled whole and freshness
+                # stays exact on it.
+                step = max(1, live.size // _CAMERA_DIGEST_BYTES)
+                sample = bytes(live[::step])
+            except (AttributeError, BufferError, TypeError, ValueError) as exc:
+                # A buffer that is present but unusable is a failure like any
+                # other: recorded and logged once, or a permanently dead
+                # camera vanishes from the grid with nothing in the log.
+                if name not in self._hybrid_camera_failures:
+                    LOGGER.warning(
+                        "Hybrid camera %s returned an unusable colour buffer: %s",
+                        name,
+                        exc,
+                    )
+                self._hybrid_camera_failures.add(name)
+                continue
+            self._hybrid_camera_failures.discard(name)
 
-            rays = self._camera_rays.get(name)
-            if rays is None:
-                # A camera with no ray table is a display-only camera (or an
-                # offline stub); its colour still reaches the grid above.
-                continue
-            depth_raw = raw.get("depth")
-            if depth_raw is None or len(depth_raw) != width * height * 4:
-                continue
-            # Fresh-frame detection on the depth lattice itself: a strided
-            # gather the unprojection needs anyway, so the digest is free.
-            depth_digest = bytes(
-                np.frombuffer(depth_raw, dtype=np.float32)[
-                    rays.pixel_index[::_VISION_DIGEST_STRIDE]
-                ]
-            )
-            checked = self._camera_frame_checked.get(name)
-            if depth_digest != self._camera_digests.get(name):
-                self._camera_digests[name] = depth_digest
-                # The buffer changed somewhere between the LAST look and this
-                # one, so the change time's best estimate is the MIDPOINT of
-                # the two. Stamping `now` instead under-ages every frame by
-                # half a tick on average (~20 ms -- 0.22 m of forward
-                # misplacement at the 40 km/h cap), which the 2026-08-24
-                # fence-run regression measured live as +32 +/- 17 ms per
-                # unit speed against a ~17-20 ms detection-latency
-                # prediction. Centring zeroes the mean and halves the worst
-                # case; the residual half-tick jitter is the ghosting
-                # milestone's remaining business.
-                self._camera_frame_seen[name] = (
-                    (now + checked) / 2.0 if checked is not None else now
-                )
-                any_fresh = True
-            self._camera_frame_checked[name] = now
-            seen = self._camera_frame_seen.get(name)
-            age = (
-                CAMERA_FRAME_STAGING_S
-                if seen is None
-                else CAMERA_FRAME_STAGING_S + max(0.0, now - seen)
-            )
+            held = self._hybrid_camera_frames.get(name)
+            if sample != self._hybrid_camera_digests.get(name) or held is None:
+                self._hybrid_camera_digests[name] = sample
+                # `stream_raw` hands back a memoryview of the buffer the
+                # simulator is still writing into, so this copy is what makes
+                # the image safe to hold and paint from.
+                held = live.copy().reshape((height, width, 4))
+                self._hybrid_camera_frames[name] = held
+                # An all-zero buffer is the documented never-written state,
+                # not a frame. Counting it fresh latches the "first fresh
+                # frames" line over a rig of black tiles and permanently
+                # disarms the silence warning that names the trap.
+                if held.any():
+                    any_fresh = True
+            images.append(CameraImage(name=name, rgba=held))
 
-            result = unproject_frame(
-                rays,
-                depth_raw,
-                raw.get("annotation"),
-                pose_from_state(
-                    state, age, self._yaw_rate_rps, self._pitch_rate_rps
-                ),
-                geometry,
-                UNKNOWN_SEMANTIC_RGB,
-            )
-            if result is None:
-                continue
-            points, colours, sampled = result
-            if not self._logged_unprojection:
-                reach.append(
-                    (name, sampled, self._furthest_m(points, origin), age)
-                )
-            if not len(points):
-                continue
-            point_chunks.append(points)
-            colour_chunks.append(colours)
-
-        self._watch_vision_liveness(now, any_fresh, images)
-        if reach and any_fresh and not self._logged_unprojection:
-            self._logged_unprojection = True
-            # The `Sensor reach:` equivalent: per-camera counts and reach are
-            # what decide the strides, and the frame age is the one number
-            # the ego-motion milestone has to be judged against.
-            LOGGER.info(
-                "Unprojection check: %s | total %d points | mean frame age "
-                "%.0f ms (staging %.0f ms assumed) | eye height %.2f m",
-                " | ".join(
-                    f"{name} {count} returns, furthest {far:.0f} m"
-                    for name, count, far, _ in reach
-                ),
-                sum(count for _, count, _, _ in reach),
-                1000.0 * float(np.mean([age for *_, age in reach])),
-                1000.0 * CAMERA_FRAME_STAGING_S,
-                self._vision_eye_height_m,
-            )
-        return point_chunks, colour_chunks, images, any_fresh
+        self._watch_vision_liveness(
+            now,
+            any_fresh,
+            images,
+            channel="colour",
+            update_time_name="HYBRID_CAMERA_UPDATE_TIME_S",
+        )
+        return images
 
     @staticmethod
     def _furthest_m(points: np.ndarray, origin: np.ndarray) -> float:
@@ -2116,9 +2025,9 @@ class BeamNgWorker(QObject):
     def lidar_sensor_kwargs(mount: SensorMount) -> dict[str, Any]:
         """
         The `Lidar` constructor arguments for one mount, after name, bng and
-        vehicle. Public and pure so tools/unprojection_oracle.py builds the
-        SAME unit the app does -- an oracle that differed from the app in any
-        constructor argument would be measuring the difference.
+        vehicle. Public and pure so a probe in tools/ builds the SAME unit
+        the app does -- a probe that differed from the app in any constructor
+        argument would be measuring the difference.
         """
         return dict(
             requested_update_time=LIDAR_UPDATE_TIME_S,
@@ -2155,19 +2064,10 @@ class BeamNgWorker(QObject):
         )
 
     @staticmethod
-    def camera_sensor_kwargs(mount: CameraMount) -> dict[str, Any]:
-        """
-        The `Camera` constructor arguments for one mount, after name, bng and
-        vehicle -- the rung-0.5 rig: colour for the grid, depth and
-        annotation for the unprojection. Public and pure for the same reason
-        `lidar_sensor_kwargs` is.
-
-        `integer_depth=False` and `postprocess_depth=False` are both TRAPS the
-        spec names: the default quantises depth to 0-255 silently, and the
-        postprocess is a 256-iteration Python loop per frame.
-        """
+    def hybrid_camera_sensor_kwargs(mount: CameraMount) -> dict[str, Any]:
+        """The RGB-only shared-memory Camera arguments for a HYBRID mount."""
         return dict(
-            requested_update_time=CAMERA_UPDATE_TIME_S,
+            requested_update_time=HYBRID_CAMERA_UPDATE_TIME_S,
             update_priority=0.0,
             pos=mount.position_vehicle,
             dir=mount.direction_vehicle,
@@ -2177,11 +2077,9 @@ class BeamNgWorker(QObject):
             near_far_planes=CAMERA_NEAR_FAR_PLANES,
             is_using_shared_memory=True,
             is_render_colours=True,
-            is_render_annotations=True,
+            is_render_annotations=False,
             is_render_instance=False,
-            is_render_depth=True,
-            integer_depth=False,
-            postprocess_depth=False,
+            is_render_depth=False,
             is_visualised=False,
             is_streaming=True,
             is_static=False,
@@ -2190,55 +2088,40 @@ class BeamNgWorker(QObject):
             is_dir_world_space=False,
         )
 
-    def _attach_camera_rig(
+    def _attach_hybrid_camera_rig(
         self, vehicle: Vehicle, geometry: VehicleGeometry, sensor_prefix: str
     ) -> int:
-        """
-        Build the eight-camera Vision rig on the connected vehicle.
-
-        All three channels from rung 0.5 on: depth and annotation are what the
-        unprojection consumes, colour is what the grid draws. Annotation is a
-        second full geometry pass (measured 42 -> 33 Hz sim rate for eight
-        cameras) and depth doubles the bytes the simulator writes -- both are
-        paid for now because both are read. Streaming shared memory is the
-        only viable transport -- the poll path was measured at 204 ms per
-        8-camera frame, ~150x slower.
-        """
+        """Build HYBRID's two RGB-only cameras outside the LiDAR sensor list."""
         from beamngpy.sensors import Camera
 
-        rig = derive_camera_rig(geometry)
-        self._camera_rays = build_rig_rays(rig)
-        self._vision_eye_height_m = max(
-            float(mount.position_vehicle[2]) for mount in rig.values()
-        )
+        rig = derive_hybrid_camera_rig(geometry)
+        engine_names: list[str] = []
         for index, mount in enumerate(rig.values()):
             self.status_changed.emit(
                 "ATTACHING",
                 f"Attaching {mount.name} camera ({index + 1}/{len(rig)})",
             )
-            sensor = Camera(
-                f"{sensor_prefix}_{mount.name}",
+            engine_name = f"{sensor_prefix}_{mount.name}"
+            camera = Camera(
+                engine_name,
                 self._bng,
                 vehicle,
-                **self.camera_sensor_kwargs(mount),
+                **self.hybrid_camera_sensor_kwargs(mount),
             )
-            self._sensor_names.append(mount.name)
-            self._sensors.append(sensor)
-        LOGGER.info(
-            "Vision rig: %d cameras at %dx%d, update %.0f ms, colour + depth + "
-            "annotation, %d lattice samples | %s",
-            len(rig),
-            rig[next(iter(rig))].resolution[0],
-            rig[next(iter(rig))].resolution[1],
-            CAMERA_UPDATE_TIME_S * 1000.0,
-            sum(rays.sample_count for rays in self._camera_rays.values()),
-            ", ".join(
-                f"{m.name} hfov {m.horizontal_fov_deg:.0f} z "
-                f"{m.position_vehicle[2]:.2f} stride "
-                f"{m.sample_stride[0]}x{m.sample_stride[1]}"
-                for m in rig.values()
-            ),
-        )
+            engine_names.append(engine_name)
+            self._hybrid_camera_names.append(mount.name)
+            self._hybrid_cameras.append(camera)
+            LOGGER.info(
+                "Camera check: %s at (%+.3f, %+.3f, %+.3f) in the sensor frame "
+                "| %.0f deg horizontal (%.1f vertical) | %dx%d",
+                mount.name,
+                *mount.position_vehicle,
+                mount.horizontal_fov_deg,
+                mount.vertical_fov_deg,
+                *mount.resolution,
+            )
+        # After every camera exists, so one round trip covers the pair.
+        self._apply_camera_exposure(engine_names)
         self._check_capture_settings()
         return len(rig)
 
@@ -2297,8 +2180,81 @@ class BeamNgWorker(QObject):
         for warning in capture_setting_warnings(values):
             LOGGER.warning("Capture check: %s", warning)
 
+    # A tech Camera sensor DOES NOT auto-expose: measured live on 0.39.4, one
+    # created exactly the way beamngpy creates it reports `useManualEV=true,
+    # manualEV=0.001` -- a fixed linear exposure roughly 5x brighter than the
+    # eye-adapted view the player sees, which is the "brighter and overexposed"
+    # report (mean 232-241 of 255, 36-64% of pixels clipped at white).
+    #
+    # BeamNG ships the four Lua wrappers for this COMMENTED OUT
+    # (lua/ge/extensions/tech/sensors.lua:438-441) and beamngpy's Camera has no
+    # exposure argument at all, so the only route is the C++ bindings under
+    # them. They take the engine's own integer sensor id, which beamngpy never
+    # exposes -- hence the lookup by name.
+    #
+    # Every call is inside one pcall: this is an undocumented API and a version
+    # that lacks it must leave the cameras working, merely bright.
+    _CAMERA_EXPOSURE_CHUNK = (
+        "local wanted = {{{names}}}\n"
+        "local ok, res = pcall(function()\n"
+        "  local done = 0\n"
+        "  for _, id in ipairs(Research.Camera.getActiveCameraSensors()) do\n"
+        "    if wanted[tostring(Research.Camera.getSensorName(id))] then\n"
+        "      {apply}\n"
+        "      done = done + 1\n"
+        "    end\n"
+        "  end\n"
+        "  return done\n"
+        "end)\n"
+        "if ok then return tostring(res) else return 'error: ' .. tostring(res) end"
+    )
+
+    def _apply_camera_exposure(self, names: Sequence[str]) -> None:
+        """Hand each camera to the engine's eye adaptation, or pin its EV."""
+        if self._bng is None or not names:
+            return
+        wanted = ",".join(f'["{name}"]=true' for name in names)
+        apply = (
+            "Research.Camera.clearManualEV(id)"
+            if HYBRID_CAMERA_AUTO_EXPOSURE
+            else f"Research.Camera.setManualEV(id, {HYBRID_CAMERA_MANUAL_EV!r})"
+        )
+        try:
+            reply = self._bng.control.queue_lua_command(
+                self._CAMERA_EXPOSURE_CHUNK.format(names=wanted, apply=apply),
+                response=True,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Exposure check: could not reach the camera exposure API; the "
+                "tiles will render at the simulator's fixed default, which is "
+                "about 5x brighter than the game view",
+                exc_info=True,
+            )
+            return
+        setting = (
+            "auto (engine eye adaptation)"
+            if HYBRID_CAMERA_AUTO_EXPOSURE
+            else f"fixed linear EV {HYBRID_CAMERA_MANUAL_EV}"
+        )
+        if str(reply).startswith("error:") or str(reply) != str(len(names)):
+            LOGGER.warning(
+                "Exposure check: asked %d cameras for %s, the simulator "
+                "answered %r -- tiles may be overexposed",
+                len(names),
+                setting,
+                reply,
+            )
+            return
+        LOGGER.info("Exposure check: %d cameras set to %s", len(names), setting)
+
     def _watch_vision_liveness(
-        self, now: float, any_fresh: bool, images: list[CameraImage]
+        self,
+        now: float,
+        any_fresh: bool,
+        images: list[CameraImage],
+        channel: str = "colour + depth + annotation",
+        update_time_name: str = "CAMERA_UPDATE_TIME_S",
     ) -> None:
         """
         One line when the rig comes alive, one warning if it never does.
@@ -2318,9 +2274,10 @@ class BeamNgWorker(QObject):
             )
             LOGGER.info(
                 "Vision check: first fresh frames %.1f s after attach | "
-                "%d cameras delivering | colour + depth + annotation",
+                "%d cameras delivering | %s",
                 since,
                 len(images),
+                channel,
             )
             return
         if (
@@ -2331,14 +2288,27 @@ class BeamNgWorker(QObject):
             and now - self._vision_streaming_since > _VISION_SILENCE_WARN_S
         ):
             self._logged_vision_silence = True
-            LOGGER.warning(
-                "Vision check: no camera has delivered a new frame in %.0f s. "
-                "Known trap: streaming buffers stay zero-filled when "
-                "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
-                "positive); also check the graphics preset is above 'Lowest', "
-                "which returns empty camera buffers.",
-                _VISION_SILENCE_WARN_S,
-            )
+            if channel == "colour + depth + annotation":
+                LOGGER.warning(
+                    "Vision check: no camera has delivered a new frame in %.0f s. "
+                    "Known trap: streaming buffers stay zero-filled when "
+                    "requested_update_time is 0.0 (%s must be "
+                    "positive); also check the graphics preset is above 'Lowest', "
+                    "which returns empty camera buffers.",
+                    _VISION_SILENCE_WARN_S,
+                    update_time_name,
+                )
+            else:
+                LOGGER.warning(
+                    "Vision check: no camera has delivered a new %s frame in %.0f s. "
+                    "Known trap: streaming buffers stay zero-filled when "
+                    "requested_update_time is 0.0 (%s must be "
+                    "positive); also check the graphics preset is above 'Lowest', "
+                    "which returns empty camera buffers.",
+                    channel,
+                    _VISION_SILENCE_WARN_S,
+                    update_time_name,
+                )
 
     def _scan_for_parking(
         self,
@@ -3384,12 +3354,104 @@ class BeamNgWorker(QObject):
             LOGGER.debug("Could not read the vehicle bounding box", exc_info=True)
             return None
 
+    def _measure_sensor_origin(
+        self, vehicle: Vehicle, state: Mapping[str, Any]
+    ) -> tuple[float, float, float]:
+        """
+        Where the simulator's origin for a vehicle-space `pos` actually is.
+
+        Every extent in `derive_vehicle_geometry` is measured from the
+        REFERENCE NODE and the simulator does not read a mount `pos` from
+        there, so a mount built from an extent lands displaced by the
+        difference. Measured on the vivace it is (+0.160, +0.362, -0.233) --
+        0.36 m of it longitudinally, which had the front unit inside the
+        bonnet and the right unit 0.11 m inside the shell.
+
+        The only way to know it is to ask: a throwaway camera at exactly
+        (0, 0, 0) reports where the simulator put it. Measured cost 11 ms
+        (create 3, read 4, remove 5) and stable to 0.1 mm across repeats, so
+        it is done once per attach rather than assumed. A failure falls back
+        to (0, 0, 0), which is the old uncorrected placement -- never an
+        attach failure, because a diagnostic must not be able to stop the app
+        working.
+        """
+        from beamngpy.sensors import Camera
+
+        probe: Camera | None = None
+        try:
+            probe = Camera(
+                f"origin_{os.getpid()}_{int(time.monotonic() * 1000)}",
+                self._bng,
+                vehicle,
+                requested_update_time=_SENSOR_ORIGIN_PROBE_UPDATE_S,
+                update_priority=0.0,
+                pos=(0.0, 0.0, 0.0),
+                dir=(0.0, -1.0, 0.0),
+                up=(0.0, 0.0, 1.0),
+                resolution=_SENSOR_ORIGIN_PROBE_RESOLUTION,
+                field_of_view_y=60.0,
+                near_far_planes=CAMERA_NEAR_FAR_PLANES,
+                # Nothing reads this camera's pixels, so it gets no shared
+                # memory and no stream: only its POSITION is wanted.
+                is_using_shared_memory=False,
+                is_render_colours=True,
+                is_render_annotations=False,
+                is_render_instance=False,
+                is_render_depth=False,
+                is_visualised=False,
+                is_streaming=False,
+                is_static=False,
+                is_snapping_desired=False,
+                is_force_inside_triangle=False,
+                is_dir_world_space=False,
+            )
+            origin = self._to_vehicle_frame(state, probe.get_position())
+        except Exception:
+            LOGGER.warning(
+                "Origin check: could not measure where the simulator reads a "
+                "sensor pos from; falling back to the reference node, which "
+                "displaces every mount built from a body face",
+                exc_info=True,
+            )
+            return (0.0, 0.0, 0.0)
+        finally:
+            if probe is not None:
+                try:
+                    probe.remove()
+                except Exception:
+                    LOGGER.debug("Could not remove the origin probe", exc_info=True)
+        LOGGER.info(
+            "Origin check: a sensor pos of (0, 0, 0) lands (%+.3f, %+.3f, "
+            "%+.3f) m from the reference node (left, rearward, up); every "
+            "mount built from a body face is corrected by it",
+            *origin,
+        )
+        return origin
+
     @staticmethod
-    def _verify_mount_height(
-        sensor: Lidar, bbox_z: float | None, mount: SensorMount
+    def _to_vehicle_frame(
+        state: Mapping[str, Any], world_point: Any
+    ) -> tuple[float, float, float]:
+        """A world point in the vehicle frame: +X left, +Y rearward, +Z up."""
+        right, forward, up = vehicle_axes(state)
+        offset = vec3(world_point) - vec3(state["pos"])
+        return (
+            float(offset @ -right),
+            float(offset @ -forward),
+            float(offset @ up),
+        )
+
+    @staticmethod
+    def _verify_mount_placement(
+        sensor: Lidar,
+        bbox_z: float | None,
+        mount: SensorMount,
+        state: Mapping[str, Any],
+        sensor_origin: tuple[float, float, float],
     ) -> None:
         """
-        Confirm the simulator placed each sensor where we asked.
+        Confirm the simulator placed each sensor where we asked -- all three
+        axes.
 
         Sensor `pos` is referenced to the vehicle ground plane; adding the bbox
         bottom on top used to bury the sensors underground, which silently
@@ -3399,28 +3461,55 @@ class BeamNgWorker(QObject):
         Checked per mount rather than once, because the mounts no longer share a
         height: the roof unit is derived from the bounding box, so it is exactly
         the one a bad bbox would misplace, and its whole value is the height.
+
+        **It used to check the HEIGHT ONLY, and that is how the lateral and
+        longitudinal displacement survived**: the simulator reads a `pos` from
+        the sensor origin rather than the reference node, and z was the one axis
+        where those two coincide. The residual below is measured against the
+        intended node-frame position (`pos + sensor_origin`), so a mount that
+        does not land on the body face it names now says so.
         """
-        if bbox_z is None:
-            return
-        wanted = float(mount.position_vehicle[2])
         try:
-            delta = float(sensor.get_position()[2]) - bbox_z
+            world = sensor.get_position()
         except Exception:
-            LOGGER.debug("Could not verify sensor mount height", exc_info=True)
+            LOGGER.debug("Could not verify sensor mount placement", exc_info=True)
             return
-        LOGGER.info(
-            "Mount check: %s sits %.3f m above the bbox bottom (want %.2f)",
-            mount.name,
-            delta,
-            wanted,
+        wanted_z = float(mount.position_vehicle[2])
+        height = None if bbox_z is None else float(vec3(world)[2]) - bbox_z
+        try:
+            measured = BeamNgWorker._to_vehicle_frame(state, world)
+        except Exception:
+            LOGGER.debug("Could not project the mount into the body", exc_info=True)
+            return
+        intended = tuple(
+            float(mount.position_vehicle[axis]) + float(sensor_origin[axis])
+            for axis in range(3)
         )
-        if abs(delta - wanted) > 0.15:
+        residual = tuple(measured[axis] - intended[axis] for axis in range(3))
+        LOGGER.info(
+            "Mount check: %s sits %s above the bbox bottom (want %.2f) | "
+            "placement error (%+.3f, %+.3f, %+.3f) m",
+            mount.name,
+            "unknown" if height is None else f"{height:.3f} m",
+            wanted_z,
+            *residual,
+        )
+        if height is not None and abs(height - wanted_z) > 0.15:
             LOGGER.warning(
                 "%s mount height is off by %.3f m. Below ground means no "
                 "downward rays and a collapsed horizontal sweep; a low roof "
                 "unit loses the ground-ring spacing it exists for.",
                 mount.name,
-                delta - wanted,
+                height - wanted_z,
+            )
+        if max(abs(residual[0]), abs(residual[1])) > _MOUNT_PLACEMENT_TOLERANCE_M:
+            LOGGER.warning(
+                "%s did not land where it was asked: %+.3f m across and "
+                "%+.3f m along the car. A mount inside the shell sees its own "
+                "bodywork and is occluded by it; see Origin check above.",
+                mount.name,
+                residual[0],
+                residual[1],
             )
 
     def _get_vehicle_state(self) -> dict[str, Any]:
@@ -3810,6 +3899,16 @@ class BeamNgWorker(QObject):
         self._disengage_aeb("Sensors stopped", announce=False)
         self._disengage_parking_drive("Sensors stopped")
         self._disengage_self_driving("Sensors stopped", announce=False)
+        for camera in reversed(self._hybrid_cameras):
+            try:
+                camera.remove()
+            except Exception:
+                LOGGER.debug("Could not remove hybrid camera", exc_info=True)
+        self._hybrid_cameras.clear()
+        self._hybrid_camera_names.clear()
+        self._hybrid_camera_digests = {}
+        self._hybrid_camera_failures = set()
+        self._hybrid_camera_frames = {}
         for sensor in reversed(self._sensors):
             try:
                 sensor.remove()
@@ -3817,15 +3916,9 @@ class BeamNgWorker(QObject):
                 LOGGER.debug("Could not remove sensor", exc_info=True)
         self._sensors.clear()
         self._sensor_names.clear()
-        self._camera_digests = {}
-        self._camera_frame_seen = {}
-        self._camera_frame_checked = {}
-        self._camera_rays = {}
-        self._vision_eye_height_m = 0.0
         self._vision_streaming_since = None
         self._logged_vision_check = False
         self._logged_vision_silence = False
-        self._logged_unprojection = False
         self._geometry = None
         self._mirrored_geometry = None
         self._memory.clear()

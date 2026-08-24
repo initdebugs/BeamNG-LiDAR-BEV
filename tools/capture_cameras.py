@@ -30,10 +30,10 @@ from beamng_lidar_bev.config import (  # noqa: E402
     BEAMNG_HOST,
     BEAMNG_PORT,
     CAMERA_NEAR_FAR_PLANES,
-    CAMERA_UPDATE_TIME_S,
+    HYBRID_CAMERA_UPDATE_TIME_S,
 )
 from beamng_lidar_bev.geometry import (  # noqa: E402
-    derive_camera_rig,
+    derive_hybrid_camera_rig,
     derive_vehicle_geometry,
 )
 from beamng_lidar_bev.models import CameraMount  # noqa: E402
@@ -83,7 +83,7 @@ def make_camera(camera_cls, bng, vehicle, name: str, mount: CameraMount):
         name,
         bng,
         vehicle,
-        requested_update_time=CAMERA_UPDATE_TIME_S,
+        requested_update_time=HYBRID_CAMERA_UPDATE_TIME_S,
         update_priority=0.0,
         pos=mount.position_vehicle,
         dir=mount.direction_vehicle,
@@ -188,7 +188,7 @@ def main() -> int:
         )
 
         if args.camera == "all":
-            rig = derive_camera_rig(geometry, tuple(args.resolution))
+            rig = derive_hybrid_camera_rig(geometry, tuple(args.resolution))
             for name, mount in rig.items():
                 capture(Camera, bng, vehicle, f"rig_{name}", mount)
             return 0
@@ -199,7 +199,7 @@ def main() -> int:
             if settings:
                 bng.settings.apply_graphics()
                 time.sleep(1.0)
-            mount = derive_camera_rig(geometry, resolution)[args.camera]
+            mount = derive_hybrid_camera_rig(geometry, resolution)[args.camera]
             capture(Camera, bng, vehicle, f"{args.camera}_{label}", mount)
 
         for key in POSTFX_KEYS:

@@ -2,10 +2,10 @@
 
 A Windows desktop app for BeamNG.tech 0.39.x (via beamngpy 1.36) that launches
 the simulator with the BeamNGpy communication bridge enabled, connects after
-the map and vehicle are loaded, attaches a semantic LiDAR set — or, in Vision
-mode, a Tesla-style eight-camera rig — to the current player vehicle, and
-renders the output as a reconstructed autonomous-driving world, an EGO-fixed
-diagnostic bird's-eye view, or a live camera array.
+the map and vehicle are loaded, attaches a semantic six-LiDAR set — optionally
+with two colour A-pillar cameras alongside it — to the current player vehicle,
+and renders the output as a reconstructed autonomous-driving world, an
+EGO-fixed diagnostic bird's-eye view, or a live camera array.
 
 beamngpy 1.36 speaks bridge protocol v1.27, which is BeamNG.tech 0.39.x; it
 cannot connect to 0.38.x or earlier. The install path lives in
@@ -16,8 +16,15 @@ cannot connect to 0.38.x or earlier. The install path lives in
 1. Run `install_dependencies.bat` once.
 2. Run `run_app.bat`.
 3. If BeamNG.tech is not already running, select **Launch BeamNG.tech**.
-4. Load a map, spawn/select the intended EGO vehicle, then select
-   **Attach to Player Vehicle**.
+4. For the LiDAR-first camera view, choose **HYBRID**, load a map, and
+   spawn/select the intended EGO vehicle.
+5. Select **Attach to Player Vehicle**, then select **CAMERAS** to compare the
+   two live views.
+
+HYBRID keeps the six-LiDAR perception and safety stack active and adds two
+colour-only A-pillar cameras. Select CAMERAS to compare their live aiming;
+WORLD and RAW BEV remain LiDAR-backed. The cameras are requested at 10 Hz, so
+keep BeamNG.tech visible and use a graphics preset above Lowest.
 
 The app probes for a running BeamNG.tech bridge every two seconds, so a session
 you started yourself — from Steam, a shortcut, or an earlier run of this app —
@@ -44,19 +51,23 @@ The visualization header switches between:
   state.
 - **RAW BEV** — the original top-down semantic point cloud with range rings,
   planner candidates, sensor mounts, AEB corridors, and performance metrics.
-- **VISION** — the eight-camera rig (Tesla HW4 layout: windshield main + wide,
-  front bumper, two B-pillars, two fender repeaters, rear) streamed live as a
-  labelled grid; click a camera to view it full-frame, click again to return.
-  This is rung 0 of the vision-only ladder; see `docs/VISION_MODE_SPEC.md`
-  for the spec and `docs/VISION_ROADMAP.md` for the development roadmap.
+- **HYBRID** — keeps the six LiDARs authoritative for WORLD, RAW BEV,
+  planning, parking, and both AEB systems, and adds live colour-only
+  **A PILLAR LEFT** and **A PILLAR RIGHT** camera views. Choose **CAMERAS** to
+  see the feeds side by side.
+  Click a camera to view it full-frame, click again to return to the pair.
 
 Switching between WORLD and RAW BEV is instantaneous and does not restart
-sensors or change driving state. Switching to or from VISION swaps the
-instrument set on the car, so it re-attaches the sensors; self-driving and
-both AEB systems need the LiDAR point cloud and are unavailable in Vision
-mode at this rung. If Qt Quick 3D cannot initialize, the app falls back to
-RAW BEV while the sensor and control loops continue normally; VISION has no
+sensors or change driving state. Switching the instrument set re-attaches it on
+the car. HYBRID offers self-driving, parking and both AEB systems exactly as
+LIDAR does, because the cameras render colour only and reach nothing but the
+screen. If Qt Quick 3D cannot initialize, the app falls back to RAW BEV while
+the sensor and control loops continue normally; the camera view has no
 3D-renderer dependency and keeps working.
+
+A camera-only VISION mode (an eight-camera rig whose engine depth was
+unprojected into the same cloud) was removed in favour of HYBRID; see
+`docs/VISION_ROADMAP.md` for what it measured.
 
 ## Sensor Configuration
 

@@ -8,20 +8,13 @@ from typing import Any
 import numpy as np
 
 from .config import (
-    CAMERA_DEFAULT_SAMPLE_STRIDE,
-    CAMERA_FAR_ROAD_BAND_M,
-    CAMERA_FRONT_BUMPER_HFOV_DEG,
-    CAMERA_FRONT_BUMPER_STANDOFF_M,
-    CAMERA_FRONT_MAIN_HFOV_DEG,
-    CAMERA_FRONT_WIDE_HFOV_DEG,
-    CAMERA_PILLAR_HFOV_DEG,
-    CAMERA_PILLAR_YAW_DEG,
-    CAMERA_REAR_HFOV_DEG,
-    CAMERA_REAR_PITCH_DEG,
-    CAMERA_REPEATER_HFOV_DEG,
-    CAMERA_REPEATER_YAW_DEG,
-    CAMERA_RESOLUTION,
-    CAMERA_SAMPLE_STRIDES,
+    HYBRID_CAMERA_BODY_CLEARANCE_M,
+    HYBRID_CAMERA_FRONT_FRACTION,
+    HYBRID_CAMERA_HEIGHT_FRACTION,
+    HYBRID_CAMERA_HFOV_DEG,
+    HYBRID_CAMERA_PITCH_DEG,
+    HYBRID_CAMERA_RESOLUTION,
+    HYBRID_CAMERA_YAW_DEG,
     LIDAR_FRONT_DENSITY,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
@@ -69,18 +62,6 @@ def rotate_about_up(vector: np.ndarray, angle_rad: float) -> np.ndarray:
     return np.asarray((cos * x - sin * y, sin * x + cos * y, z), dtype=np.float64)
 
 
-def rotate_about_axis(
-    vector: np.ndarray, axis: np.ndarray, angle_rad: float
-) -> np.ndarray:
-    """Rotate a world vector about an arbitrary UNIT axis (Rodrigues,
-    right-handed). `rotate_about_up` is this with the axis pinned to world Z;
-    the PITCH rewind needs the vehicle's own RIGHT axis, which is not."""
-    cos, sin = math.cos(angle_rad), math.sin(angle_rad)
-    v = np.asarray(vector, dtype=np.float64)
-    a = np.asarray(axis, dtype=np.float64)
-    return v * cos + np.cross(a, v) * sin + a * float(np.dot(a, v)) * (1.0 - cos)
-
-
 def vehicle_axes(state: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return orthonormal world-space right, forward and up unit vectors."""
     forward = _normalise(vec3(state["dir"]), "forward")
@@ -96,11 +77,30 @@ def derive_vehicle_geometry(
     sensor_height_m: float = SENSOR_HEIGHT_ABOVE_GROUND_M,
     body_clearance_m: float = SENSOR_BODY_CLEARANCE_M,
     roof_clearance_m: float = ROOF_SENSOR_CLEARANCE_M,
+    sensor_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> VehicleGeometry:
     """
-    Derive vehicle-space extents and five mounts from a live world OOBB.
+    Derive vehicle-space extents and six mounts from a live world OOBB.
 
     BeamNG vehicle coordinates use +X left, +Y rearward and +Z up.
+
+    **The extents are measured from the REFERENCE NODE and a mount `pos` is
+    NOT** -- see `VehicleGeometry.sensor_origin_vehicle`. Measured live on the
+    vivace with `tools/mount_origin_probe.py`, a Camera AND a Lidar both asked
+    for (0, 0, 0) land at (+0.160, +0.362, -0.233) in the node frame, and the
+    offset is a pure translation (identical at four probe positions, stable to
+    0.1 mm across trials). So every mount built from an extent -- the four
+    perimeter units, and both A-pillar cameras -- has `sensor_origin`
+    subtracted from that extent, which is what puts it against the body face
+    it names. The RIGHT unit was 0.11 m INSIDE the shell before this and the
+    front unit 0.36 m back inside the bonnet.
+
+    Two things deliberately do NOT get the correction. `pos.z` is measured
+    from the vehicle ground plane, which is the sensor frame's own z origin
+    (the bbox bottom sits at -0.010 m in it), so heights are already right and
+    are the one axis this project had checked. And the centreline mounts stay
+    at x = 0, because 0 in the sensor frame IS the body centreline -- the
+    lateral offset above equals the body centre to a millimetre.
     """
     if len(bbox) < 8:
         raise ValueError("BeamNG did not return a complete vehicle bounding box")
@@ -131,13 +131,23 @@ def derive_vehicle_geometry(
             f"({width:.2f} x {length:.2f} x {height:.2f} m)"
         )
 
+    # The body faces, expressed in the frame the simulator reads a mount `pos`
+    # in. Identical to the node-frame extents when the origin has not been
+    # measured, which is what keeps the offline suite's numbers unchanged.
+    origin_x, origin_y, origin_z = (float(value) for value in sensor_origin)
+    face_left = float(max_x) - origin_x
+    face_right = float(min_x) - origin_x
+    face_front = float(min_y) - origin_y
+    face_rear = float(max_y) - origin_y
     # The simulator already measures vehicle-space sensor `pos` from the
     # vehicle's ground plane, so adding the bbox bottom again buries the sensor
     # below the terrain -- which kills every downward ray and collapses the
     # horizontal sweep. Verified live: passing pos.z=0.20 puts
     # Lidar.get_position() at bbox_bottom + 0.21 m, while passing
     # min_z + 0.20 put it 0.03 m underground. ground_z_vehicle below is a
-    # different quantity and is still the bbox bottom.
+    # different quantity and is still the bbox bottom. This is the one axis
+    # `sensor_origin` does NOT correct, because the two frames already agree
+    # on it (the bbox bottom measures -0.010 m in the sensor frame).
     mount_z = float(sensor_height_m)
     # Same reference plane, so this is the bbox HEIGHT plus clearance and never
     # max_z (which is measured from the reference node, not the ground). Derived
@@ -164,7 +174,7 @@ def derive_vehicle_geometry(
         # motorway speed and that is a question about one direction only.
         "front": SensorMount(
             "front",
-            (0.0, float(min_y - body_clearance_m), mount_z),
+            (0.0, float(face_front - body_clearance_m), mount_z),
             (0.0, -1.0, 0.0),
             max_distance_m=LIDAR_FRONT_MAX_DISTANCE_M,
             horizontal_fov_deg=LIDAR_FRONT_HORIZONTAL_FOV_DEG,
@@ -172,17 +182,17 @@ def derive_vehicle_geometry(
         ),
         "left": SensorMount(
             "left",
-            (float(max_x + body_clearance_m), 0.0, mount_z),
+            (float(face_left + body_clearance_m), 0.0, mount_z),
             (1.0, 0.0, 0.0),
         ),
         "right": SensorMount(
             "right",
-            (float(min_x - body_clearance_m), 0.0, mount_z),
+            (float(face_right - body_clearance_m), 0.0, mount_z),
             (-1.0, 0.0, 0.0),
         ),
         "rear": SensorMount(
             "rear",
-            (0.0, float(max_y + body_clearance_m), mount_z),
+            (0.0, float(face_rear + body_clearance_m), mount_z),
             (0.0, 1.0, 0.0),
         ),
         # The ground-fill unit. Above the bodywork and aimed down, because ring
@@ -243,21 +253,13 @@ def derive_vehicle_geometry(
         height_m=height,
         mounts=mounts,
         body_floor_z=float(min_z),
+        sensor_origin_vehicle=(origin_x, origin_y, origin_z),
     )
 
 
 # Fixed rig order, front row first, so the GUI grid and every log line agree
 # on which camera is which without consulting the worker.
-CAMERA_NAMES = (
-    "front_main",
-    "front_wide",
-    "front_bumper",
-    "pillar_left",
-    "pillar_right",
-    "repeater_left",
-    "repeater_right",
-    "rear",
-)
+HYBRID_CAMERA_NAMES = ("a_pillar_left", "a_pillar_right")
 
 
 def camera_vertical_fov_deg(
@@ -267,9 +269,10 @@ def camera_vertical_fov_deg(
     The `field_of_view_y` that yields a designed HORIZONTAL aperture.
 
     The Camera constructor takes only the vertical field of view and derives
-    the horizontal one from the aspect ratio, so the rig -- which is designed
-    around horizontal coverage exactly as the LiDAR wedges are -- has to run
-    the rectilinear projection backwards: tan(h/2) scales by height/width.
+    the horizontal one from the aspect ratio, so a camera rig -- which is
+    designed around horizontal coverage exactly as the LiDAR wedges are --
+    has to run the rectilinear projection backwards: tan(h/2) scales by
+    height/width.
     """
     width, height = resolution
     if width <= 0 or height <= 0:
@@ -278,179 +281,72 @@ def camera_vertical_fov_deg(
     return math.degrees(2.0 * math.atan(math.tan(half_h) * height / width))
 
 
-def derive_camera_rig(
+def derive_hybrid_camera_rig(
     geometry: VehicleGeometry,
-    resolution: tuple[int, int] = CAMERA_RESOLUTION,
-    body_clearance_m: float = SENSOR_BODY_CLEARANCE_M,
+    resolution: tuple[int, int] = HYBRID_CAMERA_RESOLUTION,
 ) -> dict[str, CameraMount]:
     """
-    The eight-camera Vision rig, derived from the same live bounding box the
-    LiDAR mounts are (Tesla HW4 layout: windshield main + wide, front bumper,
-    two B-pillars looking forward-outboard, two fender repeaters looking
-    rear-outboard, one rear).
+    HYBRID's two A-pillar colour cameras, one per side, mirrored about the
+    BODY.
 
-    Same conventions as the LiDAR mounts: vehicle frame +X left, +Y rearward,
-    +Z up; FORWARD IS (0, -1, 0) -- the intuitive (0, 1, 0) renders the rear
-    seats -- and `pos.z` is measured from the vehicle ground plane, which the
-    simulator references sensor positions to (see derive_vehicle_geometry).
-
-    Mounts sit ON or just outside the body shell because there is no hide-ego
-    flag: a camera inside the glasshouse films the cabin (measured: a
-    windshield mount placed inboard came back 68% CAR). The stations are
-    plausible fractions of the bounding box, not measured body features -- a
-    later rung can refine the B-pillar station from the Mesh sensor's
-    per-part nodes. Some bodywork in frame is correct: a real bumper camera
-    sees bonnet.
+    The stations are built from the body faces expressed in the simulator's
+    own sensor frame (`VehicleGeometry.sensor_origin_vehicle`), not from the
+    node-referenced extents. Placed from the node instead, the pair is
+    symmetric on paper and lands displaced by the whole origin offset: on the
+    vivace the left camera ended up 0.28 m outboard of the body with the car
+    entirely out of frame, and the right camera 0.04 m INSIDE the shell, where
+    6.6% of its pixels were ego bodywork against the left camera's 0.65%
+    (measured, `tools/hybrid_rig_probe.py`). That is the whole of the live
+    "one cam shows more bodywork than the other" report, and it also drags the
+    two cameras' independent auto-exposure apart, because a frame with a slab
+    of dark car in it adapts brighter.
     """
-    height = geometry.height_m
-    windshield_z = 0.90 * height
-    pillar_z = 0.80 * height
-    repeater_z = 0.60 * height
-    # Higher than the first attempt (0.32 * height) and pushed well clear of
-    # the shell: at the ordinary clearance the camera sat INSIDE the bumper
-    # mesh -- the bbox face is the car's widest point, not the bumper face at
-    # this height. See CAMERA_FRONT_BUMPER_STANDOFF_M.
-    bumper_z = max(0.50, 0.38 * height)
-    bumper_y = -(geometry.front_m + CAMERA_FRONT_BUMPER_STANDOFF_M)
-    rear_z = 0.75 * height
-    # Just outside each surface, reusing the LiDAR body clearance.
-    rear_y = geometry.rear_m + body_clearance_m
-    left_x = geometry.left_m + body_clearance_m
-    right_x = -(geometry.right_m + body_clearance_m)
-    # THE REFERENCE NODE IS NOT THE BODY CENTRE, so a camera meant to sit on the
-    # car's centreline cannot be placed at x = 0. Measured on the vivace the
-    # node is 0.16 m off centre, which put the bumper and rear cameras 0.16 m
-    # to one side of the car they are supposed to look straight out of. This is
-    # the same defect the WORLD ego model and the AEB corridor each had, for the
-    # same reason -- see CLAUDE.md's "anything centred on the origin is centred
-    # on the wrong thing". The outboard pairs never had it: they are placed
-    # against their OWN side's surface, so they are already symmetric about the
-    # body (measured: 0.0000 m lateral asymmetry).
-    centre_x = (geometry.left_m - geometry.right_m) / 2.0
-    # The windshield pair sits ahead of the reference node, roughly at the
-    # screen header; the repeaters ride the front fenders; the B-pillars sit
-    # slightly behind the node, mid-cabin.
-    windshield_y = -0.30 * geometry.front_m
-    repeater_y = -0.55 * geometry.front_m
-    pillar_y = 0.10 * geometry.rear_m
-
-    pillar_yaw = math.radians(CAMERA_PILLAR_YAW_DEG)
-    repeater_yaw = math.radians(CAMERA_REPEATER_YAW_DEG)
-    forward = (0.0, -1.0, 0.0)
-
-    def mount(
-        name: str,
-        position: tuple[float, float, float],
-        direction: tuple[float, float, float],
-        hfov: float,
-        far_road_band: tuple[float, float] | None = None,
-    ) -> CameraMount:
-        return CameraMount(
-            name=name,
-            position_vehicle=position,
-            direction_vehicle=direction,
-            horizontal_fov_deg=hfov,
-            vertical_fov_deg=camera_vertical_fov_deg(hfov, resolution),
-            resolution=resolution,
-            sample_stride=tuple(
-                CAMERA_SAMPLE_STRIDES.get(name, CAMERA_DEFAULT_SAMPLE_STRIDE)
-            ),
-            far_road_band_m=far_road_band,
-        )
-
-    # The reversing camera looks DOWN as well as back. Its job is the ground
-    # immediately behind the bumper, which a level view cuts off a couple of
-    # metres out; pitched, the bottom of a 130-degree frame meets the ground
-    # about 0.3 m behind the lens. See CAMERA_REAR_PITCH_DEG.
-    rear_pitch = math.radians(CAMERA_REAR_PITCH_DEG)
-    rear_direction = (0.0, math.cos(rear_pitch), -math.sin(rear_pitch))
-
-    return {
-        # The windshield pair, offset either side of the mirror so the two
-        # never coincide. Main is the long-range narrow view, wide the
-        # context view.
-        "front_main": mount(
-            "front_main",
-            (centre_x + 0.08, windshield_y, windshield_z),
-            forward,
-            CAMERA_FRONT_MAIN_HFOV_DEG,
-            # The far-road instrument: the rows where 20-100 m of level
-            # ground land are sampled at full density. See
-            # CAMERA_FAR_ROAD_BAND_M for the street-capture measurement
-            # behind it.
-            far_road_band=CAMERA_FAR_ROAD_BAND_M,
+    yaw = math.radians(HYBRID_CAMERA_YAW_DEG)
+    pitch = math.radians(HYBRID_CAMERA_PITCH_DEG)
+    horizontal = math.cos(pitch)
+    origin_x, origin_y, _ = geometry.sensor_origin_vehicle
+    face_left = geometry.left_m - origin_x
+    face_right = -geometry.right_m - origin_x
+    face_front = -geometry.front_m - origin_y
+    y = HYBRID_CAMERA_FRONT_FRACTION * face_front
+    z = HYBRID_CAMERA_HEIGHT_FRACTION * geometry.height_m
+    left = CameraMount(
+        name="a_pillar_left",
+        position_vehicle=(
+            face_left + HYBRID_CAMERA_BODY_CLEARANCE_M,
+            y,
+            z,
         ),
-        "front_wide": mount(
-            "front_wide",
-            (centre_x - 0.08, windshield_y, windshield_z),
-            forward,
-            CAMERA_FRONT_WIDE_HFOV_DEG,
+        direction_vehicle=(
+            math.sin(yaw) * horizontal,
+            -math.cos(yaw) * horizontal,
+            -math.sin(pitch),
         ),
-        "front_bumper": mount(
-            "front_bumper",
-            (centre_x, bumper_y, bumper_z),
-            forward,
-            CAMERA_FRONT_BUMPER_HFOV_DEG,
+        horizontal_fov_deg=HYBRID_CAMERA_HFOV_DEG,
+        vertical_fov_deg=camera_vertical_fov_deg(
+            HYBRID_CAMERA_HFOV_DEG, resolution
         ),
-        # B-pillars: forward-outboard. +X is LEFT, so the left camera's
-        # direction gains a positive X component.
-        "pillar_left": mount(
-            "pillar_left",
-            (left_x, pillar_y, pillar_z),
-            (math.sin(pillar_yaw), -math.cos(pillar_yaw), 0.0),
-            CAMERA_PILLAR_HFOV_DEG,
+        resolution=resolution,
+    )
+    right = CameraMount(
+        name="a_pillar_right",
+        position_vehicle=(
+            face_right - HYBRID_CAMERA_BODY_CLEARANCE_M,
+            y,
+            z,
         ),
-        "pillar_right": mount(
-            "pillar_right",
-            (right_x, pillar_y, pillar_z),
-            (-math.sin(pillar_yaw), -math.cos(pillar_yaw), 0.0),
-            CAMERA_PILLAR_HFOV_DEG,
+        direction_vehicle=(
+            -math.sin(yaw) * horizontal,
+            -math.cos(yaw) * horizontal,
+            -math.sin(pitch),
         ),
-        # Fender repeaters: rear-outboard, the blind-spot view.
-        "repeater_left": mount(
-            "repeater_left",
-            (left_x, repeater_y, repeater_z),
-            (math.sin(repeater_yaw), math.cos(repeater_yaw), 0.0),
-            CAMERA_REPEATER_HFOV_DEG,
+        horizontal_fov_deg=HYBRID_CAMERA_HFOV_DEG,
+        vertical_fov_deg=camera_vertical_fov_deg(
+            HYBRID_CAMERA_HFOV_DEG, resolution
         ),
-        "repeater_right": mount(
-            "repeater_right",
-            (right_x, repeater_y, repeater_z),
-            (-math.sin(repeater_yaw), math.cos(repeater_yaw), 0.0),
-            CAMERA_REPEATER_HFOV_DEG,
-        ),
-        "rear": mount(
-            "rear",
-            (centre_x, rear_y, rear_z),
-            rear_direction,
-            CAMERA_REAR_HFOV_DEG,
-        ),
-    }
-
-
-def camera_basis(mount: CameraMount) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    The camera's (image right, image up, optical axis) unit vectors in the
-    VEHICLE frame, for a mount built with `up=(0, 0, 1)` as every camera here
-    is.
-
-    Image right is `forward x up`: the same handedness the LiDAR/BEV frames use
-    (`vehicle_axes` builds right as `forward x up` too), so a point to the
-    camera's right lands on the vehicle's right. The up vector is
-    re-orthogonalised against a pitched axis exactly as `vehicle_axes` does,
-    which is what keeps the rear camera's tilt from shearing its columns.
-
-    Which way the simulator's COLUMN index runs relative to this vector is an
-    engine fact the offline suite cannot reach; the `Unprojection check:` line
-    and tools/unprojection_oracle.py exist to confirm it against the LiDAR
-    cloud. If a live scene ever comes back mirrored, negate `right` HERE and
-    nowhere else.
-    """
-    axis = _normalise(np.asarray(mount.direction_vehicle, dtype=np.float64), "dir")
-    world_up = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
-    right = _normalise(np.cross(axis, world_up), "camera right")
-    up = _normalise(np.cross(right, axis), "camera up")
-    return right, up, axis
+        resolution=resolution,
+    )
+    return {left.name: left, right.name: right}
 
 
 # The ground-annulus units: every ray points below the horizon, so their reach

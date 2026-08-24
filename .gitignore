@@ -27,3 +27,6 @@ tools/kerb_data/
 # The oracle's lockstep captures (20+ MB each); the side-by-side PNG beside
 # them stays tracked as evidence, like the colour probe.
 tools/oracle_data/*.npz
+
+# tools/hybrid_rig_probe.py's side-by-side output; re-run the probe for it.
+tools/hybrid_rig_probe.png

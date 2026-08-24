@@ -240,3 +240,71 @@ def test_heights_are_referenced_to_gravity_not_the_body_axis(
     _, heights = world_points_to_bev(ahead, state)
 
     np.testing.assert_allclose(heights, np.full(4, -0.5), atol=1e-5)
+
+
+# --- Where the simulator actually reads a mount `pos` from --------------------
+#
+# The extents are measured from the REFERENCE NODE and the simulator resolves a
+# vehicle-space `pos` from somewhere else: measured live on the vivace with
+# tools/mount_origin_probe.py, a Camera AND a Lidar both asked for (0, 0, 0)
+# land at (+0.160, +0.362, -0.233) in the node frame -- the body centre
+# laterally and longitudinally, the ground plane vertically. Uncorrected, the
+# right unit sat 0.11 m INSIDE the shell and the front unit 0.36 m back inside
+# the bonnet.
+
+_VIVACE_ORIGIN = (0.160, 0.362, -0.233)
+
+
+def test_a_measured_sensor_origin_puts_every_mount_on_the_face_it_names() -> None:
+    geometry = derive_vehicle_geometry(
+        _state(), _bbox(), sensor_origin=_VIVACE_ORIGIN
+    )
+    clearance = 0.08  # SENSOR_BODY_CLEARANCE_M
+
+    # The body faces are still reported from the node -- everything else in the
+    # app measures from there -- so the check is that mount + origin lands
+    # exactly `clearance` outside each face.
+    def landed(name: str) -> tuple[float, float, float]:
+        pos = geometry.mounts[name].position_vehicle
+        return tuple(pos[axis] + _VIVACE_ORIGIN[axis] for axis in range(3))
+
+    assert landed("left")[0] == pytest.approx(geometry.left_m + clearance)
+    assert landed("right")[0] == pytest.approx(-(geometry.right_m + clearance))
+    assert landed("front")[1] == pytest.approx(-(geometry.front_m + clearance))
+    assert landed("rear")[1] == pytest.approx(geometry.rear_m + clearance)
+
+
+def test_the_uncorrected_default_is_exactly_the_old_placement() -> None:
+    """Every offline number in this suite assumes the (0, 0, 0) default, so it
+    has to stay byte-identical to what the app built before the correction."""
+    plain = derive_vehicle_geometry(_state(), _bbox())
+    explicit = derive_vehicle_geometry(
+        _state(), _bbox(), sensor_origin=(0.0, 0.0, 0.0)
+    )
+    for name, mount in plain.mounts.items():
+        assert mount.position_vehicle == pytest.approx(
+            explicit.mounts[name].position_vehicle
+        )
+
+
+def test_the_correction_never_touches_the_height_axis() -> None:
+    """`pos.z` is already measured from the vehicle ground plane -- the one
+    axis where the two frames agree, and the one this project had checked."""
+    corrected = derive_vehicle_geometry(
+        _state(), _bbox(), sensor_origin=_VIVACE_ORIGIN
+    )
+    plain = derive_vehicle_geometry(_state(), _bbox())
+    for name, mount in corrected.mounts.items():
+        assert mount.position_vehicle[2] == pytest.approx(
+            plain.mounts[name].position_vehicle[2]
+        )
+
+
+def test_the_centreline_units_stay_on_the_body_centreline() -> None:
+    """x = 0 in the SENSOR frame is the body centreline (the measured lateral
+    offset IS the body centre), so the roof and road units need no shift."""
+    geometry = derive_vehicle_geometry(
+        _state(), _bbox(), sensor_origin=_VIVACE_ORIGIN
+    )
+    for name in ("front", "rear", "roof", "road"):
+        assert geometry.mounts[name].position_vehicle[0] == pytest.approx(0.0)
