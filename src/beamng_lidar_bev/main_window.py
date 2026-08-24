@@ -136,6 +136,31 @@ def sensor_mode_has_cameras(mode: str) -> bool:
     return mode in (SENSOR_MODE_HYBRID, SENSOR_MODE_VISION)
 
 
+def resolve_startup_visualization(
+    requested_sensor_mode: str,
+    requested_visualization: str | None,
+    *,
+    active_sensor_mode: str,
+    world_available: bool,
+) -> str | None:
+    """
+    Resolve the saved view once its requested instrument set is active.
+
+    A camera-capable mode reaches the GUI asynchronously, so resolving its
+    saved CAMERAS view against the initial LiDAR default would overwrite that
+    setting with a fallback. Returning None keeps the request pending until
+    the worker confirms the requested mode. The default LiDAR request already
+    matches the initial mode and therefore needs no confirmation signal.
+    """
+    if requested_sensor_mode != active_sensor_mode:
+        return None
+    return resolve_visualization(
+        requested_visualization,
+        world_available=world_available,
+        cameras_available=sensor_mode_has_cameras(active_sensor_mode),
+    )
+
+
 def controls_offered(sensor_mode: str) -> bool:
     """
     Whether the driving controls (self-driving, both AEBs, parking) are
@@ -168,6 +193,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(640, 560)
         self.resize(1180, 820)
         self._settings = QSettings("Local BeamNG Tools", "BeamNG LiDAR BEV")
+        requested_mode = self._settings.value("sensor_mode", SENSOR_MODE_LIDAR)
+        self._pending_startup_sensor_mode = resolve_sensor_mode(str(requested_mode))
+        requested_view = self._settings.value("visualization", VIEW_WORLD)
+        self._pending_startup_visualization = (
+            str(requested_view) if requested_view is not None else VIEW_WORLD
+        )
         self._bridge_ready = False
         # Set from the moment Launch is pressed until the bridge answers, the
         # wait runs out, or a launch fault clears it. Without it the monitor's
@@ -197,12 +228,8 @@ class MainWindow(QMainWindow):
         # The instrument set first: the view it allows depends on it. The
         # worker records the choice while idle and confirms it back through
         # sensor_mode_changed, which is what enables the CAMERAS view.
-        requested_mode = self._settings.value("sensor_mode", SENSOR_MODE_LIDAR)
-        self._select_sensor_mode(resolve_sensor_mode(str(requested_mode)))
-        requested_view = self._settings.value("visualization", VIEW_WORLD)
-        self._select_visualization(
-            str(requested_view) if requested_view is not None else None
-        )
+        self._select_sensor_mode(self._pending_startup_sensor_mode)
+        self._apply_pending_startup_visualization()
 
         self._set_status("OFFLINE", "Looking for a running BeamNG.tech session")
         self._append_log("Application ready")
@@ -595,17 +622,20 @@ class MainWindow(QMainWindow):
             self.view_button_group.addButton(button)
             view_toggle_layout.addWidget(button)
         self.world_view_button.clicked.connect(
-            lambda checked: checked and self._select_visualization(VIEW_WORLD)
+            lambda checked: checked
+            and self._select_user_visualization(VIEW_WORLD)
         )
         self.raw_bev_button.clicked.connect(
-            lambda checked: checked and self._select_visualization(VIEW_RAW_BEV)
+            lambda checked: checked
+            and self._select_user_visualization(VIEW_RAW_BEV)
         )
         self.vision_button.setToolTip(
             "Show the selected camera rig live. Available in HYBRID or VISION; "
             "HYBRID keeps its six LiDARs authoritative for perception."
         )
         self.vision_button.clicked.connect(
-            lambda checked: checked and self._select_visualization(VIEW_CAMERAS)
+            lambda checked: checked
+            and self._select_user_visualization(VIEW_CAMERAS)
         )
         # Enabled by the worker's confirmed instrument set: only modes with
         # cameras have images for this grid to draw.
@@ -659,15 +689,16 @@ class MainWindow(QMainWindow):
             )
         )
         self.lidar_mode_button.clicked.connect(
-            lambda checked: checked and self._select_sensor_mode(SENSOR_MODE_LIDAR)
+            lambda checked: checked
+            and self._select_user_sensor_mode(SENSOR_MODE_LIDAR)
         )
         self.hybrid_mode_button.clicked.connect(
             lambda checked: checked
-            and self._select_sensor_mode(SENSOR_MODE_HYBRID)
+            and self._select_user_sensor_mode(SENSOR_MODE_HYBRID)
         )
         self.vision_mode_button.clicked.connect(
             lambda checked: checked
-            and self._select_sensor_mode(SENSOR_MODE_VISION)
+            and self._select_user_sensor_mode(SENSOR_MODE_VISION)
         )
         header.addWidget(sensor_toggle)
 
@@ -1069,6 +1100,7 @@ class MainWindow(QMainWindow):
             and not cameras_available
         ):
             self._select_visualization(VIEW_WORLD)
+        self._apply_pending_startup_visualization()
 
     def _sync_sensor_buttons(self, mode: str) -> None:
         self.lidar_mode_button.setChecked(mode == SENSOR_MODE_LIDAR)
@@ -1087,6 +1119,33 @@ class MainWindow(QMainWindow):
         self._sync_sensor_buttons(mode)
         self._settings.setValue("sensor_mode", mode)
         self.sensor_mode_requested.emit(mode)
+
+    def _select_user_sensor_mode(self, mode: str) -> None:
+        """A user mode choice supersedes an unresolved saved view."""
+        self._pending_startup_visualization = None
+        self._select_sensor_mode(mode)
+
+    def _apply_pending_startup_visualization(self) -> None:
+        """Apply the saved view once the worker-confirmed mode permits it."""
+        pending = self._pending_startup_visualization
+        if pending is None:
+            return
+        selected = resolve_startup_visualization(
+            self._pending_startup_sensor_mode,
+            pending,
+            active_sensor_mode=self._active_sensor_mode,
+            world_available=self.world_view.is_ready
+            and self.world_view_button.isEnabled(),
+        )
+        if selected is None:
+            return
+        self._pending_startup_visualization = None
+        self._select_visualization(selected)
+
+    def _select_user_visualization(self, requested: str) -> None:
+        """A user view choice supersedes an unresolved saved view."""
+        self._pending_startup_visualization = None
+        self._select_visualization(requested)
 
     def _select_visualization(self, requested: str | None) -> None:
         """GUI-only: which of the three views draws. Never touches the rig."""

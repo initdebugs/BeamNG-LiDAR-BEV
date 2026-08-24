@@ -9,6 +9,7 @@ from beamng_lidar_bev.main_window import (
     bridge_wait_message,
     controls_offered,
     resolve_sensor_mode,
+    resolve_startup_visualization,
     resolve_visualization,
     sensor_mode_has_cameras,
 )
@@ -76,6 +77,41 @@ def test_the_camera_grid_is_preserved_for_the_hybrid_instrument_set() -> None:
             cameras_available=sensor_mode_has_cameras(SENSOR_MODE_HYBRID),
         )
         == VIEW_CAMERAS
+    )
+
+
+def test_startup_defers_a_saved_camera_view_until_hybrid_confirms() -> None:
+    assert (
+        resolve_startup_visualization(
+            SENSOR_MODE_HYBRID,
+            VIEW_CAMERAS,
+            active_sensor_mode=SENSOR_MODE_LIDAR,
+            world_available=True,
+        )
+        is None
+    )
+    assert (
+        resolve_startup_visualization(
+            SENSOR_MODE_HYBRID,
+            VIEW_CAMERAS,
+            active_sensor_mode=SENSOR_MODE_HYBRID,
+            world_available=True,
+        )
+        == VIEW_CAMERAS
+    )
+
+
+def test_startup_restores_a_lidar_view_without_a_mode_confirmation() -> None:
+    """The worker no-ops when its default LiDAR mode is requested, so no
+    confirmation signal is needed before restoring the saved view."""
+    assert (
+        resolve_startup_visualization(
+            SENSOR_MODE_LIDAR,
+            VIEW_RAW_BEV,
+            active_sensor_mode=SENSOR_MODE_LIDAR,
+            world_available=True,
+        )
+        == VIEW_RAW_BEV
     )
 
 

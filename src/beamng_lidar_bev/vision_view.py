@@ -188,7 +188,7 @@ class VisionView(QWidget):
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
-                "VISION MODE\nAttach to a vehicle to stream the camera rig",
+                "CAMERA VIEW\nAttach to a vehicle to stream the camera rig",
             )
             painter.end()
             return
