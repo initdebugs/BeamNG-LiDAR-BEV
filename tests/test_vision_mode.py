@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -294,6 +295,35 @@ class RemovableCameraStub(StreamingCameraStub):
             raise RuntimeError("camera removal failed")
 
 
+class EpisodicCameraStub(StreamingCameraStub):
+    """A camera that can fail in discrete episodes between good frames."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._failures_remaining = 0
+
+    def fail_next(self, attempts: int) -> None:
+        self._failures_remaining = attempts
+
+    def stream_raw(self) -> dict[str, bytes]:
+        if self._failures_remaining:
+            self._failures_remaining -= 1
+            raise RuntimeError("camera gone")
+        return super().stream_raw()
+
+
+class InvalidColourCameraStub(StreamingCameraStub):
+    """A streaming camera whose colour channel is absent or not a pixel buffer."""
+
+    def __init__(self, raw: dict[str, object]) -> None:
+        super().__init__()
+        self._raw = raw
+
+    def stream_raw(self) -> dict[str, bytes]:
+        self.stream_raw_calls += 1
+        return self._raw  # type: ignore[return-value]
+
+
 def _stub_mount(name: str, width: int, height: int) -> CameraMount:
     return CameraMount(
         name=name,
@@ -489,6 +519,9 @@ def test_attach_to_player_hybrid_builds_lidars_then_cameras_and_starts_streaming
     worker, timer, constructor_order, lidars, cameras = _hybrid_attach_worker(
         monkeypatch
     )
+    worker._vision_streaming_since = 0.0
+    worker._logged_vision_check = True
+    worker._logged_vision_silence = True
     statuses: list[tuple[str, str]] = []
     worker.status_changed.connect(
         lambda state, detail: statuses.append((state, detail))
@@ -516,6 +549,10 @@ def test_attach_to_player_hybrid_builds_lidars_then_cameras_and_starts_streaming
     )
     assert worker._sensors == lidars
     assert worker._hybrid_cameras == cameras
+    assert worker._vision_streaming_since is not None
+    assert worker._vision_streaming_since > 0.0
+    assert worker._logged_vision_check is False
+    assert worker._logged_vision_silence is False
     assert (
         "STREAMING",
         "6 LiDAR sensors + 2 cameras active on ego",
@@ -581,6 +618,160 @@ def test_cleanup_removes_and_forgets_every_hybrid_camera() -> None:
     assert worker._hybrid_camera_names == []
     assert worker._hybrid_camera_digests == {}
     assert worker._hybrid_camera_failures == set()
+
+
+def _armed_hybrid_camera_worker(
+    cameras: list[StreamingCameraStub],
+) -> BeamNgWorker:
+    worker = BeamNgWorker()
+    worker._sensor_mode = SENSOR_MODE_HYBRID
+    worker._hybrid_cameras = cameras  # type: ignore[assignment]
+    worker._hybrid_camera_names = list(HYBRID_CAMERA_NAMES[: len(cameras)])
+    worker._vision_streaming_since = time.perf_counter()
+    return worker
+
+
+def test_hybrid_rgb_acquisition_preserves_order_and_owns_the_bytes() -> None:
+    cameras = [StreamingCameraStub(), StreamingCameraStub()]
+    worker = _armed_hybrid_camera_worker(cameras)
+
+    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert fresh is True
+    assert [image.name for image in images] == list(HYBRID_CAMERA_NAMES)
+    assert [camera.stream_raw_calls for camera in cameras] == [1, 1]
+    assert all(image.rgba.shape == (3, 4, 4) for image in images)
+    assert all(image.rgba.dtype == np.uint8 for image in images)
+    assert all(
+        image.rgba.flags["OWNDATA"] or image.rgba.base.flags["OWNDATA"]
+        for image in images
+    )
+
+
+def test_unchanged_hybrid_colour_is_not_counted_as_a_new_frame() -> None:
+    camera = StreamingCameraStub()
+    worker = _armed_hybrid_camera_worker([camera])
+
+    _, first = worker._acquire_hybrid_camera_images(time.perf_counter())
+    _, second = worker._acquire_hybrid_camera_images(time.perf_counter())
+    camera.repaint()
+    _, third = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert (first, second, third) == (True, False, True)
+
+
+def test_hybrid_malformed_colour_buffers_are_omitted_without_failing() -> None:
+    cameras = [
+        InvalidColourCameraStub({}),
+        InvalidColourCameraStub({"colour": b"short"}),
+    ]
+    worker = _armed_hybrid_camera_worker(cameras)
+
+    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert images == []
+    assert fresh is False
+    assert worker._poll_failures == 0
+    assert worker._hybrid_camera_failures == set()
+
+
+def test_hybrid_non_buffer_colour_is_omitted_without_failing() -> None:
+    worker = _armed_hybrid_camera_worker(
+        [InvalidColourCameraStub({"colour": object()})]
+    )
+
+    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert images == []
+    assert fresh is False
+    assert worker._poll_failures == 0
+
+
+def test_one_hybrid_camera_failure_does_not_hide_the_other() -> None:
+    failed = EpisodicCameraStub()
+    failed.fail_next(1)
+    worker = _armed_hybrid_camera_worker([failed, StreamingCameraStub()])
+
+    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert fresh is True
+    assert [image.name for image in images] == ["a_pillar_right"]
+    assert worker._hybrid_camera_failures == {"a_pillar_left"}
+    assert worker._poll_failures == 0
+
+
+def test_hybrid_camera_recovers_and_only_warns_once_per_failure_episode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    camera = EpisodicCameraStub()
+    worker = _armed_hybrid_camera_worker([camera])
+    caplog.set_level("WARNING", logger=worker_module.__name__)
+
+    camera.fail_next(2)
+    worker._acquire_hybrid_camera_images(time.perf_counter())
+    worker._acquire_hybrid_camera_images(time.perf_counter())
+    recovered, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    camera.fail_next(1)
+    worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Hybrid camera a_pillar_left failed" in record.getMessage()
+    ]
+    assert [image.name for image in recovered] == ["a_pillar_left"]
+    assert fresh is True
+    assert worker._hybrid_camera_failures == {"a_pillar_left"}
+    assert len(warnings) == 2
+    assert worker._poll_failures == 0
+
+
+def test_hybrid_liveness_reports_the_colour_only_channel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = _armed_hybrid_camera_worker([StreamingCameraStub()])
+    worker._vision_streaming_since = time.perf_counter() - 0.25
+    caplog.set_level("INFO", logger=worker_module.__name__)
+
+    worker._acquire_hybrid_camera_images(time.perf_counter())
+
+    assert any(
+        "Vision check: first fresh frames" in record.getMessage()
+        and record.getMessage().endswith("| colour")
+        for record in caplog.records
+    )
+
+
+def test_hybrid_liveness_warns_about_silent_colour_frames(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = _armed_hybrid_camera_worker([InvalidColourCameraStub({})])
+    worker._vision_streaming_since = 0.0
+    caplog.set_level("WARNING", logger=worker_module.__name__)
+
+    worker._acquire_hybrid_camera_images(
+        worker_module._VISION_SILENCE_WARN_S + 0.1
+    )
+
+    assert any(
+        "no camera has delivered a new colour frame" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_vision_liveness_keeps_its_three_channel_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = BeamNgWorker()
+    worker._vision_streaming_since = 9.75
+    caplog.set_level("INFO", logger=worker_module.__name__)
+
+    worker._watch_vision_liveness(10.0, True, [])
+
+    assert caplog.records[-1].getMessage() == (
+        "Vision check: first fresh frames 0.2 s after attach | "
+        "0 cameras delivering | colour + depth + annotation"
+    )
 
 
 class VehicleStub:

@@ -761,6 +761,9 @@ class BeamNgWorker(QObject):
                 )
                 self._hybrid_camera_digests = {}
                 self._hybrid_camera_failures = set()
+                self._vision_streaming_since = time.perf_counter()
+                self._logged_vision_check = False
+                self._logged_vision_silence = False
 
             self._geometry = geometry
             self._palette = palette
@@ -2096,6 +2099,48 @@ class BeamNgWorker(QObject):
             )
         return point_chunks, colour_chunks, images, any_fresh
 
+    def _acquire_hybrid_camera_images(
+        self, now: float
+    ) -> tuple[list[CameraImage], bool]:
+        """Copy HYBRID's RGB frames without letting one camera stop its peer."""
+        images: list[CameraImage] = []
+        any_fresh = False
+
+        for index, camera in enumerate(self._hybrid_cameras):
+            name = (
+                self._hybrid_camera_names[index]
+                if index < len(self._hybrid_camera_names)
+                else str(index)
+            )
+            try:
+                raw = camera.stream_raw()
+            except Exception as exc:
+                if name not in self._hybrid_camera_failures:
+                    LOGGER.warning("Hybrid camera %s failed: %s", name, exc)
+                self._hybrid_camera_failures.add(name)
+                continue
+
+            self._hybrid_camera_failures.discard(name)
+            try:
+                width, height = camera.resolution
+                colour = raw.get("colour")
+                if colour is None or len(colour) != width * height * 4:
+                    continue
+                pixels = np.frombuffer(colour, dtype=np.uint8).copy()
+            except (AttributeError, BufferError, TypeError, ValueError):
+                continue
+
+            digest = bytes(pixels[::_VISION_DIGEST_STRIDE])
+            if digest != self._hybrid_camera_digests.get(name):
+                self._hybrid_camera_digests[name] = digest
+                any_fresh = True
+            images.append(
+                CameraImage(name=name, rgba=pixels.reshape((height, width, 4)))
+            )
+
+        self._watch_vision_liveness(now, any_fresh, images, channel="colour")
+        return images, any_fresh
+
     @staticmethod
     def _furthest_m(points: np.ndarray, origin: np.ndarray) -> float:
         if not len(points):
@@ -2376,7 +2421,11 @@ class BeamNgWorker(QObject):
             LOGGER.warning("Capture check: %s", warning)
 
     def _watch_vision_liveness(
-        self, now: float, any_fresh: bool, images: list[CameraImage]
+        self,
+        now: float,
+        any_fresh: bool,
+        images: list[CameraImage],
+        channel: str = "colour + depth + annotation",
     ) -> None:
         """
         One line when the rig comes alive, one warning if it never does.
@@ -2396,9 +2445,10 @@ class BeamNgWorker(QObject):
             )
             LOGGER.info(
                 "Vision check: first fresh frames %.1f s after attach | "
-                "%d cameras delivering | colour + depth + annotation",
+                "%d cameras delivering | %s",
                 since,
                 len(images),
+                channel,
             )
             return
         if (
@@ -2409,14 +2459,25 @@ class BeamNgWorker(QObject):
             and now - self._vision_streaming_since > _VISION_SILENCE_WARN_S
         ):
             self._logged_vision_silence = True
-            LOGGER.warning(
-                "Vision check: no camera has delivered a new frame in %.0f s. "
-                "Known trap: streaming buffers stay zero-filled when "
-                "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
-                "positive); also check the graphics preset is above 'Lowest', "
-                "which returns empty camera buffers.",
-                _VISION_SILENCE_WARN_S,
-            )
+            if channel == "colour + depth + annotation":
+                LOGGER.warning(
+                    "Vision check: no camera has delivered a new frame in %.0f s. "
+                    "Known trap: streaming buffers stay zero-filled when "
+                    "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
+                    "positive); also check the graphics preset is above 'Lowest', "
+                    "which returns empty camera buffers.",
+                    _VISION_SILENCE_WARN_S,
+                )
+            else:
+                LOGGER.warning(
+                    "Vision check: no camera has delivered a new %s frame in %.0f s. "
+                    "Known trap: streaming buffers stay zero-filled when "
+                    "requested_update_time is 0.0 (CAMERA_UPDATE_TIME_S must be "
+                    "positive); also check the graphics preset is above 'Lowest', "
+                    "which returns empty camera buffers.",
+                    channel,
+                    _VISION_SILENCE_WARN_S,
+                )
 
     def _scan_for_parking(
         self,
