@@ -8,9 +8,9 @@ import pytest
 from beamng_lidar_bev.config import CAMERA_NEAR_FAR_PLANES
 from beamng_lidar_bev.geometry import (
     CAMERA_NAMES,
+    HYBRID_CAMERA_NAMES,
     camera_vertical_fov_deg,
     derive_camera_rig,
-    HYBRID_CAMERA_NAMES,
     derive_hybrid_camera_rig,
 )
 from beamng_lidar_bev.models import (
@@ -279,6 +279,18 @@ class StreamingCameraStub:
         )
 
 
+class RemovableCameraStub(StreamingCameraStub):
+    def __init__(self, raises_on_remove: bool = False) -> None:
+        super().__init__()
+        self.raises_on_remove = raises_on_remove
+        self.remove_calls = 0
+
+    def remove(self) -> None:
+        self.remove_calls += 1
+        if self.raises_on_remove:
+            raise RuntimeError("camera removal failed")
+
+
 def _stub_mount(name: str, width: int, height: int) -> CameraMount:
     return CameraMount(
         name=name,
@@ -289,6 +301,79 @@ def _stub_mount(name: str, width: int, height: int) -> CameraMount:
         resolution=(width, height),
         sample_stride=(1, 1),
     )
+
+
+def test_hybrid_camera_constructor_is_rgb_only_streaming_shared_memory() -> None:
+    mount = derive_hybrid_camera_rig(_geometry())["a_pillar_left"]
+
+    kwargs = BeamNgWorker.hybrid_camera_sensor_kwargs(mount)
+
+    assert kwargs["requested_update_time"] == pytest.approx(0.10)
+    assert kwargs["resolution"] == (1280, 960)
+    assert kwargs["is_using_shared_memory"] is True
+    assert kwargs["is_streaming"] is True
+    assert kwargs["is_render_colours"] is True
+    assert kwargs["is_render_depth"] is False
+    assert kwargs["is_render_annotations"] is False
+    assert kwargs["is_render_instance"] is False
+
+
+def test_hybrid_camera_attach_constructs_and_owns_only_the_ordered_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HYBRID attach must leave its six LiDARs out of the Camera path."""
+
+    constructed: list[object] = []
+
+    class CameraStub:
+        def __init__(
+            self, name: str, bng: object, vehicle: object, **kwargs: object
+        ) -> None:
+            self.name = name
+            self.bng = bng
+            self.vehicle = vehicle
+            self.kwargs = kwargs
+            constructed.append(self)
+
+    monkeypatch.setattr("beamngpy.sensors.Camera", CameraStub)
+    worker = BeamNgWorker()
+    lidar_sensors = [object() for _ in range(6)]
+    worker._sensors = lidar_sensors  # type: ignore[assignment]
+    worker._sensor_names = [f"lidar_{index}" for index in range(6)]
+    worker._bng = object()  # type: ignore[assignment]
+    vehicle = object()
+
+    attached = worker._attach_hybrid_camera_rig(vehicle, _geometry(), "hybrid")
+
+    assert attached == 2
+    assert [camera.name for camera in constructed] == [
+        "hybrid_a_pillar_left",
+        "hybrid_a_pillar_right",
+    ]
+    assert worker._hybrid_cameras == constructed
+    assert worker._hybrid_camera_names == ["a_pillar_left", "a_pillar_right"]
+    assert worker._sensors == lidar_sensors
+    assert worker._sensor_names == [f"lidar_{index}" for index in range(6)]
+
+
+def test_cleanup_removes_and_forgets_every_hybrid_camera() -> None:
+    worker = BeamNgWorker()
+    cameras = (
+        RemovableCameraStub(),
+        RemovableCameraStub(raises_on_remove=True),
+    )
+    worker._hybrid_cameras = list(cameras)  # type: ignore[assignment]
+    worker._hybrid_camera_names = list(HYBRID_CAMERA_NAMES)
+    worker._hybrid_camera_digests = {"a_pillar_left": b"old"}
+    worker._hybrid_camera_failures = {"a_pillar_right"}
+
+    worker._cleanup_sensors()
+
+    assert [camera.remove_calls for camera in cameras] == [1, 1]
+    assert worker._hybrid_cameras == []
+    assert worker._hybrid_camera_names == []
+    assert worker._hybrid_camera_digests == {}
+    assert worker._hybrid_camera_failures == set()
 
 
 class VehicleStub:

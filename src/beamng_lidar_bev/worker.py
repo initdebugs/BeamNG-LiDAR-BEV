@@ -17,7 +17,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 
 if TYPE_CHECKING:
     from beamngpy import BeamNGpy, Vehicle
-    from beamngpy.sensors import Lidar
+    from beamngpy.sensors import Camera, Lidar
 
 from .aeb import (
     FORWARD,
@@ -47,6 +47,7 @@ from .config import (
     CAMERA_UPDATE_TIME_S,
     CONTROL_INTERVAL_MS,
     DISPLAY_INTERVAL_MS,
+    HYBRID_CAMERA_UPDATE_TIME_S,
     LIDAR_RANGE_M,
     LIDAR_ROAD_VISUAL_COLOUR,
     LIDAR_UPDATE_HZ,
@@ -100,6 +101,7 @@ from .controller import (
 )
 from .geometry import (
     derive_camera_rig,
+    derive_hybrid_camera_rig,
     derive_vehicle_geometry,
     outside_ego_body,
     rotate_about_up,
@@ -344,6 +346,12 @@ class BeamNgWorker(QObject):
         # update, and counting re-reads would report the tick rate as the
         # acquisition rate.
         self._sensor_mode = SENSOR_MODE_LIDAR
+        # HYBRID owns its RGB-only cameras separately: the LiDAR list remains
+        # the six-mount cloud source in its existing order.
+        self._hybrid_cameras: list[Camera] = []
+        self._hybrid_camera_names: list[str] = []
+        self._hybrid_camera_digests: dict[str, bytes] = {}
+        self._hybrid_camera_failures: set[str] = set()
         self._camera_digests: dict[str, bytes] = {}
         self._vision_streaming_since: float | None = None
         self._logged_vision_check = False
@@ -710,6 +718,7 @@ class BeamNgWorker(QObject):
                 in (MARKING_CLASSES | {"DRIVING_INSTRUCTIONS", "SPEED_BUMP"})
             }
 
+            hybrid_camera_count = 0
             if self._sensor_mode == SENSOR_MODE_VISION:
                 # Rung 0.5 of the vision ladder: every camera renders depth
                 # and annotation beside colour, and the tick unprojects them
@@ -746,6 +755,13 @@ class BeamNgWorker(QObject):
                 self._sensors.append(sensor)
                 self._verify_mount_height(sensor, bbox_z, mount)
 
+            if self._sensor_mode == SENSOR_MODE_HYBRID:
+                hybrid_camera_count = self._attach_hybrid_camera_rig(
+                    vehicle, geometry, sensor_prefix
+                )
+                self._hybrid_camera_digests = {}
+                self._hybrid_camera_failures = set()
+
             self._geometry = geometry
             self._palette = palette
             self._frame_times.clear()
@@ -764,10 +780,19 @@ class BeamNgWorker(QObject):
             return
 
         vision = self._sensor_mode == SENSOR_MODE_VISION
+        hybrid = self._sensor_mode == SENSOR_MODE_HYBRID
+        active_sensors = (
+            f"{mount_count} cameras"
+            if vision
+            else (
+                f"{mount_count} LiDAR sensors + {hybrid_camera_count} cameras"
+                if hybrid
+                else f"{mount_count} LiDAR sensors"
+            )
+        )
         self.status_changed.emit(
             "STREAMING",
-            f"{mount_count} {'cameras' if vision else 'LiDAR sensors'} active "
-            f"on {player_vid}",
+            f"{active_sensors} active on {player_vid}",
         )
         # Before sensors_ready, so the GUI knows which instrument set it is
         # enabling controls for when that signal lands.
@@ -2194,6 +2219,54 @@ class BeamNgWorker(QObject):
             is_force_inside_triangle=False,
             is_dir_world_space=False,
         )
+
+    @staticmethod
+    def hybrid_camera_sensor_kwargs(mount: CameraMount) -> dict[str, Any]:
+        """The RGB-only shared-memory Camera arguments for a HYBRID mount."""
+        return dict(
+            requested_update_time=HYBRID_CAMERA_UPDATE_TIME_S,
+            update_priority=0.0,
+            pos=mount.position_vehicle,
+            dir=mount.direction_vehicle,
+            up=(0.0, 0.0, 1.0),
+            resolution=mount.resolution,
+            field_of_view_y=mount.vertical_fov_deg,
+            near_far_planes=CAMERA_NEAR_FAR_PLANES,
+            is_using_shared_memory=True,
+            is_render_colours=True,
+            is_render_annotations=False,
+            is_render_instance=False,
+            is_render_depth=False,
+            is_visualised=False,
+            is_streaming=True,
+            is_static=False,
+            is_snapping_desired=False,
+            is_force_inside_triangle=False,
+            is_dir_world_space=False,
+        )
+
+    def _attach_hybrid_camera_rig(
+        self, vehicle: Vehicle, geometry: VehicleGeometry, sensor_prefix: str
+    ) -> int:
+        """Build HYBRID's two RGB-only cameras outside the LiDAR sensor list."""
+        from beamngpy.sensors import Camera
+
+        rig = derive_hybrid_camera_rig(geometry)
+        for index, mount in enumerate(rig.values()):
+            self.status_changed.emit(
+                "ATTACHING",
+                f"Attaching {mount.name} camera ({index + 1}/{len(rig)})",
+            )
+            camera = Camera(
+                f"{sensor_prefix}_{mount.name}",
+                self._bng,
+                vehicle,
+                **self.hybrid_camera_sensor_kwargs(mount),
+            )
+            self._hybrid_camera_names.append(mount.name)
+            self._hybrid_cameras.append(camera)
+        self._check_capture_settings()
+        return len(rig)
 
     def _attach_camera_rig(
         self, vehicle: Vehicle, geometry: VehicleGeometry, sensor_prefix: str
@@ -3815,6 +3888,15 @@ class BeamNgWorker(QObject):
         self._disengage_aeb("Sensors stopped", announce=False)
         self._disengage_parking_drive("Sensors stopped")
         self._disengage_self_driving("Sensors stopped", announce=False)
+        for camera in reversed(self._hybrid_cameras):
+            try:
+                camera.remove()
+            except Exception:
+                LOGGER.debug("Could not remove hybrid camera", exc_info=True)
+        self._hybrid_cameras.clear()
+        self._hybrid_camera_names.clear()
+        self._hybrid_camera_digests = {}
+        self._hybrid_camera_failures = set()
         for sensor in reversed(self._sensors):
             try:
                 sensor.remove()
