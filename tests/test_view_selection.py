@@ -68,6 +68,17 @@ def test_the_camera_grid_falls_back_when_the_lidar_set_is_the_instrument() -> No
     )
 
 
+def test_the_camera_grid_is_preserved_for_the_hybrid_instrument_set() -> None:
+    assert (
+        resolve_visualization(
+            VIEW_CAMERAS,
+            world_available=True,
+            cameras_available=sensor_mode_has_cameras(SENSOR_MODE_HYBRID),
+        )
+        == VIEW_CAMERAS
+    )
+
+
 def test_a_persisted_legacy_vision_view_means_the_camera_grid() -> None:
     """Settings written before the split stored "VISION" for the grid."""
     assert (

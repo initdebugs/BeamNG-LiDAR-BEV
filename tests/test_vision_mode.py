@@ -211,6 +211,13 @@ def test_a_tall_window_lays_out_in_more_rows_than_columns() -> None:
     assert rows > cols
 
 
+@pytest.mark.parametrize("size", ((1600.0, 700.0), (700.0, 1600.0)))
+def test_two_camera_angle_check_is_always_left_right(
+    size: tuple[float, float],
+) -> None:
+    assert grid_dimensions(2, *size) == (1, 2)
+
+
 def test_an_empty_grid_is_zero_by_zero() -> None:
     assert grid_dimensions(0, 800.0, 600.0) == (0, 0)
 

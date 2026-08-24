@@ -43,7 +43,7 @@ from .config import (
     VISION_DRIVING_ENABLED,
     WORLD_STORE_REFRESH_INTERVAL_S,
 )
-from .geometry import CAMERA_NAMES
+from .geometry import CAMERA_NAMES, HYBRID_CAMERA_NAMES
 from .models import BevFrame, VehicleGeometry, VisionFrame
 from .scene_worker import SceneWorker
 from .vision_view import VisionView
@@ -274,7 +274,7 @@ class MainWindow(QMainWindow):
             application_style.standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
         )
         self.attach_button.setToolTip(
-            "Attach the LiDAR sensor set to the currently selected vehicle"
+            "Attach the selected instrument set to the currently selected vehicle"
         )
         self.attach_button.setEnabled(False)
         self.attach_button.clicked.connect(self._request_attach)
@@ -458,7 +458,9 @@ class MainWindow(QMainWindow):
             application_style.standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
         )
         self.compact_attach_button.setAccessibleName("Attach to player vehicle")
-        self.compact_attach_button.setToolTip("Attach to player vehicle")
+        self.compact_attach_button.setToolTip(
+            "Attach the selected instrument set to the player vehicle"
+        )
         self.compact_attach_button.setFixedSize(40, 40)
         self.compact_attach_button.setEnabled(False)
         self.compact_attach_button.clicked.connect(self._request_attach)
@@ -599,21 +601,20 @@ class MainWindow(QMainWindow):
             lambda checked: checked and self._select_visualization(VIEW_RAW_BEV)
         )
         self.vision_button.setToolTip(
-            "Show every camera of the rig live. Available while the camera "
-            "rig is the instrument set (VISION, to the right)."
+            "Show the selected camera rig live. Available in HYBRID or VISION; "
+            "HYBRID keeps its six LiDARs authoritative for perception."
         )
         self.vision_button.clicked.connect(
             lambda checked: checked and self._select_visualization(VIEW_CAMERAS)
         )
-        # Enabled by the worker's sensor_mode_changed(VISION) and by nothing
-        # else: the grid has images to draw only while the camera rig is the
-        # instrument set, and the worker is what knows which set is live.
+        # Enabled by the worker's confirmed instrument set: only modes with
+        # cameras have images for this grid to draw.
         self.vision_button.setEnabled(False)
         header.addWidget(view_toggle)
 
         # The INSTRUMENT SET, separate from the view since rung 0.5: both
         # rigs produce the same cloud now, so WORLD and RAW BEV draw either,
-        # and only the CAMERAS view is tied to one of them. Unlike the view
+        # and only the CAMERAS view is tied to a camera-capable one. Unlike the view
         # toggle this one is not GUI-only -- the worker owns the mode and
         # re-attaches through its one teardown funnel on a live switch.
         sensor_toggle = QFrame()
@@ -624,8 +625,13 @@ class MainWindow(QMainWindow):
         self.sensor_button_group = QButtonGroup(self)
         self.sensor_button_group.setExclusive(True)
         self.lidar_mode_button = QPushButton("LIDAR")
+        self.hybrid_mode_button = QPushButton("HYBRID")
         self.vision_mode_button = QPushButton("VISION")
-        for button in (self.lidar_mode_button, self.vision_mode_button):
+        for button in (
+            self.lidar_mode_button,
+            self.hybrid_mode_button,
+            self.vision_mode_button,
+        ):
             button.setObjectName("viewToggleButton")
             button.setCheckable(True)
             button.setFixedHeight(28)
@@ -633,6 +639,11 @@ class MainWindow(QMainWindow):
             sensor_toggle_layout.addWidget(button)
         self.lidar_mode_button.setToolTip(
             "Stream the six-unit LiDAR set. Switching while streaming "
+            "re-attaches the sensors."
+        )
+        self.hybrid_mode_button.setToolTip(
+            "Stream six LiDARs with two live A-pillar camera views. LiDAR "
+            "remains authoritative for perception. Switching while streaming "
             "re-attaches the sensors."
         )
         self.vision_mode_button.setToolTip(
@@ -649,6 +660,10 @@ class MainWindow(QMainWindow):
         )
         self.lidar_mode_button.clicked.connect(
             lambda checked: checked and self._select_sensor_mode(SENSOR_MODE_LIDAR)
+        )
+        self.hybrid_mode_button.clicked.connect(
+            lambda checked: checked
+            and self._select_sensor_mode(SENSOR_MODE_HYBRID)
         )
         self.vision_mode_button.clicked.connect(
             lambda checked: checked
@@ -918,6 +933,7 @@ class MainWindow(QMainWindow):
     def _on_sensors_ready(self, vehicle_id: str, geometry: VehicleGeometry) -> None:
         self._phase = "STREAMING"
         vision = self._active_sensor_mode == SENSOR_MODE_VISION
+        hybrid = self._active_sensor_mode == SENSOR_MODE_HYBRID
         self.streaming_changed.emit(True)
         self._set_attach_enabled(False)
         self._set_stop_enabled(True)
@@ -943,12 +959,28 @@ class MainWindow(QMainWindow):
             return
         # Per-mount, because they no longer share a height: the roof unit is
         # derived from the bounding box and its whole value is how high it sits.
+        lidar_mounts = ", ".join(
+            f"{mount.name} {mount.position_vehicle[2]:.2f} m"
+            for mount in geometry.mounts.values()
+        )
+        if hybrid:
+            camera_names = ", ".join(HYBRID_CAMERA_NAMES)
+            self._set_status(
+                "STREAMING",
+                "HYBRID: LiDAR perception ("
+                + lidar_mounts
+                + "); live view only: "
+                + camera_names,
+            )
+            self._append_log(
+                f"HYBRID attached to {vehicle_id}: LiDAR remains authoritative "
+                f"for perception ({lidar_mounts} above ground); live view only "
+                f"({camera_names})"
+            )
+            return
         self._append_log(
             f"{len(geometry.mounts)} LiDAR sensors attached to {vehicle_id} ("
-            + ", ".join(
-                f"{mount.name} {mount.position_vehicle[2]:.2f} m"
-                for mount in geometry.mounts.values()
-            )
+            + lidar_mounts
             + " above ground)"
         )
 
@@ -1016,23 +1048,31 @@ class MainWindow(QMainWindow):
             return
         self._active_sensor_mode = mode
         self._append_log(
-            "Sensor mode: Vision (camera rig, engine-depth unprojection)"
-            if mode == SENSOR_MODE_VISION
-            else "Sensor mode: LiDAR"
+            {
+                SENSOR_MODE_HYBRID: (
+                    "Sensor mode: Hybrid (six LiDARs authoritative; "
+                    "a_pillar_left and a_pillar_right are live view only)"
+                ),
+                SENSOR_MODE_VISION: (
+                    "Sensor mode: Vision (camera rig, engine-depth unprojection)"
+                ),
+            }.get(mode, "Sensor mode: LiDAR")
         )
         self._sync_sensor_buttons(mode)
         # The CAMERAS view draws the rig's images, which the LiDAR set does
         # not have; it follows the confirmed mode, and a view left pointing
         # at it falls back to one that can draw.
-        self.vision_button.setEnabled(mode == SENSOR_MODE_VISION)
+        cameras_available = sensor_mode_has_cameras(self._active_sensor_mode)
+        self.vision_button.setEnabled(cameras_available)
         if (
             self._active_visualization == VIEW_CAMERAS
-            and mode != SENSOR_MODE_VISION
+            and not cameras_available
         ):
             self._select_visualization(VIEW_WORLD)
 
     def _sync_sensor_buttons(self, mode: str) -> None:
         self.lidar_mode_button.setChecked(mode == SENSOR_MODE_LIDAR)
+        self.hybrid_mode_button.setChecked(mode == SENSOR_MODE_HYBRID)
         self.vision_mode_button.setChecked(mode == SENSOR_MODE_VISION)
 
     def _select_sensor_mode(self, mode: str) -> None:
@@ -1054,7 +1094,7 @@ class MainWindow(QMainWindow):
             requested,
             world_available=self.world_view.is_ready
             and self.world_view_button.isEnabled(),
-            cameras_available=self._active_sensor_mode == SENSOR_MODE_VISION,
+            cameras_available=sensor_mode_has_cameras(self._active_sensor_mode),
         )
         self._active_visualization = selected
         widget = {

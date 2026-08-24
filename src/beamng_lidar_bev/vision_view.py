@@ -62,6 +62,8 @@ def grid_dimensions(
     """
     if count <= 0:
         return (0, 0)
+    if count == 2:
+        return (1, 2)
     if area_w <= 0.0 or area_h <= 0.0:
         return (1, count)
     best = (1, count)
