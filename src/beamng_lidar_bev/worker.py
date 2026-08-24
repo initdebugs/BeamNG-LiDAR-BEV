@@ -353,6 +353,7 @@ class BeamNgWorker(QObject):
         # nothing. The eye height is the tallest camera's, for porosity.
         self._camera_rays: dict[str, CameraRays] = {}
         self._camera_frame_seen: dict[str, float] = {}
+        self._camera_frame_checked: dict[str, float] = {}
         self._vision_eye_height_m = 0.0
         self._logged_unprojection = False
         self._frame_times: deque[float] = deque(maxlen=60)
@@ -1997,10 +1998,24 @@ class BeamNgWorker(QObject):
                     rays.pixel_index[::_VISION_DIGEST_STRIDE]
                 ]
             )
+            checked = self._camera_frame_checked.get(name)
             if depth_digest != self._camera_digests.get(name):
                 self._camera_digests[name] = depth_digest
-                self._camera_frame_seen[name] = now
+                # The buffer changed somewhere between the LAST look and this
+                # one, so the change time's best estimate is the MIDPOINT of
+                # the two. Stamping `now` instead under-ages every frame by
+                # half a tick on average (~20 ms -- 0.22 m of forward
+                # misplacement at the 40 km/h cap), which the 2026-08-24
+                # fence-run regression measured live as +32 +/- 17 ms per
+                # unit speed against a ~17-20 ms detection-latency
+                # prediction. Centring zeroes the mean and halves the worst
+                # case; the residual half-tick jitter is the ghosting
+                # milestone's remaining business.
+                self._camera_frame_seen[name] = (
+                    (now + checked) / 2.0 if checked is not None else now
+                )
                 any_fresh = True
+            self._camera_frame_checked[name] = now
             seen = self._camera_frame_seen.get(name)
             age = (
                 CAMERA_FRAME_STAGING_S
@@ -3790,6 +3805,7 @@ class BeamNgWorker(QObject):
         self._sensor_names.clear()
         self._camera_digests = {}
         self._camera_frame_seen = {}
+        self._camera_frame_checked = {}
         self._camera_rays = {}
         self._vision_eye_height_m = 0.0
         self._vision_streaming_since = None

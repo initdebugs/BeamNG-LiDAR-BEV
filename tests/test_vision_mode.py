@@ -424,6 +424,28 @@ def test_a_frames_age_is_counted_from_when_its_depth_last_changed() -> None:
     assert worker._camera_frame_seen["cam_0"] > first_seen
 
 
+def test_a_fresh_frames_seen_time_is_centred_between_the_last_two_looks() -> None:
+    """
+    The digest notices a frame change only ON a tick, so the true change
+    time is uniform over the tick that elapsed -- stamping `now` under-ages
+    every frame by half a tick on average (~20 ms, 0.22 m of forward
+    misplacement at the 40 km/h cap), which the 2026-08-24 fence-run
+    regression measured live as +32 +/- 17 ms per unit speed. The midpoint
+    of the last two looks zeroes the mean error and halves the worst case.
+    """
+    camera = StreamingCameraStub()
+    worker, _ = _armed_vision_worker([camera])
+
+    worker._poll_once()
+    checked_before = worker._camera_frame_checked["cam_0"]
+    camera.repaint()
+    worker._poll_once()
+    checked_after = worker._camera_frame_checked["cam_0"]
+    seen = worker._camera_frame_seen["cam_0"]
+    assert checked_before < checked_after
+    assert seen == pytest.approx((checked_before + checked_after) / 2.0)
+
+
 def test_vision_mode_refuses_self_driving_and_both_aebs() -> None:
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     answers: list[bool] = []
