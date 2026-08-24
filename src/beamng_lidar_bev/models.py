@@ -36,9 +36,11 @@ class SensorMount:
 @dataclass(frozen=True)
 class CameraMount:
     """
-    One camera of the Vision-mode rig, in the same vehicle frame as
+    One camera of the A-pillar pair, in the same vehicle frame as
     `SensorMount` (+X left, +Y rearward, +Z up; `pos.z` referenced to the
-    vehicle ground plane exactly as the LiDAR mounts are).
+    vehicle ground plane exactly as the LiDAR mounts are, and the lateral and
+    longitudinal stations expressed in the simulator's own sensor frame -- see
+    `VehicleGeometry.sensor_origin_vehicle`).
 
     `vertical_fov_deg` is what the Camera constructor actually takes
     (`field_of_view_y`); it is derived from the designed HORIZONTAL aperture
@@ -53,17 +55,6 @@ class CameraMount:
     horizontal_fov_deg: float
     vertical_fov_deg: float
     resolution: tuple[int, int]
-    sample_stride: tuple[int, int] = (6, 4)
-    """(column, row) pixel stride the unprojection rung samples the depth and
-    annotation images at. Per mount because rows are the RANGE axis for ground
-    seen from a camera, and only the long-range windshield camera needs them
-    fine (see config.CAMERA_SAMPLE_STRIDES)."""
-    far_road_band_m: tuple[float, float] | None = None
-    """Ground-range band (near, far) whose image rows are sampled at FULL
-    density regardless of the row stride -- the far-road densification,
-    front_main only. Requires a LEVEL optical axis (the row for ground at
-    range r is planar geometry, image y = h/r). See
-    config.CAMERA_FAR_ROAD_BAND_M."""
 
 
 @dataclass(frozen=True)
@@ -80,8 +71,20 @@ class VehicleGeometry:
     reference node -- the plane the simulator references every sensor
     `pos.z` to. `ground_z_vehicle` is the same corner measured along WORLD Z;
     the two agree on level ground and diverge by half the length times the
-    sine of the pitch on a grade, which is why unprojection places a camera
-    with this one. None (older callers, tests) falls back to ground_z_vehicle."""
+    sine of the pitch on a grade. None (older callers, tests) falls back to
+    ground_z_vehicle."""
+    sensor_origin_vehicle: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Where the simulator's origin for a vehicle-space sensor `pos` sits,
+    measured from the REFERENCE NODE in the vehicle frame.
+
+    Every extent above is measured from the reference node, and the sensor
+    origin is NOT that node -- measured on the vivace it is
+    (+0.160, +0.362, -0.233) away from it, i.e. the body centre laterally and
+    longitudinally and the ground plane vertically. A mount built from an
+    extent therefore lands displaced by exactly this vector unless it is
+    subtracted first. `worker._measure_sensor_origin` measures it live (see
+    `tools/mount_origin_probe.py`); the (0, 0, 0) default is the old,
+    uncorrected behaviour and is what every offline test uses."""
 
     @property
     def width_m(self) -> float:
@@ -409,7 +412,7 @@ class CameraImage:
 
 @dataclass(frozen=True)
 class VisionFrame:
-    """The Vision-mode analogue of `BevFrame`: the whole rig, one tick."""
+    """The camera rig's analogue of `BevFrame`: every camera, one tick."""
 
     images: tuple[CameraImage, ...]
     acquisition_fps: float

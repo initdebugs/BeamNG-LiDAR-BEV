@@ -1,3 +1,25 @@
+> **RETIRED, 2026-08-24.** The vision-ONLY ladder this roadmap describes is
+> gone: the eight-camera rig, `unprojection.py`, the oracle and the staging and
+> ghosting probes were all removed when HYBRID replaced VISION. HYBRID keeps the
+> six LiDARs authoritative and adds two colour-only A-pillar cameras as a live
+> view, so nothing below is being worked on. It is kept because the
+> MEASUREMENTS in it are about the simulator rather than about that rung, and
+> they are the reason the ladder was abandoned:
+>
+> * computed stereo resolved a 0.11 m kerb at 15 m and nowhere beyond it —
+>   matching fails on low-texture asphalt, so engine depth was the only viable
+>   depth source;
+> * the camera ground band agreed with the LiDAR floor to −1…−2 cm out to 60 m
+>   but starved past 20 m (~175 returns per 4 m ring against the road-scan
+>   unit's ~1300);
+> * camera frame staging measured ≈ 0 by two independent instruments;
+> * a fully covered simulator window throttles the renderer to ~2 Hz;
+> * the camera buffer's fourth byte is not opacity.
+>
+> Two later findings supersede parts of it outright, and both are in CLAUDE.md:
+> a sensor `pos` is resolved from the body centre rather than the reference
+> node, and a tech Camera does not auto-expose.
+
 # Vision Project — Development Roadmap
 
 The phased plan for the whole vision-only effort. The technical detail behind

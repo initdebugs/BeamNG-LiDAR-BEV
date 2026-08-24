@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-from beamng_lidar_bev import main_window
 from beamng_lidar_bev.main_window import (
     _BRIDGE_WAIT_GRACE_S,
     VIEW_CAMERAS,
     VIEW_RAW_BEV,
     VIEW_WORLD,
     bridge_wait_message,
-    controls_offered,
     resolve_sensor_mode,
     resolve_startup_visualization,
     resolve_visualization,
     sensor_mode_has_cameras,
 )
-from beamng_lidar_bev.worker import (
-    SENSOR_MODE_HYBRID,
-    SENSOR_MODE_LIDAR,
-    SENSOR_MODE_VISION,
-)
+from beamng_lidar_bev.worker import SENSOR_MODE_HYBRID, SENSOR_MODE_LIDAR
 
 
 def test_world_is_the_default_when_the_renderer_is_available() -> None:
@@ -128,11 +122,16 @@ def test_a_persisted_legacy_vision_view_means_the_camera_grid() -> None:
 
 
 def test_the_instrument_set_is_its_own_setting() -> None:
-    assert resolve_sensor_mode("VISION") == SENSOR_MODE_VISION
-    assert resolve_sensor_mode("vision") == SENSOR_MODE_VISION
     assert resolve_sensor_mode("LIDAR") == SENSOR_MODE_LIDAR
+    assert resolve_sensor_mode("lidar") == SENSOR_MODE_LIDAR
     assert resolve_sensor_mode(None) == SENSOR_MODE_LIDAR
     assert resolve_sensor_mode("garbage") == SENSOR_MODE_LIDAR
+
+
+def test_a_saved_vision_setting_lands_on_lidar_rather_than_breaking() -> None:
+    """VISION was a real persisted choice; anyone who left it selected must
+    get a working app, not an unknown instrument set."""
+    assert resolve_sensor_mode("VISION") == SENSOR_MODE_LIDAR
 
 
 def test_hybrid_is_a_persisted_instrument_set() -> None:
@@ -140,27 +139,9 @@ def test_hybrid_is_a_persisted_instrument_set() -> None:
     assert resolve_sensor_mode("hybrid") == SENSOR_MODE_HYBRID
 
 
-def test_hybrid_has_camera_view_and_lidar_controls(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(main_window, "VISION_DRIVING_ENABLED", False)
+def test_only_hybrid_has_camera_images_to_draw() -> None:
     assert sensor_mode_has_cameras(SENSOR_MODE_HYBRID) is True
-    assert sensor_mode_has_cameras(SENSOR_MODE_VISION) is True
     assert sensor_mode_has_cameras(SENSOR_MODE_LIDAR) is False
-    assert controls_offered(SENSOR_MODE_HYBRID) is True
-    assert controls_offered(SENSOR_MODE_VISION) is False
-
-
-def test_the_driving_controls_follow_the_workers_vision_gate(
-    monkeypatch,
-) -> None:
-    """The GUI offers exactly what the worker will accept, and nothing the
-    worker would bounce: one constant gates both."""
-    assert controls_offered(SENSOR_MODE_LIDAR) is True
-    monkeypatch.setattr(main_window, "VISION_DRIVING_ENABLED", False)
-    assert controls_offered(SENSOR_MODE_VISION) is False
-    monkeypatch.setattr(main_window, "VISION_DRIVING_ENABLED", True)
-    assert controls_offered(SENSOR_MODE_VISION) is True
 
 
 def test_a_booting_simulator_is_reported_as_starting_not_as_absent() -> None:

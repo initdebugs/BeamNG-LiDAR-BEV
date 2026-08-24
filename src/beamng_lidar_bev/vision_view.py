@@ -1,5 +1,5 @@
 """
-The Vision-mode camera wall: every camera of the rig, live, in one grid.
+The camera wall: every camera of the rig, live, in one grid.
 
 Qt-only and worker-agnostic on purpose -- it consumes `VisionFrame` the way
 `BevWidget` consumes `BevFrame` and never touches BeamNGpy. The grid geometry
@@ -59,13 +59,21 @@ def grid_dimensions(
     Tries every row count and keeps the arrangement whose uniformly scaled
     cell is largest -- so a wide window lays 8 cameras out 2x4 and a tall one
     4x2, with no hand-tuned breakpoints. Always satisfies rows * cols >= count.
+
+    A PAIR is the one case where the spatial reading outranks the area: left
+    and right cameras belong side by side, and stacking them puts the left one
+    above the right one, which reads as nothing at all. That override applies
+    only while the pane is at least as wide as it is tall -- forced
+    unconditionally it costs real size on a portrait pane (measured on a
+    700x1000 pane with 1280x960 frames: 341x256 drawn per tile against
+    688x516 for the stacked answer, 3.7x the pixels).
     """
     if count <= 0:
         return (0, 0)
-    if count == 2:
-        return (1, 2)
     if area_w <= 0.0 or area_h <= 0.0:
         return (1, count)
+    if count == 2 and area_w >= area_h:
+        return (1, 2)
     best = (1, count)
     best_width = -1.0
     for rows in range(1, count + 1):

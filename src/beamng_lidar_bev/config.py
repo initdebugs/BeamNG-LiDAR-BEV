@@ -239,222 +239,78 @@ LIDAR_UPDATE_TIME_S = 1.0 / LIDAR_UPDATE_HZ
 SENSOR_HEIGHT_ABOVE_GROUND_M = 0.20
 SENSOR_BODY_CLEARANCE_M = 0.08
 
-# --- Vision mode: the eight-camera rig ------------------------------------------
+# --- The A-pillar camera pair (HYBRID mode) -----------------------------------
 #
-# Rung 0 of the vision-only ladder (docs/VISION_MODE_SPEC.md): eight streaming
-# COLOUR cameras in a Tesla HW4-style layout, rendered as a live grid. Depth and
-# annotation channels stay off at this rung on purpose -- each extra channel has
-# a measured simulator cost (annotation is a second full geometry pass: 42 Hz ->
-# 33 Hz sim rate on the reference machine; depth roughly doubles the bytes
-# copied per read) and nothing consumes them yet. The unprojection rung turns
-# them on per-mount when it lands.
+# HYBRID streams the six LiDAR units unchanged -- they remain the only source
+# of perception -- and adds two COLOUR cameras at the A-pillars purely as a
+# live view. Nothing here reaches the planner, either AEB band or parking:
+# these cameras render colour only (no depth, no annotation), so there is
+# nothing to turn into a point even by accident.
 #
-# Resolution is nearly free (measured: 8 cams 320x240 -> 1280x960 costs
-# 21 -> 16 Hz -- the cost is per-camera draw submission, not per-pixel), so this
-# is NOT the dial to reach for if the sim rate drops; drop a camera instead.
-#
-# Back to 640x480 on 2026-08-23, and the history matters because the obvious
-# reading of it is wrong. It was raised to 1280x960 in response to "pixelated",
-# then the real defect turned out to be that `vision_view` was reading the
-# camera buffer's fourth byte as OPACITY (see its `_IMAGE_FORMAT`): every frame
-# was being composited against the dark tile, which reads as both softness and
-# heavy speckle. With that fixed the extra pixels may be buying nothing, so the
-# cheaper setting is being tried again on its merits.
-#
-# Measured either way on this machine, so the trade is known rather than
-# guessed: sim-side 18.6 Hz per camera at 640x480 against 16.2 at 1280x960
-# (live, the app read 17.5 Hz and 12.1 Hz respectively under load), and the
-# worker's own per-tick copy of all eight buffers 1.31 ms against 4.41 ms of
-# the 40 ms tick -- 9.8 MB a tick against 39.3, since every camera is copied
-# every tick whether or not it delivered a new frame.
-#
-# 960x720 since 2026-08-23: 640 was tried once the alpha bug was fixed and the
-# detail was judged too low, so this is the middle setting -- 2.25x the pixels
-# of 640x480 and 0.56x those of 1280x960, with the copy cost scaling the same
-# way (roughly 2.9 ms a tick for all eight). This is a display-quality dial with
-# a known cost, not a correctness one. If the copy ever binds at a
-# higher setting, digest the live buffer BEFORE copying and copy only the
-# cameras that changed -- they update at ~16-18 Hz against a 25 Hz tick.
-CAMERA_RESOLUTION = (960, 720)
+# This replaced a VISION-only mode that swapped the whole LiDAR set for an
+# eight-camera rig and unprojected its engine depth into the same cloud. That
+# rung is gone; what it measured and why it was abandoned is in the git
+# history and in docs/VISION_ROADMAP.md.
+HYBRID_CAMERA_RESOLUTION = (1280, 960)
 # MUST be positive, and this is a trap, not a tuning choice: with
 # is_streaming=True and requested_update_time=0.0 every shared-memory buffer
 # stays zero-filled forever while the read loop happily spins -- a working rig
 # producing black frames, measured live on BeamNG 0.39.4 / beamngpy 1.36.
-# 0.05 asks for 20 Hz; measured delivery for 8 colour cameras at 640x480 is
-# ~18 Hz, so the request is not the bottleneck.
-CAMERA_UPDATE_TIME_S = 0.05
-CAMERA_NEAR_FAR_PLANES = (0.05, 300.0)
-
-# --- Vision mode rung 1: LiDAR-first hybrid A-pillar camera pair -------------
-HYBRID_CAMERA_RESOLUTION = (1280, 960)
+# 0.10 asks for 10 Hz, which is ample for a view; the worker digests a strided
+# sample of each buffer to tell a genuinely new frame from a re-read.
 HYBRID_CAMERA_UPDATE_TIME_S = 0.10
+# Near/far planes for every Camera this app builds. The far plane is also what
+# a depth buffer would be scaled by, which is why it is generous.
+CAMERA_NEAR_FAR_PLANES = (0.05, 300.0)
+# A 105 degree aperture yawed 37 degrees outboard puts the pair's inner edges
+# 15.5 degrees ACROSS the centreline, so the two frames overlap ahead of the
+# car and there is no blind wedge in front of the bumper; together they cover
+# 37 + 52.5 = 89.5 degrees either side of straight ahead.
 HYBRID_CAMERA_HFOV_DEG = 105.0
 HYBRID_CAMERA_YAW_DEG = 37.0
+# Pitched down, because the near ground beside the car is what a mirror-height
+# camera is for; the frame still reaches 37 degrees above the horizon.
 HYBRID_CAMERA_PITCH_DEG = 7.0
+# Fractions of the bounding box, so the stations track the vehicle rather than
+# being fixed millimetres that only suit one car. Height is just under the
+# roofline; the longitudinal station is a quarter of the way from the body
+# centre to the nose, which is the A-pillar on a saloon.
 HYBRID_CAMERA_HEIGHT_FRACTION = 0.88
 HYBRID_CAMERA_FRONT_FRACTION = 0.25
+# How far outboard of the body's widest point each camera sits. Small on
+# purpose: a real A-pillar camera sees some of its own wing, and that is a
+# useful depth cue. It is only ever right because the mount is expressed in
+# the SIMULATOR's sensor frame -- see VehicleGeometry.sensor_origin_vehicle.
 HYBRID_CAMERA_BODY_CLEARANCE_M = 0.12
 
-# Per-mount horizontal FOVs. The Camera constructor takes a VERTICAL field of
-# view (field_of_view_y); geometry.camera_vertical_fov_deg derives it from
-# these and the aspect ratio, because the horizontal aperture is what the rig
-# is designed around. Wide rectilinear apertures sit on the same tan() cliff
-# the LiDAR's 179-degree sweep did, so nothing here goes past 110.
-CAMERA_FRONT_MAIN_HFOV_DEG = 50.0
-CAMERA_FRONT_WIDE_HFOV_DEG = 100.0
-CAMERA_FRONT_BUMPER_HFOV_DEG = 110.0
-# 90/90 rather than Tesla's 90/60, and the repeater aim moved with it, because
-# the eight apertures have to TILE THE CIRCLE and at 80/60 they did not: the
-# union left a 24.5-degree hole per side at bearings 95-120 -- over the
-# driver's shoulder, which is exactly the blind spot the repeaters exist for.
-# Reported live as the side FOVs feeling too narrow, and it is measurable
-# rather than a matter of taste. Widening the pillar alone leaves 20 degrees;
-# both to 90 leaves 5. With the repeaters re-aimed to 45 degrees off rearward
-# the union closes with a 10-degree overlap either side, and 135 degrees is a
-# better blind-spot bearing anyway. Rearward is unaffected: the 110-degree rear
-# camera spans 125-235. `test_the_rig_leaves_no_gap_all_the_way_round` pins it.
-CAMERA_PILLAR_HFOV_DEG = 90.0
-CAMERA_REPEATER_HFOV_DEG = 90.0
-# 130 since 2026-08-23, up from 110, and PITCHED DOWN (CAMERA_REAR_PITCH_DEG):
-# the rear camera is the reversing camera, and a reversing camera's job is the
-# ground immediately behind the bumper -- the kerb, the bollard, the neighbour's
-# wing -- which a level 110-degree view cut off at the frame bottom a couple of
-# metres out. Widening past the 110 the other mounts stop at costs centre
-# density (3.9 px/deg at 960 wide against 5.9), which is affordable here because
-# nothing long-range is asked of this camera: forward AEB range comes from the
-# windshield pair, and the rear brake arms at a crawl. The 16:12 vertical
-# aperture at 130 wide is ~116 degrees, so pitched 15 down the frame still
-# reaches 43 degrees above the horizon (a following car's windscreen at 5 m)
-# and the bottom edge meets the ground ~0.3 m behind the lens.
-CAMERA_REAR_HFOV_DEG = 130.0
-CAMERA_REAR_PITCH_DEG = 15.0
-# B-pillar cameras look forward-outboard, repeaters (front fenders) look
-# rear-outboard -- the HW4 pattern. Yaw is measured from straight ahead
-# (pillars) and from straight behind (repeaters).
-CAMERA_PILLAR_YAW_DEG = 55.0
-# 45, not Tesla's ~30: see the FOV note above -- the aim is what closes the
-# blind-spot gap cheaply, and it costs nothing rearward.
-CAMERA_REPEATER_YAW_DEG = 45.0
-# The bumper camera gets its OWN standoff, well past the ordinary
-# SENSOR_BODY_CLEARANCE_M: reported live (2026-08-23) that 0.08 m beyond the
-# bounding-box face still landed INSIDE the bumper shell -- the OOBB extreme is
-# set by the widest point of the car, not by the bumper face at camera height,
-# so the curved shell can enclose a point "outside" the box. The camera is
-# invisible in-world, so a generous standoff costs nothing. If the rear camera
-# is ever reported dark, it wants the same treatment.
-CAMERA_FRONT_BUMPER_STANDOFF_M = 0.30
-
-# --- Vision mode rung 0.5: engine-depth unprojection -----------------------------
+# --- What the cameras are exposed for -----------------------------------------
 #
-# Phase 2 of docs/VISION_ROADMAP.md. Every camera renders the DEPTH and
-# ANNOTATION channels beside colour, and the worker rebuilds the perception
-# waist (`points_world + colours + state`) from them through `unprojection.py`,
-# so the planner, both AEBs, the BEV and WORLD all run on the camera rig.
+# A tech Camera sensor DOES NOT auto-expose by default. Measured live on
+# 0.39.4 (tools/camera_exposure_probe.py): a camera created exactly the way
+# beamngpy creates one reports `useManualEV=true, manualEV=0.001` -- a fixed
+# linear exposure multiplier -- while the game's own view runs its eye
+# adaptation loop and had settled around 2^-12.4 = 0.00019 on the same map.
+# The sensor is therefore roughly 5x brighter than what the player sees, which
+# is the live "brighter and overexposed" report: colour mean 232-241 of 255
+# with 36-64% of pixels hard-clipped at white, against mean 76-137 and NO
+# clipping once corrected.
 #
-# Phase 1's verdict made this the PERMANENT ground-band source rather than
-# scaffolding: computed stereo resolved a kerb at 15 m and nowhere beyond it
-# (measured 2026-08-23, tools/kerb_experiment.py), so engine depth keeps kerbs
-# and the road surface for good; stereo, when it lands, takes obstacles only.
+# beamngpy cannot reach this -- its Camera constructor has no exposure
+# argument at all -- and neither can `tech_sensors`, because BeamNG ships the
+# four Lua wrappers COMMENTED OUT (lua/ge/extensions/tech/sensors.lua:438-441).
+# The C++ bindings under them are live, so the worker calls them directly
+# through queue_lua_command.
 #
-# Measured costs the rung is budgeted against (spec section 2): annotation is a
-# second full geometry pass per camera (sim 42 -> 33 Hz for eight), depth
-# doubles the bytes the simulator writes. The worker does NOT copy the depth or
-# annotation buffers -- it gathers only the strided sample below straight from
-# the live shared memory, one vectorised read per channel per camera.
-#
-# Per-camera (column, row) sample strides. Rows are the RANGE axis for ground
-# seen from a camera: a row at depression theta meets the ground at h/tan(theta)
-# and consecutive sampled rows land (r^2/h) * dtheta apart, exactly the LiDAR
-# ring-spacing arithmetic with the row stride standing in for the channel
-# pitch. So the windshield main camera -- the only long-range instrument in the
-# rig -- keeps a finer row stride than anything else: at 960x720 / 50 deg its
-# focal length is ~1029 px, so a row stride of 2 is 0.11 deg and the ground is
-# sampled every 0.6 m at 20 m from the 1.3 m windshield height. The wide and
-# side cameras are context and near field, where a coarser lattice is ample.
-# Budget at 960x720: ~280k sampled pixels across the rig, of which roughly half
-# are sky and far plane and are culled before anything else runs, landing near
-# the six-unit LiDAR rig's 100-150k. Raise a stride before touching the
-# resolution if the tick binds; the `Unprojection check:` line reports the
-# per-camera counts that decide it.
-CAMERA_SAMPLE_STRIDES = {
-    "front_main": (4, 2),
-    "front_wide": (6, 3),
-    "front_bumper": (6, 4),
-    "pillar_left": (6, 4),
-    "pillar_right": (6, 4),
-    "repeater_left": (8, 4),
-    "repeater_right": (8, 4),
-    "rear": (6, 4),
-}
-CAMERA_DEFAULT_SAMPLE_STRIDE = (6, 4)
-# The far-road row band, front_main only: every image row where LEVEL ground
-# from 20 to 100 m lands is sampled at full density, overriding the coarse
-# row stride there. Rows are the range axis and ring spacing goes as
-# (r^2/h) x row pitch, so stride-2 rows put rings 2.3 m apart at 40 m against
-# WORLD's 1.5 m road bridge -- the street oracle capture (2026-08-24,
-# tools/oracle_data/street.npz) measured the camera ground band ACCURATE to
-# -1..-2 cm against the LiDAR floor on every ring out to 60 m but STARVED
-# past 20 m (~175 returns per 4 m ring at 20-24 m against the road-scan
-# unit's ~1300, ~30 by 50 m): density, not accuracy, is the binder. The whole
-# 20-100 m band is ~54 rows just under the horizon (planar geometry,
-# image y = h/r), so full density there costs ~7k samples on a 283k lattice
-# and moves the single-frame road edge from ~30 m to ~45 m, where stride-1
-# rings outrun the bridge. Beyond that, accumulation while driving fills the
-# road exactly as it did for the pre-road-scan LiDAR rig.
-CAMERA_FAR_ROAD_BAND_M = (20.0, 100.0)
-CAMERA_FAR_ROAD_ROW_STRIDE = 1
-# The band is fitted to LEVEL ground, and the first milestone-5 drive showed
-# what that costs: on a grade the far road climbs OUT of the strip (a 6%
-# grade shifts it ~64 rows) and under pitch it swings (1 degree is ~18 rows,
-# and a road car pitches 1-3 degrees braking), so on hills the far road lost
-# its dense sampling exactly when it was wanted -- the drawn road popped
-# between ~10 m and ~40 m, and AEB's coarse-base ceiling lost its floor
-# context at range, which is what let tree canopy read as a wall (returns
-# 8-14 m up with `ground rise` readings of 5-11 m: the estimator was
-# following the canopy). The margin widens the dense strip by this many
-# degrees of grade-plus-pitch each way (~36 rows, ~17k samples); grades and
-# pitches beyond it fall back to the coarse stride exactly as before.
-CAMERA_FAR_ROAD_PITCH_MARGIN_DEG = 2.0
-# Depth decodes as raw float32 x far plane, in linear metres of PLANAR Z
-# (measured: 10 m read 9.65, 25 m -> 24.17, 50 m -> 49.51). Sky and anything
-# past the far plane come back AT the far plane, so a sample within this
-# fraction of it is not a surface and is dropped before unprojection -- along
-# with anything past LIDAR_RANGE_M, which the downstream cull would discard
-# anyway but which this avoids transforming at all.
-CAMERA_DEPTH_FAR_FRACTION = 0.98
-# A sample nearer than this is bodywork or the lens's own housing (the bumper
-# camera sees bonnet; the repeaters see the fender) and never a return.
-CAMERA_DEPTH_MIN_M = 0.30
-# The fixed part of each camera frame's age: the simulator stages frames with
-# no timestamp, and the worker can only measure the part AFTER the buffer
-# changed (the digest age). MEASURED ~= 0 on 2026-08-24, two independent ways
-# -- tools/camera_staging_probe.py (a swung camera's buffer follows within
-# 5-8 ms, which frames staged 1-2 behind could never do) and
-# tools/ghosting_probe.py's fence-run regression (+32 +/- 17 ms of total
-# speed-scaled age error, of which the probe's own detection latency predicts
-# ~17-20) -- so zero is a measured value, not a default. Points are placed
-# from the pose the car had `age` ago; at the 40 km/h cap an unmodelled 60 ms
-# would be 0.66 m, in the late direction for AEB -- and in a turn, every
-# unmodelled millisecond rotates the cloud about the car before it is stamped
-# into the world stores.
-CAMERA_FRAME_STAGING_S = 0.0
-# Whether self-driving, both AEBs and parking may engage on the unprojected
-# camera cloud. ON since 2026-08-24 -- roadmap milestone 5's code change,
-# earned by the phase-2 measurements: the camera ground band agrees with the
-# LiDAR floor to -1..-2 cm on every ring out to 60 m (street oracle),
-# registration is measured (staging ~= 0; detection jitter zero-mean and
-# half-tick bounded after the seen-time centring), and everything from
-# `points_world + colours` on is the LiDAR path's own code. TRUST is still
-# gated on the live phantom checklist -- hills, brake dive, bushes, kerbs,
-# reverse, plus the two measured sampling differences (low canopy entering
-# the planner band from the repeaters; a car's rear glass reading one 0.4 m
-# cell nearer than its bumper) -- because the camera lattice is a new
-# distribution (no azimuth stripes, density falling as 1/r^2) and every
-# LiDAR-era phantom hid exactly there. This constant stays as the SHUT-OFF:
-# one flip closes all four slots (self-driving, both AEBs, parking) through
-# the one gate, worker-side (_vision_refuses_driving, the load-bearing half)
-# and GUI-side (controls_offered) at once.
-VISION_DRIVING_ENABLED = True
+# True hands each camera's render view to the engine's own eye adaptation,
+# which is what makes it behave like the stock camera. Setting it False pins
+# every camera at HYBRID_CAMERA_MANUAL_EV instead, which is what you want if
+# the tiles must not change brightness between frames.
+HYBRID_CAMERA_AUTO_EXPOSURE = True
+# The fixed LINEAR exposure used when auto-exposure is off. Not stops: the
+# sensor's manualEV is a multiplier, and measured on a bright map 0.0001 reads
+# mean 73, 0.001 (the shipped default) reads 90 with clipping already starting,
+# and 1.0 reads 238. Anything at or above ~50 saturates the frame outright.
+HYBRID_CAMERA_MANUAL_EV = 0.0002
 
 DISPLAY_RADIUS_M = 105.0
 # poll_sensors("state") is a blocking round-trip measured at 32.7 ms (p95 35.3),

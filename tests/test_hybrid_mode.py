@@ -9,12 +9,13 @@ import numpy as np
 import pytest
 
 from beamng_lidar_bev import worker as worker_module
-from beamng_lidar_bev.config import CAMERA_NEAR_FAR_PLANES
+from beamng_lidar_bev.config import (
+    CAMERA_NEAR_FAR_PLANES,
+    HYBRID_CAMERA_BODY_CLEARANCE_M,
+)
 from beamng_lidar_bev.geometry import (
-    CAMERA_NAMES,
     HYBRID_CAMERA_NAMES,
     camera_vertical_fov_deg,
-    derive_camera_rig,
     derive_hybrid_camera_rig,
 )
 from beamng_lidar_bev.models import (
@@ -25,7 +26,6 @@ from beamng_lidar_bev.models import (
     VisionFrame,
 )
 from beamng_lidar_bev.semantics import SemanticPalette
-from beamng_lidar_bev.unprojection import build_camera_rays
 from beamng_lidar_bev.vision_view import (
     grid_dimensions,
     toggle_focus,
@@ -34,7 +34,6 @@ from beamng_lidar_bev.vision_view import (
 from beamng_lidar_bev.worker import (
     SENSOR_MODE_HYBRID,
     SENSOR_MODE_LIDAR,
-    SENSOR_MODE_VISION,
     BeamNgWorker,
 )
 
@@ -74,12 +73,6 @@ def _offset_geometry() -> VehicleGeometry:
 # --- The rig ------------------------------------------------------------------
 
 
-def test_the_rig_is_the_eight_hw4_cameras_in_a_stable_order() -> None:
-    rig = derive_camera_rig(_geometry())
-    assert tuple(rig) == CAMERA_NAMES
-    assert len(rig) == 8
-
-
 def test_the_hybrid_rig_is_exactly_the_two_a_pillar_cameras() -> None:
     rig = derive_hybrid_camera_rig(_offset_geometry())
     assert tuple(rig) == HYBRID_CAMERA_NAMES
@@ -101,6 +94,11 @@ def test_hybrid_cameras_are_mirrored_outboard_a_pillar_mounts() -> None:
     assert left.position_vehicle[0] - centre_x == pytest.approx(
         -(right.position_vehicle[0] - centre_x)
     )
+
+
+def _bearing_deg(direction: tuple[float, float, float]) -> float:
+    """Compass bearing in the vehicle frame: forward 0, LEFT +90, rear 180."""
+    return math.degrees(math.atan2(direction[0], -direction[1]))
 
 
 def test_hybrid_pair_covers_the_front_half_circle_with_overlap() -> None:
@@ -128,59 +126,6 @@ def test_hybrid_pair_is_high_quality_and_pitched_toward_the_road() -> None:
         assert pitch == pytest.approx(7.0)
 
 
-def test_forward_is_negative_y_never_the_intuitive_positive() -> None:
-    """
-    Vehicle space is +X left, +Y REARWARD: a camera built with the intuitive
-    dir=(0, 1, 0) films the rear seats. Verified live in the feasibility work
-    across all mounts, so the sign is pinned here.
-    """
-    rig = derive_camera_rig(_geometry())
-    for name in ("front_main", "front_wide", "front_bumper"):
-        assert rig[name].direction_vehicle == (0.0, -1.0, 0.0)
-    # The rear camera looks back (+Y) and DOWN: it is the reversing camera,
-    # and its job is the ground immediately behind the bumper.
-    rear = rig["rear"].direction_vehicle
-    assert rear[0] == 0.0 and rear[1] > 0.9 and rear[2] < 0.0
-
-
-def test_side_cameras_sit_outside_the_body_shell() -> None:
-    """There is no hide-ego flag: a mount inside the glasshouse films the
-    cabin (measured 68% CAR on the first windshield attempt)."""
-    geometry = _geometry()
-    rig = derive_camera_rig(geometry)
-    for name in ("pillar_left", "repeater_left"):
-        assert rig[name].position_vehicle[0] > geometry.left_m
-    for name in ("pillar_right", "repeater_right"):
-        assert rig[name].position_vehicle[0] < -geometry.right_m
-    # The bumper camera needs a GENEROUS standoff, not just "outside the
-    # bbox": the ordinary clearance landed inside the bumper shell live,
-    # because the box face is the car's widest point, not the bumper face.
-    assert rig["front_bumper"].position_vehicle[1] <= -(
-        geometry.front_m + 0.25
-    )
-    assert rig["rear"].position_vehicle[1] > geometry.rear_m
-
-
-def test_pillars_look_forward_outboard_and_repeaters_rear_outboard() -> None:
-    rig = derive_camera_rig(_geometry())
-    # +X is LEFT: the left pillar's direction gains a positive X component,
-    # and forward means a negative Y one.
-    assert rig["pillar_left"].direction_vehicle[0] > 0.0
-    assert rig["pillar_left"].direction_vehicle[1] < 0.0
-    assert rig["pillar_right"].direction_vehicle[0] < 0.0
-    assert rig["pillar_right"].direction_vehicle[1] < 0.0
-    assert rig["repeater_left"].direction_vehicle[0] > 0.0
-    assert rig["repeater_left"].direction_vehicle[1] > 0.0
-    assert rig["repeater_right"].direction_vehicle[0] < 0.0
-    assert rig["repeater_right"].direction_vehicle[1] > 0.0
-
-
-def test_every_mount_sits_between_the_ground_plane_and_the_roof() -> None:
-    geometry = _geometry()
-    for mount in derive_camera_rig(geometry).values():
-        assert 0.0 < mount.position_vehicle[2] <= geometry.height_m
-
-
 def test_the_vertical_fov_is_derived_from_the_horizontal_and_aspect() -> None:
     # The constructor takes field_of_view_y; the rig is designed in horizontal
     # apertures, so the projection has to run backwards through the aspect.
@@ -188,7 +133,7 @@ def test_the_vertical_fov_is_derived_from_the_horizontal_and_aspect() -> None:
     assert vfov == pytest.approx(
         math.degrees(2.0 * math.atan(math.tan(math.radians(45.0)) * 0.75))
     )
-    for mount in derive_camera_rig(_geometry()).values():
+    for mount in derive_hybrid_camera_rig(_geometry()).values():
         assert mount.vertical_fov_deg < mount.horizontal_fov_deg
 
 
@@ -211,11 +156,18 @@ def test_a_tall_window_lays_out_in_more_rows_than_columns() -> None:
     assert rows > cols
 
 
-@pytest.mark.parametrize("size", ((1600.0, 700.0), (700.0, 1600.0)))
-def test_two_camera_angle_check_is_always_left_right(
-    size: tuple[float, float],
-) -> None:
-    assert grid_dimensions(2, *size) == (1, 2)
+def test_a_camera_pair_lays_out_left_and_right_on_any_landscape_pane() -> None:
+    # Stacking a left/right pair puts the left camera ABOVE the right one,
+    # which reads as nothing at all -- so on a pane with the width for it the
+    # spatial reading outranks the area search.
+    for size in ((1600.0, 700.0), (1000.0, 1000.0), (900.0, 640.0)):
+        assert grid_dimensions(2, *size) == (1, 2)
+
+
+def test_a_portrait_pane_stacks_the_pair_rather_than_shrinking_it() -> None:
+    # Forced side by side on a tall pane the tiles lose 3.7x their pixels, and
+    # nothing about the layout is worth that.
+    assert grid_dimensions(2, 700.0, 1600.0) == (2, 1)
 
 
 def test_an_empty_grid_is_zero_by_zero() -> None:
@@ -510,12 +462,22 @@ def _hybrid_attach_worker(
             self, name: str, bng: object, vehicle: object, **kwargs: object
         ) -> None:
             del bng, vehicle, kwargs
+            self.name = name
+            self.remove_calls = 0
+            # The sensor-origin probe is a throwaway camera at (0, 0, 0); it
+            # is not part of the rig and must not appear in the build order.
+            self.is_origin_probe = name.startswith("origin_")
+            if self.is_origin_probe:
+                return
             constructor_order.append(("Camera", name))
             if fail_second_camera and name.endswith("_a_pillar_right"):
                 raise RuntimeError("second hybrid camera failed")
-            self.name = name
-            self.remove_calls = 0
             cameras.append(self)
+
+        def get_position(self) -> tuple[float, float, float]:
+            # Reports the reference node, so the measured correction is zero
+            # and the mounts keep the offline suite's numbers.
+            return (0.0, 0.0, 0.0)
 
         def remove(self) -> None:
             self.remove_calls += 1
@@ -536,7 +498,7 @@ def _hybrid_attach_worker(
     monkeypatch.setattr(
         worker_module,
         "derive_vehicle_geometry",
-        lambda state, bbox: _hybrid_attach_geometry(),
+        lambda state, bbox, **kwargs: _hybrid_attach_geometry(),
     )
     monkeypatch.setattr(worker, "_attach_electrics", lambda vehicle: None)
     monkeypatch.setattr(worker, "_load_annotations", lambda: {"STREET": (1, 2, 3)})
@@ -598,7 +560,7 @@ def test_attach_to_player_hybrid_failure_removes_every_constructed_sensor(
     )
     worker._hybrid_camera_digests = {"old": b"stale"}
     worker._hybrid_camera_failures = {"old"}
-    worker._camera_digests = {"vision": b"stale"}
+    worker._hybrid_camera_frames = {"old": np.zeros((2, 2, 4), dtype=np.uint8)}
     statuses: list[tuple[str, str]] = []
     worker.status_changed.connect(
         lambda state, detail: statuses.append((state, detail))
@@ -619,10 +581,7 @@ def test_attach_to_player_hybrid_failure_removes_every_constructed_sensor(
     assert worker._hybrid_camera_names == []
     assert worker._hybrid_camera_digests == {}
     assert worker._hybrid_camera_failures == set()
-    assert worker._camera_digests == {}
-    assert worker._camera_frame_seen == {}
-    assert worker._camera_frame_checked == {}
-    assert worker._camera_rays == {}
+    assert worker._hybrid_camera_frames == {}
     assert worker._geometry is None
     assert worker._palette is None
     assert all(state != "STREAMING" for state, _detail in statuses)
@@ -665,9 +624,8 @@ def test_hybrid_rgb_acquisition_preserves_order_and_owns_the_bytes() -> None:
     cameras = [StreamingCameraStub(), StreamingCameraStub()]
     worker = _armed_hybrid_camera_worker(cameras)
 
-    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    images = worker._acquire_hybrid_camera_images(time.perf_counter())
 
-    assert fresh is True
     assert [image.name for image in images] == list(HYBRID_CAMERA_NAMES)
     assert [camera.stream_raw_calls for camera in cameras] == [1, 1]
     assert all(image.rgba.shape == (3, 4, 4) for image in images)
@@ -678,29 +636,47 @@ def test_hybrid_rgb_acquisition_preserves_order_and_owns_the_bytes() -> None:
     )
 
 
-def test_unchanged_hybrid_colour_is_not_counted_as_a_new_frame() -> None:
+def test_unchanged_hybrid_colour_is_not_re_copied_and_the_tile_survives() -> None:
     camera = StreamingCameraStub()
     worker = _armed_hybrid_camera_worker([camera])
 
-    _, first = worker._acquire_hybrid_camera_images(time.perf_counter())
-    _, second = worker._acquire_hybrid_camera_images(time.perf_counter())
+    first = worker._acquire_hybrid_camera_images(time.perf_counter())
+    held = first[0].rgba
+    # A tick on which nothing changed re-shows the frame already held rather
+    # than copying 4.9 MB again -- and the tile must not drop out of the grid.
+    second = worker._acquire_hybrid_camera_images(time.perf_counter())
+    assert [image.name for image in second] == [HYBRID_CAMERA_NAMES[0]]
+    assert second[0].rgba is held
+
     camera.repaint()
-    _, third = worker._acquire_hybrid_camera_images(time.perf_counter())
+    third = worker._acquire_hybrid_camera_images(time.perf_counter())
+    assert third[0].rgba is not held
 
-    assert (first, second, third) == (True, False, True)
 
-
-def test_a_single_changed_hybrid_colour_byte_is_fresh() -> None:
-    """Freshness must cover all copied bytes, not a sparse byte sample."""
+def test_a_buffer_inside_the_digest_budget_is_sampled_whole() -> None:
+    """
+    The freshness test reads a BYTE BUDGET, not the whole frame -- digesting
+    4.9 MB twice a tick cost 9.8 ms of the 40 ms tick. A buffer smaller than
+    the budget is still read whole, so a single changed byte is seen.
+    """
     camera = ByteMutatingCameraStub()
     worker = _armed_hybrid_camera_worker([camera])
 
-    _, first = worker._acquire_hybrid_camera_images(time.perf_counter())
-    _, second = worker._acquire_hybrid_camera_images(time.perf_counter())
+    first = worker._acquire_hybrid_camera_images(time.perf_counter())
+    held = first[0].rgba
+    assert worker._acquire_hybrid_camera_images(time.perf_counter())[0].rgba is held
     camera.mutate_byte(1, 99)
-    _, third = worker._acquire_hybrid_camera_images(time.perf_counter())
+    assert (
+        worker._acquire_hybrid_camera_images(time.perf_counter())[0].rgba
+        is not held
+    )
 
-    assert (first, second, third) == (True, False, True)
+
+def test_the_digest_budget_bounds_what_a_full_size_frame_costs() -> None:
+    # 1280x960x4 is 4.9 MB; the sample must stay near the budget however big
+    # the frame is, or the cost this exists to remove comes straight back.
+    step = max(1, (1280 * 960 * 4) // worker_module._CAMERA_DIGEST_BYTES)
+    assert len(range(0, 1280 * 960 * 4, step)) <= 2 * worker_module._CAMERA_DIGEST_BYTES
 
 
 def test_hybrid_malformed_colour_buffers_are_omitted_without_failing() -> None:
@@ -710,12 +686,14 @@ def test_hybrid_malformed_colour_buffers_are_omitted_without_failing() -> None:
     ]
     worker = _armed_hybrid_camera_worker(cameras)
 
-    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    images = worker._acquire_hybrid_camera_images(time.perf_counter())
 
     assert images == []
-    assert fresh is False
     assert worker._poll_failures == 0
-    assert worker._hybrid_camera_failures == set()
+    # Recorded, not silently dropped: a camera whose buffer is permanently
+    # unusable vanishes from the grid, and without this nothing in the log
+    # ever mentions it again.
+    assert worker._hybrid_camera_failures == set(HYBRID_CAMERA_NAMES)
 
 
 def test_hybrid_non_buffer_colour_is_omitted_without_failing() -> None:
@@ -723,10 +701,9 @@ def test_hybrid_non_buffer_colour_is_omitted_without_failing() -> None:
         [InvalidColourCameraStub({"colour": object()})]
     )
 
-    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    images = worker._acquire_hybrid_camera_images(time.perf_counter())
 
     assert images == []
-    assert fresh is False
     assert worker._poll_failures == 0
 
 
@@ -736,12 +713,11 @@ def test_typed_hybrid_colour_with_the_wrong_byte_size_does_not_hide_a_peer() -> 
     )
     worker = _armed_hybrid_camera_worker([malformed, StreamingCameraStub()])
 
-    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    images = worker._acquire_hybrid_camera_images(time.perf_counter())
 
     assert [image.name for image in images] == ["a_pillar_right"]
-    assert fresh is True
     assert worker._poll_failures == 0
-    assert worker._hybrid_camera_failures == set()
+    assert worker._hybrid_camera_failures == {"a_pillar_left"}
 
 
 def test_one_hybrid_camera_failure_does_not_hide_the_other() -> None:
@@ -749,9 +725,8 @@ def test_one_hybrid_camera_failure_does_not_hide_the_other() -> None:
     failed.fail_next(1)
     worker = _armed_hybrid_camera_worker([failed, StreamingCameraStub()])
 
-    images, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    images = worker._acquire_hybrid_camera_images(time.perf_counter())
 
-    assert fresh is True
     assert [image.name for image in images] == ["a_pillar_right"]
     assert worker._hybrid_camera_failures == {"a_pillar_left"}
     assert worker._poll_failures == 0
@@ -767,7 +742,7 @@ def test_hybrid_camera_recovers_and_only_warns_once_per_failure_episode(
     camera.fail_next(2)
     worker._acquire_hybrid_camera_images(time.perf_counter())
     worker._acquire_hybrid_camera_images(time.perf_counter())
-    recovered, fresh = worker._acquire_hybrid_camera_images(time.perf_counter())
+    recovered = worker._acquire_hybrid_camera_images(time.perf_counter())
     camera.fail_next(1)
     worker._acquire_hybrid_camera_images(time.perf_counter())
 
@@ -777,7 +752,6 @@ def test_hybrid_camera_recovers_and_only_warns_once_per_failure_episode(
         if "Hybrid camera a_pillar_left failed" in record.getMessage()
     ]
     assert [image.name for image in recovered] == ["a_pillar_left"]
-    assert fresh is True
     assert worker._hybrid_camera_failures == {"a_pillar_left"}
     assert len(warnings) == 2
     assert worker._poll_failures == 0
@@ -814,21 +788,6 @@ def test_hybrid_liveness_warns_about_silent_colour_frames(
         "no camera has delivered a new colour frame" in record.getMessage()
         and "HYBRID_CAMERA_UPDATE_TIME_S" in record.getMessage()
         for record in caplog.records
-    )
-
-
-def test_vision_liveness_keeps_its_three_channel_message(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    worker = BeamNgWorker()
-    worker._vision_streaming_since = 9.75
-    caplog.set_level("INFO", logger=worker_module.__name__)
-
-    worker._watch_vision_liveness(10.0, True, [])
-
-    assert caplog.records[-1].getMessage() == (
-        "Vision check: first fresh frames 0.2 s after attach | "
-        "0 cameras delivering | colour + depth + annotation"
     )
 
 
@@ -877,55 +836,20 @@ def _armed_hybrid_tick_worker(
     return worker, lidars
 
 
-def _armed_vision_worker(
-    cameras: list[StreamingCameraStub],
-) -> tuple[BeamNgWorker, list[VisionFrame]]:
+def _streaming_worker() -> BeamNgWorker:
+    """A worker with a live sensor set, for the mode-switch funnel tests."""
     worker = BeamNgWorker()
-    frames: list[VisionFrame] = []
-    worker._sensor_mode = SENSOR_MODE_VISION
     worker._bng = object()  # type: ignore[assignment]
     worker._vehicle = VehicleStub()  # type: ignore[assignment]
-    worker._sensors = cameras  # type: ignore[assignment]
-    worker._sensor_names = [f"cam_{index}" for index in range(len(cameras))]
+    worker._sensors = [HybridLidarStub(0.0)]  # type: ignore[assignment]
+    worker._sensor_names = ["front"]
     worker._geometry = _geometry()
     worker._palette = SemanticPalette.from_annotations({"STREET": (255, 0, 0)})
-    worker._camera_rays = {
-        name: build_camera_rays(_stub_mount(name, *camera.resolution))
-        for name, camera in zip(worker._sensor_names, cameras)
-    }
-    worker._vision_eye_height_m = 1.3
-    worker.vision_frame_ready.connect(frames.append)
-    return worker, frames
+    return worker
 
 
 def test_the_worker_defaults_to_lidar_mode() -> None:
     assert BeamNgWorker()._sensor_mode == SENSOR_MODE_LIDAR
-
-
-def test_a_vision_tick_streams_every_camera_and_emits_both_frames() -> None:
-    """
-    Rung 0.5: a vision tick emits the camera grid's frame AND the BEV frame,
-    because the unprojected cloud rejoins the common pipeline -- the same
-    tick, the same frame object the LiDAR set produces.
-    """
-    cameras = [StreamingCameraStub() for _ in range(8)]
-    worker, frames = _armed_vision_worker(cameras)
-    bev_frames: list[BevFrame] = []
-    worker.frame_ready.connect(bev_frames.append)
-
-    worker._poll_once()
-
-    assert [camera.stream_raw_calls for camera in cameras] == [1] * 8
-    assert len(frames) == 1
-    frame = frames[0]
-    assert len(frame.images) == 8
-    assert frame.images[0].rgba.shape == (3, 4, 4)
-    assert frame.images[0].rgba.dtype == np.uint8
-    assert frame.speed_mps == pytest.approx(5.0)
-    assert len(bev_frames) == 1
-    bev = bev_frames[0]
-    assert bev.raw_point_count == 8 * 4 * 3
-    assert bev.speed_mps == pytest.approx(5.0)
 
 
 def test_hybrid_tick_emits_camera_feed_but_only_lidar_perception(
@@ -1067,256 +991,36 @@ def test_hybrid_tick_contains_one_camera_failure_beside_lidar_frames() -> None:
     assert fatals == []
 
 
-def test_the_unprojected_cloud_lands_where_the_depth_says_and_is_classified() -> None:
-    """
-    A wall 20 m down the optical axis of a camera 0.6 m ahead of the node,
-    painted STREET in the annotation channel, comes out of the tick as ROAD
-    points 20.6 m ahead -- the whole waist, end to end, through the real
-    semantic pass.
-    """
-    camera = StreamingCameraStub(depth_m=20.0, annotation=(255, 0, 0))
-    worker, _ = _armed_vision_worker([camera])
-    bev_frames: list[BevFrame] = []
-    worker.frame_ready.connect(bev_frames.append)
-    snapshots: list[object] = []
-    worker.perception_ready.connect(snapshots.append)
-
-    worker._poll_once()
-
-    bev = bev_frames[0]
-    assert len(bev.road_points) == 12 and len(bev.obstacle_points) == 0
-    assert np.allclose(bev.road_points[:, 1], 20.6, atol=0.01)
-    assert len(snapshots) == 1
-    world = snapshots[0].points_world
-    # VehicleStub faces world +Y from (1, 2, 3): the wall is at y = 22.6.
-    assert np.allclose(world[:, 1], 22.6, atol=0.01)
-
-
-def test_a_camera_without_depth_still_reaches_the_grid_but_not_the_cloud() -> None:
-    cameras = [StreamingCameraStub(with_depth=False), StreamingCameraStub()]
-    worker, frames = _armed_vision_worker(cameras)
-    bev_frames: list[BevFrame] = []
-    worker.frame_ready.connect(bev_frames.append)
-
-    worker._poll_once()
-
-    assert len(frames[0].images) == 2
-    assert bev_frames[0].raw_point_count == 12
-
-
-def test_vision_mode_offers_driving_by_default_since_milestone_5() -> None:
-    """
-    Milestone 5's code change: VISION_DRIVING_ENABLED ships True, earned by
-    the phase-2 measurements (ground band -1..-2 cm against the LiDAR floor
-    out to 60 m, staging ~= 0, zero-mean detection jitter after the
-    seen-time centring). The refusal machinery stays -- the closed-gate test
-    below pins the other direction -- and TRUST is gated on the live phantom
-    checklist, which is driving, not code.
-    """
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-
-    worker.set_aeb(True)
-    worker.set_rear_aeb(True)
-    worker.set_self_driving(True)
-    worker.set_parking_scan(True)
-
-    assert worker._aeb_enabled is True
-    assert worker._rear_aeb_enabled is True
-    assert worker._self_driving is True
-    assert worker._parking_scan is True
-
-
-def test_porosity_reasons_from_the_tallest_camera_in_vision_mode() -> None:
-    """
-    The see-through veto needs the eye height of the unit that can see OVER
-    a short object. In LiDAR mode that is the roof unit; on the camera rig
-    it is the windshield pair, and the LiDAR geometry's roof mount must not
-    be consulted for a rig that does not have one.
-    """
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    assert worker._porosity_sensor_height(_geometry()) == pytest.approx(1.3)
-    worker._sensor_mode = SENSOR_MODE_LIDAR
-    assert worker._porosity_sensor_height(_geometry()) == 0.0
-
-
-def test_the_image_is_a_private_copy_not_the_shared_buffer() -> None:
-    """stream_raw hands back a view of the LIVE shared-memory buffer; the
-    frame must carry its own bytes or the grid tears as the sim writes."""
-    worker, frames = _armed_vision_worker([StreamingCameraStub()])
-
-    worker._poll_once()
-
-    image = frames[0].images[0].rgba
-    assert image.flags["OWNDATA"] or image.base.flags["OWNDATA"]
-    image_value = int(image[0, 0, 0])
-    assert image_value == 17
-
-
-def test_rereads_of_an_unchanged_buffer_do_not_count_as_acquisition() -> None:
-    """The tick re-reads shared memory faster than the cameras update, so the
-    acquisition metric counts genuinely NEW frames -- the LiDAR rule. The
-    digest is taken on the DEPTH lattice now, which the unprojection gathers
-    anyway, so freshness costs nothing extra."""
-    camera = StreamingCameraStub()
-    worker, frames = _armed_vision_worker([camera])
-
-    worker._poll_once()
-    worker._poll_once()
-    assert frames[1].acquisition_fps == pytest.approx(0.0)
-
-    camera.repaint()
-    worker._poll_once()
-    assert frames[2].acquisition_fps > 0.0
-
-
-def test_a_frames_age_is_counted_from_when_its_depth_last_changed() -> None:
-    """
-    The simulator stamps nothing, so the only measurable part of a frame's
-    age is how long since its buffer changed. The worker keeps that per
-    camera and places each camera's cloud from the pose the car had then.
-    """
-    camera = StreamingCameraStub()
-    worker, _ = _armed_vision_worker([camera])
-
-    worker._poll_once()
-    first_seen = worker._camera_frame_seen["cam_0"]
-    worker._poll_once()
-    assert worker._camera_frame_seen["cam_0"] == first_seen
-
-    camera.repaint()
-    worker._poll_once()
-    assert worker._camera_frame_seen["cam_0"] > first_seen
-
-
-def test_a_fresh_frames_seen_time_is_centred_between_the_last_two_looks() -> None:
-    """
-    The digest notices a frame change only ON a tick, so the true change
-    time is uniform over the tick that elapsed -- stamping `now` under-ages
-    every frame by half a tick on average (~20 ms, 0.22 m of forward
-    misplacement at the 40 km/h cap), which the 2026-08-24 fence-run
-    regression measured live as +32 +/- 17 ms per unit speed. The midpoint
-    of the last two looks zeroes the mean error and halves the worst case.
-    """
-    camera = StreamingCameraStub()
-    worker, _ = _armed_vision_worker([camera])
-
-    worker._poll_once()
-    checked_before = worker._camera_frame_checked["cam_0"]
-    camera.repaint()
-    worker._poll_once()
-    checked_after = worker._camera_frame_checked["cam_0"]
-    seen = worker._camera_frame_seen["cam_0"]
-    assert checked_before < checked_after
-    assert seen == pytest.approx((checked_before + checked_after) / 2.0)
-
-
-def test_the_closed_vision_gate_still_refuses_every_slot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The gate ships OPEN now, but it stays the shut-off: closed, all three
-    slots must bounce through the WORKER's own refusal -- a guard living
-    only in the window is one a queued signal walks straight past."""
-    import beamng_lidar_bev.worker as worker_module
-
-    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    answers: list[bool] = []
-    worker.self_driving_changed.connect(answers.append)
-    worker.aeb_changed.connect(answers.append)
-    worker.rear_aeb_changed.connect(answers.append)
-
-    worker.set_self_driving(True)
-    worker.set_aeb(True)
-    worker.set_rear_aeb(True)
-
-    assert answers == [False, False, False]
-    assert worker._self_driving is False
-    assert worker._aeb_enabled is False
-    assert worker._rear_aeb_enabled is False
-
-
-def test_the_closed_gate_refuses_the_parking_scan_and_the_parking_drive(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Parking sits behind the SAME gate as self-driving and both brakes -- one
-    constant, four slots -- so with the gate shut it must bounce exactly as
-    they do, through the WORKER's own refusal. (The original rationale, that
-    the camera rig produced nothing to classify, died with rung 0.5: the
-    annotation channel fills the marking store in both modes now.)
-    """
-    import beamng_lidar_bev.worker as worker_module
-
-    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    answers: list[bool] = []
-    worker.parking_changed.connect(answers.append)
-    worker.parking_drive_changed.connect(answers.append)
-
-    worker.set_parking_scan(True)
-    worker.set_parking_drive(True)
-
-    assert answers == [False, False]
-    assert worker._parking_scan is False
-    assert worker._parking_driving is False
-
-
-def test_the_parking_refusal_names_the_missing_instrument_set(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    `set_parking_drive` already refused transitively -- no bay can be found
-    behind a closed gate, so no selection can match -- but it said "select a
-    parking bay", which is unactionable when finding one is impossible.
-    """
-    import beamng_lidar_bev.worker as worker_module
-
-    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    messages: list[str] = []
-    worker.status_changed.connect(lambda _state, detail: messages.append(detail))
-
-    worker.set_parking_scan(True)
-    worker.set_parking_drive(True)
-
-    assert len(messages) == 2
-    assert all("Vision mode" in message for message in messages)
-
-
-def test_leaving_vision_mode_lets_the_parking_scan_arm_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The refusal is the MODE's, not a latch: it must not outlive the mode."""
-    import beamng_lidar_bev.worker as worker_module
-
-    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", False)
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    worker.set_parking_scan(True)
-    assert worker._parking_scan is False
-
-    worker._sensor_mode = SENSOR_MODE_LIDAR
-    worker.set_parking_scan(True)
-
-    assert worker._parking_scan is True
-
-
 def test_switching_mode_mid_stream_reattaches_through_the_one_funnel() -> None:
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    worker = _streaming_worker()
     worker._sensor_mode = SENSOR_MODE_LIDAR
     reattaches: list[bool] = []
     modes: list[str] = []
     worker.attach_to_player = lambda: reattaches.append(True)  # type: ignore
     worker.sensor_mode_changed.connect(modes.append)
 
-    worker.set_sensor_mode(SENSOR_MODE_VISION)
-    worker.set_sensor_mode(SENSOR_MODE_VISION)  # repeat is a no-op
+    worker.set_sensor_mode(SENSOR_MODE_HYBRID)
+    worker.set_sensor_mode(SENSOR_MODE_HYBRID)  # repeat is a no-op
 
     assert reattaches == [True]
-    assert modes == [SENSOR_MODE_VISION]
+    assert modes == [SENSOR_MODE_HYBRID]
+
+
+def test_an_unknown_instrument_set_is_refused_rather_than_attached() -> None:
+    worker = BeamNgWorker()
+    modes: list[str] = []
+    worker.sensor_mode_changed.connect(modes.append)
+
+    # The removed VISION mode is exactly this case for anyone whose saved
+    # setting still names it.
+    worker.set_sensor_mode("VISION")
+
+    assert worker._sensor_mode == SENSOR_MODE_LIDAR
+    assert modes == []
 
 
 def test_switching_to_hybrid_mid_stream_reattaches_once() -> None:
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    worker = _streaming_worker()
     worker._sensor_mode = SENSOR_MODE_LIDAR
     calls: list[bool] = []
     modes: list[str] = []
@@ -1335,25 +1039,28 @@ def test_a_mode_change_while_idle_only_records_the_choice() -> None:
     reattaches: list[bool] = []
     worker.attach_to_player = lambda: reattaches.append(True)  # type: ignore
 
-    worker.set_sensor_mode(SENSOR_MODE_VISION)
+    worker.set_sensor_mode(SENSOR_MODE_HYBRID)
 
-    assert worker._sensor_mode == SENSOR_MODE_VISION
+    assert worker._sensor_mode == SENSOR_MODE_HYBRID
     assert reattaches == []
 
 
-def test_cleanup_forgets_the_camera_digests() -> None:
-    """A re-attach must start with a clean freshness ledger, or the first
-    frames of the new session read as stale re-reads."""
-    worker, _ = _armed_vision_worker([StreamingCameraStub()])
-    worker._poll_once()
-    assert worker._camera_digests
-    assert worker._camera_rays
+def test_cleanup_forgets_the_camera_digests_and_the_held_frames() -> None:
+    """
+    A re-attach must start with a clean freshness ledger AND no held frames:
+    a stale digest reads the new session's first frames as re-reads, and a
+    stale frame would be painted for a camera that no longer exists.
+    """
+    worker = _armed_hybrid_camera_worker([StreamingCameraStub()])
+    worker._acquire_hybrid_camera_images(time.perf_counter())
+    assert worker._hybrid_camera_digests
+    assert worker._hybrid_camera_frames
 
     worker._cleanup_sensors()
 
-    assert worker._camera_digests == {}
-    assert worker._camera_frame_seen == {}
-    assert worker._camera_rays == {}
+    assert worker._hybrid_camera_digests == {}
+    assert worker._hybrid_camera_frames == {}
+    assert worker._hybrid_camera_failures == set()
 
 
 def test_shrinking_an_image_is_resampled_and_magnifying_it_is_not() -> None:
@@ -1427,114 +1134,179 @@ def test_the_cameras_fourth_byte_is_not_treated_as_opacity() -> None:
     )
 
 
-def _bearing_deg(direction: tuple[float, float, float]) -> float:
-    """Compass bearing in the vehicle frame: forward 0, LEFT +90, rear 180."""
-    return math.degrees(math.atan2(direction[0], -direction[1]))
+# --- The A-pillar pair lands where it is asked --------------------------------
 
 
-def _uncovered_bearings(rig, step_deg: float = 0.1) -> list[tuple[float, float]]:
-    """Runs of bearing no camera sees, as (start, end) in degrees."""
-    slots = int(round(360.0 / step_deg))
-    covered = [False] * slots
-    for mount in rig.values():
-        centre = _bearing_deg(mount.direction_vehicle)
-        half = mount.horizontal_fov_deg / 2.0
-        first = int(round((centre - half) / step_deg))
-        last = int(round((centre + half) / step_deg))
-        for index in range(first, last + 1):
-            covered[index % slots] = True
-    runs: list[tuple[float, float]] = []
-    index = 0
-    while index < slots:
-        if not covered[index]:
-            start = index
-            while index < slots and not covered[index]:
-                index += 1
-            runs.append((start * step_deg, (index - 1) * step_deg))
-        else:
-            index += 1
-    return runs
-
-
-def test_the_rig_leaves_no_gap_all_the_way_round() -> None:
-    """
-    The eight apertures have to TILE THE CIRCLE, and at the first FOVs they did
-    not: 80-degree pillars and 60-degree repeaters aimed 30 off rearward left a
-    **24.5-degree hole per side at bearings 95-120** -- over the driver's
-    shoulder, the blind spot the repeaters exist for. Reported live as the side
-    cameras feeling too narrow, which turned out to be measurable rather than a
-    matter of taste.
-    """
-    geometry = _offset_geometry()
-
-    assert _uncovered_bearings(derive_camera_rig(geometry)) == []
-
-
-def test_the_side_gap_closes_with_margin_not_by_a_hair() -> None:
-    """
-    Closing it exactly would be one per-vehicle tweak away from reopening, and
-    the mounts are metres apart so their coverage is not purely angular anyway.
-    The pillar and repeater on each side must genuinely overlap.
-    """
-    rig = derive_camera_rig(_offset_geometry())
-    pillar, repeater = rig["pillar_left"], rig["repeater_left"]
-
-    pillar_outer = (
-        _bearing_deg(pillar.direction_vehicle) + pillar.horizontal_fov_deg / 2.0
-    )
-    repeater_inner = (
-        _bearing_deg(repeater.direction_vehicle) - repeater.horizontal_fov_deg / 2.0
-    )
-
-    assert pillar_outer - repeater_inner >= 5.0, (
-        f"pillar reaches {pillar_outer:.1f} deg, repeater starts at "
-        f"{repeater_inner:.1f} -- they must overlap, not merely touch"
+def _vivace() -> VehicleGeometry:
+    """The live vivace: 2.02 m wide with the reference node 0.16 m off centre,
+    and the sensor origin measured by tools/mount_origin_probe.py."""
+    return VehicleGeometry(
+        ground_z_vehicle=-0.243,
+        left_m=1.17,
+        right_m=0.85,
+        front_m=1.858,
+        rear_m=2.489,
+        height_m=1.44,
+        mounts={},
+        body_floor_z=-0.243,
+        sensor_origin_vehicle=(0.160, 0.362, -0.233),
     )
 
 
-def test_the_outboard_cameras_are_symmetric_about_the_body_not_the_node() -> None:
+def test_the_pair_lands_the_same_distance_outside_each_body_side() -> None:
     """
-    A pair placed against its own side's surface is symmetric about the BODY
-    even though the raw x values look lopsided, because the reference node is
-    off centre (measured 0.16 m on the vivace).
-    """
-    geometry = _offset_geometry()
-    rig = derive_camera_rig(geometry)
-    centre_x = (geometry.left_m - geometry.right_m) / 2.0
+    THE REPORTED DEFECT, in one assertion.
 
-    for left_name, right_name in (
-        ("pillar_left", "pillar_right"),
-        ("repeater_left", "repeater_right"),
-    ):
-        left, right = rig[left_name], rig[right_name]
-        offsets = (
-            left.position_vehicle[0] - centre_x,
-            right.position_vehicle[0] - centre_x,
+    Placed from the node the pair is symmetric on paper and lands 0.32 m
+    asymmetric about the car: measured live, the left camera sat 0.28 m clear
+    of the body with the car entirely out of frame while the right camera was
+    0.04 m INSIDE the shell, filling 6.6% of its pixels with bodywork against
+    the left camera's 0.65%.
+    """
+    geometry = _vivace()
+    origin_x = geometry.sensor_origin_vehicle[0]
+    rig = derive_hybrid_camera_rig(geometry)
+
+    left_x = rig["a_pillar_left"].position_vehicle[0] + origin_x
+    right_x = rig["a_pillar_right"].position_vehicle[0] + origin_x
+
+    # Where each camera really ends up, measured from its OWN body face.
+    assert left_x - geometry.left_m == pytest.approx(
+        HYBRID_CAMERA_BODY_CLEARANCE_M
+    )
+    assert -geometry.right_m - right_x == pytest.approx(
+        HYBRID_CAMERA_BODY_CLEARANCE_M
+    )
+    # And therefore mirror images about the body centre, not the node.
+    body_centre = (geometry.left_m - geometry.right_m) / 2.0
+    assert left_x - body_centre == pytest.approx(body_centre - right_x)
+
+
+def test_neither_camera_ends_up_inside_the_bodywork() -> None:
+    geometry = _vivace()
+    origin_x = geometry.sensor_origin_vehicle[0]
+    rig = derive_hybrid_camera_rig(geometry)
+
+    assert rig["a_pillar_left"].position_vehicle[0] + origin_x > geometry.left_m
+    assert (
+        rig["a_pillar_right"].position_vehicle[0] + origin_x
+        < -geometry.right_m
+    )
+
+
+def test_the_pair_sits_ahead_of_the_body_centre_at_the_a_pillar() -> None:
+    """Placed from the node the 'A-pillar' station landed 0.10 m BEHIND the
+    body centre -- the door-mirror plane, not the A-pillar."""
+    geometry = _vivace()
+    origin_y = geometry.sensor_origin_vehicle[1]
+    for mount in derive_hybrid_camera_rig(geometry).values():
+        landed_y = mount.position_vehicle[1] + origin_y
+        body_centre_y = (geometry.rear_m - geometry.front_m) / 2.0
+        assert landed_y < body_centre_y
+        # ...and still well behind the nose.
+        assert landed_y > -geometry.front_m
+
+
+def test_an_unmeasured_origin_leaves_the_pair_exactly_as_it_was() -> None:
+    plain = derive_hybrid_camera_rig(_geometry())
+    explicit = derive_hybrid_camera_rig(
+        VehicleGeometry(
+            ground_z_vehicle=-0.3,
+            left_m=0.9,
+            right_m=0.9,
+            front_m=2.2,
+            rear_m=2.3,
+            height_m=1.45,
+            mounts={},
+            sensor_origin_vehicle=(0.0, 0.0, 0.0),
         )
-        assert offsets[0] == pytest.approx(-offsets[1], abs=1e-9), (
-            f"{left_name}/{right_name} sit at {offsets} from the body centreline"
+    )
+    for name, mount in plain.items():
+        assert mount.position_vehicle == pytest.approx(
+            explicit[name].position_vehicle
         )
-        assert left.position_vehicle[1] == pytest.approx(right.position_vehicle[1])
-        assert left.position_vehicle[2] == pytest.approx(right.position_vehicle[2])
 
 
-def test_a_centreline_camera_sits_on_the_body_centre_not_the_reference_node() -> None:
+# --- Exposure -----------------------------------------------------------------
+
+
+class _ExposureBngStub:
+    def __init__(self, reply: str = "2") -> None:
+        self.chunks: list[str] = []
+        self._reply = reply
+        self.control = SimpleNamespace(queue_lua_command=self._queue)
+
+    def _queue(self, chunk: str, response: bool = False) -> str:
+        del response
+        self.chunks.append(chunk)
+        return self._reply
+
+
+def test_the_cameras_are_handed_to_the_engines_own_auto_exposure() -> None:
     """
-    The node is not the body centre, so `x = 0` is 0.16 m off on the vivace --
-    the same defect the WORLD ego model and the AEB corridor each had. A bumper
-    camera looking straight ahead must do so from the middle of the car.
+    A tech Camera does NOT auto-expose: measured live it ships
+    `useManualEV=true, manualEV=0.001`, a fixed exposure ~5x brighter than the
+    view the player sees (mean 232-241 of 255, 36-64% of pixels clipped white).
+    beamngpy has no exposure argument and BeamNG's own Lua wrappers are
+    commented out, so the C++ binding is the only route.
     """
-    geometry = _offset_geometry()
-    rig = derive_camera_rig(geometry)
-    centre_x = (geometry.left_m - geometry.right_m) / 2.0
-    assert centre_x != 0.0, "guard: this vehicle must be off-centre to test it"
+    worker = BeamNgWorker()
+    bng = _ExposureBngStub()
+    worker._bng = bng  # type: ignore[assignment]
 
-    for name in ("front_bumper", "rear"):
-        assert rig[name].position_vehicle[0] == pytest.approx(centre_x), (
-            f"{name} is on the reference node, not the body centreline"
+    worker._apply_camera_exposure(["rig_a_pillar_left", "rig_a_pillar_right"])
+
+    assert len(bng.chunks) == 1
+    chunk = bng.chunks[0]
+    assert "Research.Camera.clearManualEV(id)" in chunk
+    assert '["rig_a_pillar_left"]=true' in chunk
+    assert '["rig_a_pillar_right"]=true' in chunk
+    # Undocumented API: a version that lacks it must leave the cameras working.
+    assert "pcall" in chunk
+
+
+def test_a_pinned_exposure_sends_the_linear_value_not_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sensor's manualEV is a linear MULTIPLIER, not stops -- measured,
+    0.0001 reads mean 73 and anything at or above ~50 saturates the frame."""
+    monkeypatch.setattr(worker_module, "HYBRID_CAMERA_AUTO_EXPOSURE", False)
+    monkeypatch.setattr(worker_module, "HYBRID_CAMERA_MANUAL_EV", 0.0002)
+    worker = BeamNgWorker()
+    bng = _ExposureBngStub(reply="1")
+    worker._bng = bng  # type: ignore[assignment]
+
+    worker._apply_camera_exposure(["rig_a_pillar_left"])
+
+    assert "Research.Camera.setManualEV(id, 0.0002)" in bng.chunks[0]
+
+
+def test_an_exposure_failure_is_reported_and_never_stops_the_attach(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Exploding:
+        control = SimpleNamespace(
+            queue_lua_command=lambda chunk, response=False: (_ for _ in ()).throw(
+                RuntimeError("no such API")
+            )
         )
-    # The windshield pair straddles that centre rather than the node.
-    straddle = (
-        rig["front_main"].position_vehicle[0] + rig["front_wide"].position_vehicle[0]
-    ) / 2.0
-    assert straddle == pytest.approx(centre_x)
+
+    worker = BeamNgWorker()
+    worker._bng = Exploding()  # type: ignore[assignment]
+    caplog.set_level("WARNING", logger=worker_module.__name__)
+
+    worker._apply_camera_exposure(["rig_a_pillar_left"])
+
+    assert any("Exposure check" in r.getMessage() for r in caplog.records)
+
+
+def test_a_simulator_that_sets_fewer_cameras_than_asked_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = BeamNgWorker()
+    worker._bng = _ExposureBngStub(reply="1")  # type: ignore[assignment]
+    caplog.set_level("WARNING", logger=worker_module.__name__)
+
+    worker._apply_camera_exposure(["left", "right"])
+
+    assert any("Exposure check" in r.getMessage() for r in caplog.records)

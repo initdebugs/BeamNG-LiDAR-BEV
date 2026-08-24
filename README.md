@@ -2,8 +2,8 @@
 
 A Windows desktop app for BeamNG.tech 0.39.x (via beamngpy 1.36) that launches
 the simulator with the BeamNGpy communication bridge enabled, connects after
-the map and vehicle are loaded, attaches a semantic six-LiDAR set — or, in
-Vision mode, a Tesla-style eight-camera rig — to the current player vehicle,
+the map and vehicle are loaded, attaches a semantic six-LiDAR set — optionally
+with two colour A-pillar cameras alongside it — to the current player vehicle,
 and renders the output as a reconstructed autonomous-driving world, an
 EGO-fixed diagnostic bird's-eye view, or a live camera array.
 
@@ -55,20 +55,19 @@ The visualization header switches between:
   planning, parking, and both AEB systems, and adds live colour-only
   **A PILLAR LEFT** and **A PILLAR RIGHT** camera views. Choose **CAMERAS** to
   see the feeds side by side.
-- **VISION** — the eight-camera rig (Tesla HW4 layout: windshield main + wide,
-  front bumper, two B-pillars, two fender repeaters, rear) streamed live as a
-  labelled grid; click a camera to view it full-frame, click again to return.
-  This is rung 0 of the vision-only ladder; see `docs/VISION_MODE_SPEC.md`
-  for the spec and `docs/VISION_ROADMAP.md` for the development roadmap.
+  Click a camera to view it full-frame, click again to return to the pair.
 
 Switching between WORLD and RAW BEV is instantaneous and does not restart
-sensors or change driving state. Switching sensor modes, including HYBRID,
-re-attaches the instrument set on the car. HYBRID continues to offer
-self-driving and both AEB systems because they use the unchanged six-LiDAR
-cloud; those controls are unavailable in Vision mode at this rung. If Qt Quick
-3D cannot initialize, the app falls back to RAW BEV while the sensor and
-control loops continue normally; VISION has no 3D-renderer dependency and
-keeps working.
+sensors or change driving state. Switching the instrument set re-attaches it on
+the car. HYBRID offers self-driving, parking and both AEB systems exactly as
+LIDAR does, because the cameras render colour only and reach nothing but the
+screen. If Qt Quick 3D cannot initialize, the app falls back to RAW BEV while
+the sensor and control loops continue normally; the camera view has no
+3D-renderer dependency and keeps working.
+
+A camera-only VISION mode (an eight-camera rig whose engine depth was
+unprojected into the same cloud) was removed in favour of HYBRID; see
+`docs/VISION_ROADMAP.md` for what it measured.
 
 ## Sensor Configuration
 
