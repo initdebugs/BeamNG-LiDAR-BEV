@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from beamng_lidar_bev import worker as worker_module
 from beamng_lidar_bev.config import CAMERA_NEAR_FAR_PLANES
 from beamng_lidar_bev.geometry import (
     CAMERA_NAMES,
@@ -16,6 +18,7 @@ from beamng_lidar_bev.geometry import (
 from beamng_lidar_bev.models import (
     BevFrame,
     CameraMount,
+    SensorMount,
     VehicleGeometry,
     VisionFrame,
 )
@@ -310,6 +313,9 @@ def test_hybrid_camera_constructor_is_rgb_only_streaming_shared_memory() -> None
 
     assert kwargs["requested_update_time"] == pytest.approx(0.10)
     assert kwargs["resolution"] == (1280, 960)
+    assert kwargs["pos"] == mount.position_vehicle
+    assert kwargs["dir"] == mount.direction_vehicle
+    assert kwargs["field_of_view_y"] == mount.vertical_fov_deg
     assert kwargs["is_using_shared_memory"] is True
     assert kwargs["is_streaming"] is True
     assert kwargs["is_render_colours"] is True
@@ -354,6 +360,207 @@ def test_hybrid_camera_attach_constructs_and_owns_only_the_ordered_pair(
     assert worker._hybrid_camera_names == ["a_pillar_left", "a_pillar_right"]
     assert worker._sensors == lidar_sensors
     assert worker._sensor_names == [f"lidar_{index}" for index in range(6)]
+
+
+class _AttachTimerStub:
+    def __init__(self) -> None:
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class _HybridAttachVehicleStub:
+    def __init__(self) -> None:
+        self.model = "test_vehicle"
+        self.state = {
+            "pos": (0.0, 0.0, 0.0),
+            "dir": (0.0, 1.0, 0.0),
+            "up": (0.0, 0.0, 1.0),
+            "vel": (0.0, 0.0, 0.0),
+        }
+
+    def connect(self, bng: object) -> None:
+        del bng
+
+    def poll_sensors(self, *names: str) -> None:
+        del names
+
+    def get_bbox(self) -> dict[str, tuple[float, float, float]]:
+        return {}
+
+    def is_connected(self) -> bool:
+        return False
+
+
+def _hybrid_attach_geometry() -> VehicleGeometry:
+    lidar_names = ("front", "left", "right", "rear", "roof", "road")
+    return VehicleGeometry(
+        ground_z_vehicle=-0.3,
+        left_m=0.9,
+        right_m=0.9,
+        front_m=2.2,
+        rear_m=2.3,
+        height_m=1.45,
+        mounts={
+            name: SensorMount(
+                name=name,
+                position_vehicle=(float(index), 0.0, 1.0),
+                direction_vehicle=(0.0, -1.0, 0.0),
+            )
+            for index, name in enumerate(lidar_names)
+        },
+    )
+
+
+def _hybrid_attach_worker(
+    monkeypatch: pytest.MonkeyPatch, *, fail_second_camera: bool = False
+) -> tuple[
+    BeamNgWorker,
+    _AttachTimerStub,
+    list[tuple[str, str]],
+    list[object],
+    list[object],
+]:
+    """Offline BeamNG construction boundary for attach-to-player tests."""
+
+    constructor_order: list[tuple[str, str]] = []
+    lidars: list[object] = []
+    cameras: list[object] = []
+
+    class LidarStub:
+        def __init__(
+            self, name: str, bng: object, vehicle: object, **kwargs: object
+        ) -> None:
+            del bng, vehicle, kwargs
+            self.name = name
+            self.remove_calls = 0
+            lidars.append(self)
+            constructor_order.append(("Lidar", name))
+
+        def remove(self) -> None:
+            self.remove_calls += 1
+
+    class CameraStub:
+        def __init__(
+            self, name: str, bng: object, vehicle: object, **kwargs: object
+        ) -> None:
+            del bng, vehicle, kwargs
+            constructor_order.append(("Camera", name))
+            if fail_second_camera and name.endswith("_a_pillar_right"):
+                raise RuntimeError("second hybrid camera failed")
+            self.name = name
+            self.remove_calls = 0
+            cameras.append(self)
+
+        def remove(self) -> None:
+            self.remove_calls += 1
+
+    vehicle = _HybridAttachVehicleStub()
+    worker = BeamNgWorker()
+    timer = _AttachTimerStub()
+    worker._poll_timer = timer  # type: ignore[assignment]
+    worker._sensor_mode = SENSOR_MODE_HYBRID
+    worker._bng = SimpleNamespace(
+        vehicles=SimpleNamespace(
+            get_player_vehicle_id=lambda: {"vid": "ego", "id": 1},
+            get_current=lambda include_config: {"ego": vehicle},
+        )
+    )  # type: ignore[assignment]
+    monkeypatch.setattr("beamngpy.sensors.Lidar", LidarStub)
+    monkeypatch.setattr("beamngpy.sensors.Camera", CameraStub)
+    monkeypatch.setattr(
+        worker_module,
+        "derive_vehicle_geometry",
+        lambda state, bbox: _hybrid_attach_geometry(),
+    )
+    monkeypatch.setattr(worker, "_attach_electrics", lambda vehicle: None)
+    monkeypatch.setattr(worker, "_load_annotations", lambda: {"STREET": (1, 2, 3)})
+    return worker, timer, constructor_order, lidars, cameras
+
+
+def test_attach_to_player_hybrid_builds_lidars_then_cameras_and_starts_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, timer, constructor_order, lidars, cameras = _hybrid_attach_worker(
+        monkeypatch
+    )
+    statuses: list[tuple[str, str]] = []
+    worker.status_changed.connect(
+        lambda state, detail: statuses.append((state, detail))
+    )
+
+    worker.attach_to_player()
+
+    expected_names = (
+        "front",
+        "left",
+        "right",
+        "rear",
+        "roof",
+        "road",
+        "a_pillar_left",
+        "a_pillar_right",
+    )
+    assert [kind for kind, _name in constructor_order] == ["Lidar"] * 6 + [
+        "Camera",
+        "Camera",
+    ]
+    assert all(
+        name.endswith(f"_{expected}")
+        for (_kind, name), expected in zip(constructor_order, expected_names)
+    )
+    assert worker._sensors == lidars
+    assert worker._hybrid_cameras == cameras
+    assert (
+        "STREAMING",
+        "6 LiDAR sensors + 2 cameras active on ego",
+    ) in statuses
+    assert timer.start_calls == 1
+
+
+def test_attach_to_player_hybrid_failure_removes_every_constructed_sensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker, timer, constructor_order, lidars, cameras = _hybrid_attach_worker(
+        monkeypatch, fail_second_camera=True
+    )
+    worker._hybrid_camera_digests = {"old": b"stale"}
+    worker._hybrid_camera_failures = {"old"}
+    worker._camera_digests = {"vision": b"stale"}
+    statuses: list[tuple[str, str]] = []
+    worker.status_changed.connect(
+        lambda state, detail: statuses.append((state, detail))
+    )
+
+    worker.attach_to_player()
+
+    assert [kind for kind, _name in constructor_order] == ["Lidar"] * 6 + [
+        "Camera",
+        "Camera",
+    ]
+    assert len(cameras) == 1
+    assert [sensor.remove_calls for sensor in lidars] == [1] * 6
+    assert cameras[0].remove_calls == 1
+    assert worker._sensors == []
+    assert worker._sensor_names == []
+    assert worker._hybrid_cameras == []
+    assert worker._hybrid_camera_names == []
+    assert worker._hybrid_camera_digests == {}
+    assert worker._hybrid_camera_failures == set()
+    assert worker._camera_digests == {}
+    assert worker._camera_frame_seen == {}
+    assert worker._camera_frame_checked == {}
+    assert worker._camera_rays == {}
+    assert worker._geometry is None
+    assert worker._palette is None
+    assert all(state != "STREAMING" for state, _detail in statuses)
+    assert statuses[-1][0] == "READY"
+    assert timer.start_calls == 0
 
 
 def test_cleanup_removes_and_forgets_every_hybrid_camera() -> None:
