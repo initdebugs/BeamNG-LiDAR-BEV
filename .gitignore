@@ -1,4 +1,9 @@
 /.claude
+# Agent implementation workspaces; both are local, disposable coordination
+# state and must never be committed with product changes.
+/.worktrees/
+/.superpowers/sdd/
+
 # Runtime logs; the colour-probe dump beside them stays tracked as evidence.
 logs/*.log
 logs/*.log.*
