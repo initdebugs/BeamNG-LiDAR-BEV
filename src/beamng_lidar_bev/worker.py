@@ -373,8 +373,9 @@ class BeamNgWorker(QObject):
         self._logged_actor_refusal = False
         # Yaw rate measured from successive polled states, for advancing the
         # prefetched heading and rewinding camera frames.
-        self._yaw_observation: tuple[float, float] | None = None
+        self._attitude_observation: tuple[float, float, float] | None = None
         self._yaw_rate_rps = 0.0
+        self._pitch_rate_rps = 0.0
 
         self._self_driving = False
         self._controller: DrivingController | None = None
@@ -2027,7 +2028,9 @@ class BeamNgWorker(QObject):
                 rays,
                 depth_raw,
                 raw.get("annotation"),
-                pose_from_state(state, age, self._yaw_rate_rps),
+                pose_from_state(
+                    state, age, self._yaw_rate_rps, self._pitch_rate_rps
+                ),
                 geometry,
                 UNKNOWN_SEMANTIC_RGB,
             )
@@ -3460,23 +3463,23 @@ class BeamNgWorker(QObject):
         future, self._state_future = self._state_future, None
         if future is None:
             state = self._get_vehicle_state()
-            self._observe_state_yaw(state, time.perf_counter())
+            self._observe_state_rates(state, time.perf_counter())
             return state
         try:
             state, done_at = future.result()
         except Exception:
             LOGGER.debug("Prefetched state poll failed; re-polling", exc_info=True)
             state = self._get_vehicle_state()
-            self._observe_state_yaw(state, time.perf_counter())
+            self._observe_state_rates(state, time.perf_counter())
             return state
         age = time.perf_counter() - done_at
         if age > _STATE_PREFETCH_MAX_AGE_S:
             # From before an app stall; extrapolating across it would be worse
             # than the round-trip it saves.
             state = self._get_vehicle_state()
-            self._observe_state_yaw(state, time.perf_counter())
+            self._observe_state_rates(state, time.perf_counter())
             return state
-        self._observe_state_yaw(state, done_at)
+        self._observe_state_rates(state, done_at)
         if age > 0.0 and "pos" in state:
             position = vec3(state["pos"]) + vec3(
                 state.get("vel", (0.0, 0.0, 0.0))
@@ -3491,33 +3494,43 @@ class BeamNgWorker(QObject):
                 )
         return state
 
-    def _observe_state_yaw(self, state: dict[str, Any], at: float) -> None:
+    def _observe_state_rates(self, state: dict[str, Any], at: float) -> None:
         """
-        Update the yaw-rate estimate from the heading of a freshly polled
-        state and the time its round trip finished.
+        Update the yaw- and pitch-rate estimates from a freshly polled
+        state's forward vector and the time its round trip finished.
 
-        A plain difference of successive headings over their interval,
-        lightly low-passed: the state is polled every tick, so the estimate
-        is 25 Hz and the filter only takes the edge off the quantisation. It
-        is what `_take_vehicle_state` advances the prefetched heading with and
-        what the vision acquisition rewinds each camera frame with.
+        A plain difference of successive angles over their interval, lightly
+        low-passed: the state is polled every tick, so the estimate is 25 Hz
+        and the filter only takes the edge off the quantisation. Yaw is what
+        `_take_vehicle_state` advances the prefetched heading with; both
+        rates are what the vision acquisition rewinds each camera frame with
+        (`pose_from_state`) -- pitch since the first milestone-5 drive found
+        stale-frame pitch mismatch firing AEB on crests and brake dives (see
+        `pose_from_state`'s docstring for the numbers). Pitch cannot wrap,
+        so only the heading delta needs the modulo.
         """
         direction = state.get("dir")
         if direction is None:
             return
         forward = vec3(direction)
         heading = float(np.arctan2(forward[1], forward[0]))
-        previous = self._yaw_observation
-        self._yaw_observation = (heading, at)
+        pitch = float(
+            np.arctan2(forward[2], float(np.hypot(forward[0], forward[1])))
+        )
+        previous = self._attitude_observation
+        self._attitude_observation = (heading, pitch, at)
         if previous is None:
             return
-        dt = at - previous[1]
+        dt = at - previous[2]
         if dt <= 1e-3 or dt > 1.0:
             return
-        delta = (heading - previous[0] + np.pi) % (2.0 * np.pi) - np.pi
-        rate = float(delta / dt)
         blend = min(1.0, dt / _YAW_RATE_TAU_S)
-        self._yaw_rate_rps += blend * (rate - self._yaw_rate_rps)
+        yaw_delta = (heading - previous[0] + np.pi) % (2.0 * np.pi) - np.pi
+        self._yaw_rate_rps += blend * (yaw_delta / dt - self._yaw_rate_rps)
+        pitch_delta = pitch - previous[1]
+        self._pitch_rate_rps += blend * (
+            pitch_delta / dt - self._pitch_rate_rps
+        )
 
     def _prefetch_vehicle_state(self) -> None:
         """
@@ -3780,8 +3793,9 @@ class BeamNgWorker(QObject):
         self._last_actor_success_at = -float("inf")
         self._actor_refused_at = -float("inf")
         self._logged_actor_refusal = False
-        self._yaw_observation = None
+        self._attitude_observation = None
         self._yaw_rate_rps = 0.0
+        self._pitch_rate_rps = 0.0
 
     def _cleanup_sensors(self) -> None:
         # The single funnel every teardown path goes through -- stop_sensors,

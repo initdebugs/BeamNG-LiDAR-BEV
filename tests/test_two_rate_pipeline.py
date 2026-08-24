@@ -55,10 +55,13 @@ def _snapshot(
 def _state_taker(**fields: object) -> SimpleNamespace:
     """The attributes `_take_vehicle_state` reads, driven unbound."""
     namespace = SimpleNamespace(
-        _yaw_observation=None, _yaw_rate_rps=0.0, _state_future=None
+        _attitude_observation=None,
+        _yaw_rate_rps=0.0,
+        _pitch_rate_rps=0.0,
+        _state_future=None,
     )
-    namespace._observe_state_yaw = lambda state, at: (
-        BeamNgWorker._observe_state_yaw(namespace, state, at)
+    namespace._observe_state_rates = lambda state, at: (
+        BeamNgWorker._observe_state_rates(namespace, state, at)
     )
     for name, value in fields.items():
         setattr(namespace, name, value)
@@ -134,7 +137,7 @@ def test_a_prefetched_heading_is_advanced_by_the_measured_yaw_rate() -> None:
     t0 = done_at - polls * 0.04
     for index in range(polls):
         angle = rate * index * 0.04
-        BeamNgWorker._observe_state_yaw(
+        BeamNgWorker._observe_state_rates(
             worker, {"dir": (np.cos(angle), np.sin(angle), 0.0)}, t0 + index * 0.04
         )
     assert worker._yaw_rate_rps == pytest.approx(rate, rel=0.05)
@@ -263,3 +266,25 @@ def test_a_teleport_is_never_presented_and_the_next_refresh_resets() -> None:
     assert not len(assembler._road_keys)
     assert not len(refreshed.road_vertices)
     assert assembler._travelled_m == 0.0
+
+
+def test_a_pitch_rate_is_measured_beside_the_yaw_rate() -> None:
+    """
+    The vision rewind needs PITCH as well: the first milestone-5 drive fired
+    AEB at 2-4 m with 0.3-0.7 m of within-cell height spread at exactly the
+    crests and brake dives where the body pitches 5-15 deg/s -- stale camera
+    frames placed with the current pitch tip their whole cloud by r x delta
+    of height at range r, and eight cameras with different ages disagree.
+    """
+    worker = _state_taker()
+    rate = np.radians(8.0)  # a brake-dive-scale pitch rate, nose rising
+    t0 = time.perf_counter()
+    for index in range(8):
+        angle = rate * index * 0.04
+        BeamNgWorker._observe_state_rates(
+            worker,
+            {"dir": (np.cos(angle), 0.0, np.sin(angle))},
+            t0 + index * 0.04,
+        )
+    assert worker._pitch_rate_rps == pytest.approx(rate, rel=0.05)
+    assert worker._yaw_rate_rps == pytest.approx(0.0, abs=1e-9)

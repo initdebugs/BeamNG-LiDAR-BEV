@@ -540,3 +540,34 @@ def test_the_far_road_band_rows_are_sampled_at_full_density() -> None:
         np.unique(plain.pixel_index // resolution[0]),
         np.arange(1, resolution[1], 2),
     )
+
+
+def test_a_stale_frame_is_rewound_in_pitch_as_well_as_yaw() -> None:
+    """
+    A frame placed with a pitch it was not rendered at tips its whole cloud
+    about the camera -- r x delta of HEIGHT error at range r -- which is what
+    fired AEB on crests and brake dives in the first milestone-5 drive:
+    0.3-0.7 m of within-cell vertical spread at 2-4 m, from eight cameras
+    whose different ages carried different pitches. The car pitched up by
+    delta during this frame's staleness, so rewinding by the measured rate
+    must hand back the LEVEL capture pose exactly.
+    """
+    import numpy as np
+    import pytest
+
+    from beamng_lidar_bev.unprojection import pose_from_state
+
+    delta = np.radians(3.0)
+    age = 0.1
+    state = {
+        "pos": (10.0, 20.0, 30.0),
+        "vel": (0.0, 0.0, 0.0),
+        "dir": (np.cos(delta), 0.0, np.sin(delta)),  # nose up by delta NOW
+        "up": (-np.sin(delta), 0.0, np.cos(delta)),
+    }
+
+    pose = pose_from_state(state, age, 0.0, pitch_rate_rps=delta / age)
+
+    assert pose.forward_world == pytest.approx((1.0, 0.0, 0.0), abs=1e-9)
+    assert pose.up_world == pytest.approx((0.0, 0.0, 1.0), abs=1e-9)
+    assert pose.right_world == pytest.approx((0.0, -1.0, 0.0), abs=1e-9)

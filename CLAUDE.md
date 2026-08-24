@@ -409,7 +409,13 @@ carrying that frame's metrics. Five things are load-bearing:
   control: 0.851 vs 0.130 either way round). If a future engine ever says
   mirrored, negate `right` in `camera_basis` and nowhere else.
 - **Each camera's cloud is placed from the pose the car had when its frame
-  changed** (`pose_from_state(state, age)`, velocity × age rewound). The
+  changed** (`pose_from_state(state, age, yaw_rate, pitch_rate)` — position,
+  yaw AND, since the first milestone-5 drive, PITCH rewound by rate × age:
+  a frame placed with a pitch it was not rendered at tips its cloud by
+  r × Δ of HEIGHT, and eight cameras with different ages disagreeing put
+  0.3–0.7 m of fake vertical spread into near cells on crests and brake
+  dives, which the cell-referenced AEB floor read as a solid — the "brakes
+  for inclines" report). The
   simulator stamps nothing; the worker can measure only the part after the
   buffer changed, and `CAMERA_FRAME_STAGING_S` (zero) is the fixed
   remainder. The 2026-08-24 staging-probe run bounded it WELL UNDER one

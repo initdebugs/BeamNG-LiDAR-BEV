@@ -69,6 +69,18 @@ def rotate_about_up(vector: np.ndarray, angle_rad: float) -> np.ndarray:
     return np.asarray((cos * x - sin * y, sin * x + cos * y, z), dtype=np.float64)
 
 
+def rotate_about_axis(
+    vector: np.ndarray, axis: np.ndarray, angle_rad: float
+) -> np.ndarray:
+    """Rotate a world vector about an arbitrary UNIT axis (Rodrigues,
+    right-handed). `rotate_about_up` is this with the axis pinned to world Z;
+    the PITCH rewind needs the vehicle's own RIGHT axis, which is not."""
+    cos, sin = math.cos(angle_rad), math.sin(angle_rad)
+    v = np.asarray(vector, dtype=np.float64)
+    a = np.asarray(axis, dtype=np.float64)
+    return v * cos + np.cross(a, v) * sin + a * float(np.dot(a, v)) * (1.0 - cos)
+
+
 def vehicle_axes(state: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return orthonormal world-space right, forward and up unit vectors."""
     forward = _normalise(vec3(state["dir"]), "forward")

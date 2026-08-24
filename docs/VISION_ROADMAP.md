@@ -432,6 +432,42 @@ Milestones, in order:
       One flip of `VISION_DRIVING_ENABLED` closes everything if any of
       it misbehaves — say what fired and the `AEB evidence:` line says
       why.
+
+      **First checklist drive (2026-08-24): it drives, it brakes for
+      inclines "every now and then", and the evidence lines classified
+      every firing. Two fixes landed the same day.**
+      - **Near-field phantoms on crests and brake dives** (threats at
+        2–4 m, 0.3–0.7 m of within-cell height spread, required decel
+        60–∞ m/s²): STALE-FRAME PITCH. Frames were rewound in position
+        and yaw but pitch was "left as it is", so eight cameras with
+        different ages disagreed by r × Δpitch of height exactly during
+        the 5–15°/s of a dive or grade transition — and AEB's own full
+        application pitched the car further, sustaining the phantom it
+        fired on. FIXED: the worker measures a pitch rate beside the yaw
+        rate (`_observe_state_rates`) and `pose_from_state` rewinds it
+        about the vehicle's right axis. Re-drive the hill and brake-dive
+        cases to confirm.
+      - **Canopy-as-wall at range** (returns starting 8–14 m above the
+        plane at 39/68/95 m, with `ground rise` readings of 5–11 m — the
+        estimator was following the canopy): the coarse-base ceiling has
+        no floor context where the camera lays no ground, and the
+        level-fitted far-road band left the road on any grade or pitch —
+        the SAME defect that made the drawn road pop between ~10 and
+        ~40 m. Partially fixed by the band's new ±2° grade/pitch margin
+        (`CAMERA_FAR_ROAD_PITCH_MARGIN_DEG`, ~17k samples). STILL OPEN:
+        beyond ~50 m no camera ground context exists at all, so at
+        100+ km/h AEB scans a region where a soffit cannot be told from
+        a wall. The honest options: a vision-mode AEB horizon cap
+        (~60 m — above ~100 km/h it becomes mitigation-only, the same
+        sensor-limit statement the LiDAR makes at 170), or accepting it
+        and keeping the checklist under 100 km/h. Decide after the
+        re-drive.
+      - The 10.5 m firing (min 1.74 m up, 12 m tall) was a tree branch
+        at windscreen height — arguably a TRUE positive; low canopy over
+        the road is the case the oracle predicted.
+      - The REAR firings at 56–67 km/h (canopy 8–11 m up, behind) need
+        one answer from the driver: was the car genuinely reversing at
+        that speed? If not, the rear arming has a sign bug to find.
 - [ ] **Milestone: the car drives in Vision mode** (on engine depth).
 
 Also landed alongside, by request: the rear camera is 130° and pitched 15°

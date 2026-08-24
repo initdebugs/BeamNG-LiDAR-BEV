@@ -49,11 +49,18 @@ import numpy as np
 from .config import (
     CAMERA_DEPTH_FAR_FRACTION,
     CAMERA_DEPTH_MIN_M,
+    CAMERA_FAR_ROAD_PITCH_MARGIN_DEG,
     CAMERA_FAR_ROAD_ROW_STRIDE,
     CAMERA_NEAR_FAR_PLANES,
     LIDAR_RANGE_M,
 )
-from .geometry import camera_basis, rotate_about_up, vec3, vehicle_axes
+from .geometry import (
+    camera_basis,
+    rotate_about_axis,
+    rotate_about_up,
+    vec3,
+    vehicle_axes,
+)
 from .models import CameraMount, VehicleGeometry
 
 _EMPTY_POINTS = np.empty((0, 3), dtype=np.float32)
@@ -129,10 +136,20 @@ def _far_road_rows(
         )
     # Ground at range r sits at normalised image y = h / r below the axis;
     # the row whose pixel CENTRE lands there is row = H/2 - 0.5 + y * f.
+    # The strip is then widened by the grade/pitch margin each way, because
+    # the fit is to LEVEL ground and the far road leaves a level strip on
+    # any grade or under brake dive -- see CAMERA_FAR_ROAD_PITCH_MARGIN_DEG.
     centre = height / 2.0 - 0.5
-    first = max(0, int(math.floor(centre + eye_height / far_m * focal_px)))
+    margin_px = (
+        math.tan(math.radians(CAMERA_FAR_ROAD_PITCH_MARGIN_DEG)) * focal_px
+    )
+    first = max(
+        0,
+        int(math.floor(centre + eye_height / far_m * focal_px - margin_px)),
+    )
     last = min(
-        height - 1, int(math.ceil(centre + eye_height / near_m * focal_px))
+        height - 1,
+        int(math.ceil(centre + eye_height / near_m * focal_px + margin_px)),
     )
     return np.arange(
         first, last + 1, CAMERA_FAR_ROAD_ROW_STRIDE, dtype=np.int64
@@ -277,19 +294,35 @@ class VehiclePose:
 
 
 def pose_from_state(
-    state: Mapping[str, Any], age_s: float = 0.0, yaw_rate_rps: float = 0.0
+    state: Mapping[str, Any],
+    age_s: float = 0.0,
+    yaw_rate_rps: float = 0.0,
+    pitch_rate_rps: float = 0.0,
 ) -> VehiclePose:
     """
     The vehicle pose `age_s` ago, by the same linear extrapolation the
     worker's prefetched state poll already uses in the other direction:
-    the position rewound by velocity x age, the heading by yaw rate x age.
+    the position rewound by velocity x age, the heading by yaw rate x age,
+    and the PITCH by pitch rate x age.
 
     The heading half matters more than it looks. A frame placed with a
     heading it was not rendered at is rotated about the car before it is
     stamped into WORLD's world-anchored stores, and a turn is precisely when
     a frame's age is worth the most: 100 ms at 30 deg/s is 3 degrees, which
     at 30 m is 1.6 m of sideways error that the store then remembers for 25 m
-    of travel. Pitch and roll are left as they are.
+    of travel.
+
+    The pitch half is what stops incline and brake-dive phantoms: a frame
+    placed with a pitch it was not rendered at tips its whole cloud about
+    the camera, r x delta of HEIGHT error at range r -- and eight cameras
+    with different ages disagree, so one 0.4 m cell collects a vertical
+    spread of pure registration that the cell-referenced AEB floor then
+    reads as a solid. Measured on the first milestone-5 drive (2026-08-24):
+    firings at 2-4 m with 0.3-0.7 m of within-cell spread, at exactly the
+    crests, grade transitions and brake dives where the body pitches
+    5-15 deg/s -- and AEB's own full application pitches the car further,
+    sustaining the phantom it fired on. Roll is left as it is: its height
+    error spans only the corridor's +/-1.2 m, not the range.
     """
     right, forward, up = vehicle_axes(state)
     origin = vec3(state["pos"])
@@ -299,6 +332,12 @@ def pose_from_state(
             rewind = -float(yaw_rate_rps) * float(age_s)
             right = rotate_about_up(right, rewind)
             forward = rotate_about_up(forward, rewind)
+        if pitch_rate_rps != 0.0:
+            # About the (already yaw-rewound) RIGHT axis: positive pitch
+            # rate is the nose RISING, so the capture pose had it lower.
+            rewind = -float(pitch_rate_rps) * float(age_s)
+            forward = rotate_about_axis(forward, right, rewind)
+            up = rotate_about_axis(up, right, rewind)
     return VehiclePose(origin, right, forward, up)
 
 

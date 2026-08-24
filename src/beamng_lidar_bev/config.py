@@ -392,6 +392,18 @@ CAMERA_DEFAULT_SAMPLE_STRIDE = (6, 4)
 # road exactly as it did for the pre-road-scan LiDAR rig.
 CAMERA_FAR_ROAD_BAND_M = (20.0, 100.0)
 CAMERA_FAR_ROAD_ROW_STRIDE = 1
+# The band is fitted to LEVEL ground, and the first milestone-5 drive showed
+# what that costs: on a grade the far road climbs OUT of the strip (a 6%
+# grade shifts it ~64 rows) and under pitch it swings (1 degree is ~18 rows,
+# and a road car pitches 1-3 degrees braking), so on hills the far road lost
+# its dense sampling exactly when it was wanted -- the drawn road popped
+# between ~10 m and ~40 m, and AEB's coarse-base ceiling lost its floor
+# context at range, which is what let tree canopy read as a wall (returns
+# 8-14 m up with `ground rise` readings of 5-11 m: the estimator was
+# following the canopy). The margin widens the dense strip by this many
+# degrees of grade-plus-pitch each way (~36 rows, ~17k samples); grades and
+# pitches beyond it fall back to the coarse stride exactly as before.
+CAMERA_FAR_ROAD_PITCH_MARGIN_DEG = 2.0
 # Depth decodes as raw float32 x far plane, in linear metres of PLANAR Z
 # (measured: 10 m read 9.65, 25 m -> 24.17, 50 m -> 49.51). Sky and anything
 # past the far plane come back AT the far plane, so a sample within this
