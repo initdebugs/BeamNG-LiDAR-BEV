@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .config import (
+    CAMERA_DEFAULT_SAMPLE_STRIDE,
     CAMERA_FRONT_BUMPER_HFOV_DEG,
     CAMERA_FRONT_BUMPER_STANDOFF_M,
     CAMERA_FRONT_MAIN_HFOV_DEG,
@@ -15,9 +16,11 @@ from .config import (
     CAMERA_PILLAR_HFOV_DEG,
     CAMERA_PILLAR_YAW_DEG,
     CAMERA_REAR_HFOV_DEG,
+    CAMERA_REAR_PITCH_DEG,
     CAMERA_REPEATER_HFOV_DEG,
     CAMERA_REPEATER_YAW_DEG,
     CAMERA_RESOLUTION,
+    CAMERA_SAMPLE_STRIDES,
     LIDAR_FRONT_DENSITY,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
@@ -56,6 +59,13 @@ def _normalise(vector: np.ndarray, label: str) -> np.ndarray:
     if magnitude < 1e-8:
         raise ValueError(f"BeamNG returned a zero-length {label} vector")
     return vector / magnitude
+
+
+def rotate_about_up(vector: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate a world vector about world Z (up) by `angle_rad`, positive left."""
+    cos, sin = math.cos(angle_rad), math.sin(angle_rad)
+    x, y, z = (float(value) for value in vector)
+    return np.asarray((cos * x - sin * y, sin * x + cos * y, z), dtype=np.float64)
 
 
 def vehicle_axes(state: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -219,6 +229,7 @@ def derive_vehicle_geometry(
         rear_m=float(max_y),
         height_m=height,
         mounts=mounts,
+        body_floor_z=float(min_z),
     )
 
 
@@ -313,7 +324,6 @@ def derive_camera_rig(
     pillar_yaw = math.radians(CAMERA_PILLAR_YAW_DEG)
     repeater_yaw = math.radians(CAMERA_REPEATER_YAW_DEG)
     forward = (0.0, -1.0, 0.0)
-    rearward = (0.0, 1.0, 0.0)
 
     def mount(
         name: str,
@@ -328,7 +338,17 @@ def derive_camera_rig(
             horizontal_fov_deg=hfov,
             vertical_fov_deg=camera_vertical_fov_deg(hfov, resolution),
             resolution=resolution,
+            sample_stride=tuple(
+                CAMERA_SAMPLE_STRIDES.get(name, CAMERA_DEFAULT_SAMPLE_STRIDE)
+            ),
         )
+
+    # The reversing camera looks DOWN as well as back. Its job is the ground
+    # immediately behind the bumper, which a level view cuts off a couple of
+    # metres out; pitched, the bottom of a 130-degree frame meets the ground
+    # about 0.3 m behind the lens. See CAMERA_REAR_PITCH_DEG.
+    rear_pitch = math.radians(CAMERA_REAR_PITCH_DEG)
+    rear_direction = (0.0, math.cos(rear_pitch), -math.sin(rear_pitch))
 
     return {
         # The windshield pair, offset either side of the mirror so the two
@@ -382,10 +402,35 @@ def derive_camera_rig(
         "rear": mount(
             "rear",
             (centre_x, rear_y, rear_z),
-            rearward,
+            rear_direction,
             CAMERA_REAR_HFOV_DEG,
         ),
     }
+
+
+def camera_basis(mount: CameraMount) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The camera's (image right, image up, optical axis) unit vectors in the
+    VEHICLE frame, for a mount built with `up=(0, 0, 1)` as every camera here
+    is.
+
+    Image right is `forward x up`: the same handedness the LiDAR/BEV frames use
+    (`vehicle_axes` builds right as `forward x up` too), so a point to the
+    camera's right lands on the vehicle's right. The up vector is
+    re-orthogonalised against a pitched axis exactly as `vehicle_axes` does,
+    which is what keeps the rear camera's tilt from shearing its columns.
+
+    Which way the simulator's COLUMN index runs relative to this vector is an
+    engine fact the offline suite cannot reach; the `Unprojection check:` line
+    and tools/unprojection_oracle.py exist to confirm it against the LiDAR
+    cloud. If a live scene ever comes back mirrored, negate `right` HERE and
+    nowhere else.
+    """
+    axis = _normalise(np.asarray(mount.direction_vehicle, dtype=np.float64), "dir")
+    world_up = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+    right = _normalise(np.cross(axis, world_up), "camera right")
+    up = _normalise(np.cross(right, axis), "camera up")
+    return right, up, axis
 
 
 # The ground-annulus units: every ray points below the horizon, so their reach
@@ -441,6 +486,35 @@ def sensor_coverage(mount: SensorMount) -> SensorCoverage:
         near_m=float(near_m),
         far_m=float(far_m),
     )
+
+
+# How far outside the bounding box a return still counts as the ego's own
+# bodywork: mirrors, the shell's curvature past the OOBB face, and the
+# reference-node/box misalignment the low mounts sit inside.
+EGO_BODY_MARGIN_M = 0.18
+
+
+def outside_ego_body(
+    bev: np.ndarray, geometry: VehicleGeometry, margin_m: float = EGO_BODY_MARGIN_M
+) -> np.ndarray:
+    """
+    Which BEV returns lie OUTSIDE the ego's own footprint (plus a margin).
+
+    Shared by the worker's tick and the oracle tool so both clouds are culled
+    identically -- the camera rig films its own bodywork by design (the
+    bumper camera sees bonnet, the pitched rear camera sees the boot), and a
+    cull that differed between the two would show up as obstacle cells on
+    the car itself.
+    """
+    if not len(bev):
+        return np.ones(0, dtype=bool)
+    inside = (
+        (bev[:, 0] >= -geometry.left_m - margin_m)
+        & (bev[:, 0] <= geometry.right_m + margin_m)
+        & (bev[:, 1] >= -geometry.rear_m - margin_m)
+        & (bev[:, 1] <= geometry.front_m + margin_m)
+    )
+    return ~inside
 
 
 def world_points_to_bev(

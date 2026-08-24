@@ -281,8 +281,11 @@ for all the LiDAR streams — so each tick submits the next tick's poll to a one
 next tick collects it (`_take_vehicle_state`) as its **first**. Nothing on the worker thread
 touches a socket between those two points, so the connection is never used from two threads at
 once; beamngpy has no internal locking, which is why this ordering is the whole of the safety
-argument — do not move either call. The collected position is advanced by `vel · age` to restore
-the pose-to-cloud alignment a synchronous poll had; a state older than
+argument — do not move either call. The collected position is advanced by `vel · age` — and, since
+2026-08-23, the HEADING by a measured yaw rate · age (`_observe_state_yaw`): a stale heading is
+invisible in RAW BEV (the same state transforms the cloud both ways) but rotates every cloud
+WORLD's stores accumulate during a turn, which was the live "the whole world turns with me"
+report — to restore the pose-to-cloud alignment a synchronous poll had; a state older than
 `_STATE_PREFETCH_MAX_AGE_S` (an app stall) is discarded and re-polled. `_cleanup_sensors` calls
 `_drop_state_future` FIRST — a bounded wait, never `result()`, because the socket has no timeout —
 so teardown traffic cannot interleave with an in-flight prefetch. Pinned by
@@ -304,8 +307,12 @@ toggle asks the worker for the eight-camera rig (Tesla HW4 layout, derived from
 the same live bbox by `geometry.derive_camera_rig` — **forward is `(0, -1, 0)`**,
 the intuitive sign films the rear seats, and mounts sit OUTSIDE the shell
 because there is no hide-ego flag) instead of the six LiDAR units, and
-`vision_view.VisionView` draws every camera as a labelled grid. Five things are
-load-bearing:
+`vision_view.VisionView` draws every camera as a labelled grid. **Since rung
+0.5 (2026-08-23, below) the header has TWO toggles**: the VIEW (WORLD / RAW BEV
+/ CAMERAS, GUI-only) and the INSTRUMENT SET (LIDAR / VISION, worker-owned). The
+CAMERAS view is enabled only by the worker's `sensor_mode_changed(VISION)`,
+because it draws the rig's images and the LiDAR set has none; the other two
+views draw whichever cloud the live set produces. Five things are load-bearing:
 
 - **The worker owns the mode** exactly as it owns the driving toggles:
   `set_sensor_mode` no-ops on a repeat, records the choice when idle, and
@@ -313,30 +320,32 @@ load-bearing:
   teardown funnel (`_cleanup_sensors`) is the only path between rigs and a
   half-swapped set cannot exist. `sensor_mode_changed` is emitted before
   `sensors_ready` so the GUI knows which controls to enable.
-- **Self-driving, both AEBs and BOTH PARKING controls refuse in vision mode** —
-  they reason over the LiDAR cloud, which rung 0 does not produce. Parking is
-  in the same position for a slightly different reason: the bay scan reads the
-  SEMANTIC marking store, and the camera rig returns no points to classify, so
-  an armed scan would sit lit over a store that can never fill. The
-  unprojection rung restores the first three; parking additionally needs
-  whatever eventually classifies paint. Until then the GUI doesn't offer the
-  buttons and the worker refuses anyway (belt and braces, worker wins) — and
-  the worker's half is the load-bearing one, because a guard living only in
-  the window is one a queued signal, a restored setting or a mid-stream mode
-  switch walks straight past. No teardown change was needed for parking:
-  `_cleanup_sensors` already clears the scan, emits `parking_changed(False)`
-  and drops the marking store, so the re-attach `set_sensor_mode` triggers
-  disarms it through the one funnel.
+- **Self-driving, both AEBs and BOTH PARKING controls refuse in vision mode
+  behind ONE gate, `VISION_DRIVING_ENABLED`** (`worker._vision_refuses_driving`,
+  mirrored by `main_window.controls_offered`). Rung 0.5 gives them a real cloud
+  to read, but every band was fitted to LiDAR sampling and the camera lattice is
+  a new distribution — no azimuth stripes, density falling as 1/r² — so the
+  phantom-braking checklist has to be re-run live before a full-authority
+  brake reads it. Flipping the constant is the whole code change of roadmap
+  milestone 5. The GUI doesn't offer the buttons and the worker refuses anyway
+  (belt and braces, worker wins) — and the worker's half is the load-bearing
+  one, because a guard living only in the window is one a queued signal, a
+  restored setting or a mid-stream mode switch walks straight past. Attach
+  runs the SAME two `_set_aeb(True)` calls in both modes and lets the slot
+  refuse, rather than carrying a second branch that could drift from it.
 - **`stream_raw()` returns a memoryview of the LIVE shared buffer** — the
-  simulator keeps writing into it — so `_poll_vision_once` copies exactly once
+  simulator keeps writing into it — so the COLOUR image is copied exactly once
   before anything reads twice; `test_the_image_is_a_private_copy...` pins it.
-  Colour only at this rung: annotation is a second geometry pass (measured
-  42→33 Hz sim rate) and depth doubles the copied bytes; nothing consumes
-  either yet.
+  Depth and annotation are deliberately NOT copied: only the ray table's
+  lattice is gathered from the live view, one vectorised read per channel
+  (~1/24th of the bytes). A torn depth read mixes two frames a sixtieth of a
+  second apart along one row boundary, which the accumulation stores absorb.
 - **ACQUISITION counts genuinely NEW frames.** The 40 ms tick re-reads shared
-  memory faster than the ~16–18 Hz cameras update, so each camera's buffer is
-  digested (strided sample) and unchanged re-reads don't count — the same
-  honesty rule the LiDAR metric follows, and the same stale-flush.
+  memory faster than the ~16–18 Hz cameras update, so each camera's DEPTH
+  lattice is digested (a strided sample of what the unprojection gathers
+  anyway) and unchanged re-reads don't count — the same honesty rule the
+  LiDAR metric follows, and the same stale-flush. The time of each change is
+  also the only measurable part of a frame's AGE (below).
 - **`CAMERA_UPDATE_TIME_S` must be positive**: at 0.0 every streaming buffer
   stays zero-filled while the loop spins — a working rig of black frames,
   measured live. The one-shot `Vision check:` line reports first fresh frames
@@ -346,6 +355,164 @@ Failure handling shares the LiDAR path's time-based budget via
 `_note_poll_failure`; a vision tick emits a frame every tick (black grid with
 live metrics, never frozen), and the same prefetched state poll supplies EGO
 SPEED with the same socket-ordering contract.
+
+### Rung 0.5: the camera rig produces the cloud (2026-08-23, phase 2 — oracle run once live)
+
+**Phase 1 failed, and that is what shaped this.** `tools/kerb_experiment.py`
+measured computed stereo resolving a 0.11 m kerb at 15 m (3.6–4.7σ) and
+nowhere beyond it — past 20 m either no depth at the kerb line at all or a
+physically impossible NEGATIVE step — across baselines 0.6–1.6 m, widths 1280
+and 1920, and an SGBM sweep, while the engine-depth oracle through the same
+pipeline passed at 9.4–16.4σ. The failure at range is MATCHING on low-texture
+asphalt, not precision. So engine depth is the PERMANENT source of the ground
+band (kerbs, road surface), not scaffolding stereo replaces, and stereo when
+it comes takes obstacles only. `unprojection.py` is built to that standard.
+
+**`_poll_once` is ONE tick for EITHER instrument set, and the split is
+acquisition-only.** `_acquire_lidar_cloud` streams the six units;
+`_acquire_vision_cloud` streams the eight cameras and unprojects their depth
+and annotation through `unprojection.unproject_frame`; everything from the
+concatenated `points_world + colours` on — the BEV transform, the semantic
+pass, both bands, the plan, AEB, `BevFrame`, `PerceptionSnapshot` — is the
+same code. That is the perception waist the ladder refills, and keeping it one
+path is what makes "the car drives in Vision mode" the same car. The vision
+tick additionally emits the `VisionFrame` for the grid, AFTER the `BevFrame`,
+carrying that frame's metrics. Five things are load-bearing:
+
+- **Depth is PLANAR Z, decoded as `raw_float32 × far plane`**, and the ray
+  table multiplies the UNNORMALISED ray `(x, y, 1)` — the cosine divide is
+  baked into the LUT. Multiplying a unit ray instead bows a flat road into a
+  bowl; `test_a_flat_floor_comes_back_flat_to_the_edge_of_the_frame` pins it
+  to 0.5 mm over a 100° frame. `integer_depth=False` and
+  `postprocess_depth=False` are both traps (silent 0–255 quantisation; a
+  256-iteration Python loop per frame). Sky arrives AT the far plane and is
+  culled by `surface_mask` before any transform, with bodywork under
+  `CAMERA_DEPTH_MIN_M` and anything past `LIDAR_RANGE_M`.
+- **A camera is placed from the BODY-frame floor, not the gravity-referenced
+  one.** `pos.z` is measured from the vehicle ground plane exactly as the
+  LiDAR mounts are, and that plane is the bbox bottom along the body's up
+  axis; `ground_z_vehicle` is the same corner along WORLD Z and the two
+  diverge on a grade. `VehicleGeometry.body_floor_z` carries the body figure
+  (`sensor_floor_z` prefers it, falls back for older callers).
+- **Image right is `forward × up` (`geometry.camera_basis`), re-orthogonalised
+  for the pitched rear camera, and the simulator's COLUMN index runs that way
+  — SETTLED LIVE 2026-08-23.** `tools/unprojection_oracle.py` answers it
+  automatically: planner-band occupancy IoU against the LiDAR cloud, direct
+  and mirrored, from one lockstep capture of both rigs on the same car. On a
+  west_coast_usa car park: **direct 0.151, mirrored 0.015** (synthetic
+  control: 0.851 vs 0.130 either way round). If a future engine ever says
+  mirrored, negate `right` in `camera_basis` and nowhere else.
+- **Each camera's cloud is placed from the pose the car had when its frame
+  changed** (`pose_from_state(state, age)`, velocity × age rewound). The
+  simulator stamps nothing and stages frames "a frame or two" behind; the
+  worker can measure only the part after the buffer changed, and
+  `CAMERA_FRAME_STAGING_S` (zero, UNMEASURED) is the fixed remainder. A
+  lockstep capture has no skew, so a live run that disagrees with the oracle
+  by a range-dependent amount is measuring that constant. Unmodelled, 60 ms
+  at the 40 km/h cap is 0.66 m in the LATE direction for AEB.
+- **The lattice is the ONLY thing that sets the cloud's size**, per camera
+  `(column, row)` strides on `CameraMount.sample_stride` from
+  `CAMERA_SAMPLE_STRIDES`. Rows are the RANGE axis for ground seen from a
+  camera — `(r²/h)·Δθ` with the row stride as the channel pitch, the LiDAR
+  ring arithmetic again — so `front_main` keeps the finest row stride (2) and
+  the rest are coarser. 283k lattice samples at 960×720, roughly half sky;
+  `test_the_rig_sample_budget_is_bounded` holds it in 150–320k so a stride
+  edit cannot blow the tick silently. Measured: 5.5 ms per tick for the whole
+  rig's unprojection (12.6 before going float32 end to end and gathering the
+  annotation as one uint32 per pixel at the surviving samples only), plus
+  ~4 ms of colour copies for the grid.
+
+The porosity veto's eye height is the tallest camera in vision mode
+(`_porosity_sensor_height` is an instance method now); the palette is loaded
+in both modes, so `Marking check:` works on cameras; `Unprojection check:` is
+the `Sensor reach:` equivalent — per-camera counts and furthest return, the
+mean measured frame age, the staging assumption and the eye height — logged
+once, on the first tick with a fresh frame. `BeamNgWorker.lidar_sensor_kwargs`
+/ `camera_sensor_kwargs` are public and pure so the oracle tool builds the
+SAME rigs the app does; an oracle differing in any constructor argument would
+be measuring the difference.
+
+**The rear camera is 130° and pitched 15° down** (`CAMERA_REAR_PITCH_DEG`,
+2026-08-23): it is the reversing camera and its job is the ground immediately
+behind the bumper, which a level 110° view cut off metres out. The bottom of
+the pitched frame meets the ground ~0.3 m behind the lens; the top still
+reaches 43° above the horizon. `camera_basis` re-orthogonalises `up` against
+the tilted axis so the columns do not shear, pinned by
+`test_the_pitched_rear_camera_still_reconstructs_a_level_floor`.
+
+**The first live DRIVE (2026-08-23 evening) found the mode working but slow
+and the WORLD view "turning with the car", and the diagnosis rewrote several
+things — all four fixes below are in and none is vision-specific:**
+
+- **"The whole 3D world turns with me, then corrects after a few seconds"**
+  was the STALE HEADING: the prefetched state advanced its position by
+  `vel x age` but never its heading, so every cloud stamped into the
+  world-anchored stores during a turn was rotated about the car by
+  yaw-rate x staleness — invisible in RAW BEV by construction (the same
+  state transforms the cloud both ways and cancels), remembered by the road
+  store for 25 m of travel, which is the "few seconds". `_take_vehicle_state`
+  now measures a yaw rate between successive polls (`_observe_state_yaw`,
+  `_YAW_RATE_TAU_S`) and advances the prefetched heading; the vision path
+  rewinds each camera frame's pose by the same rate x its measured age
+  (`pose_from_state(state, age, yaw_rate)`).
+- **The worker thread was spending ~half of every second blocked on refused
+  actor enrichment**: `vehicles.get_states` is rejected in free-roam but was
+  retried at 10 Hz (39 ms per rejected round trip) beside the 1 Hz
+  `get_current_info` registry refresh (120 ms), each logging a traceback.
+  One refusal now rests both for `WORLD_ACTOR_RETRY_S` (15 s) with one
+  warning per attach — see `_actor_enrichment_refused`.
+- **The scene-store refresh ran back-to-back once a build overran the
+  120 ms cadence** (200–460 ms in the live log), saturating its pool thread
+  and taxing the worker tick through the GIL (measured: a busy refresh
+  thread takes an offline vision tick from 7.8 to 11.5 ms). An overrunning
+  build now stretches its own interval to `last_build / WORLD_STORE_REFRESH_
+  DUTY`, trading ground freshness (already lost) for everyone else's
+  latency. The refresh itself also got cheaper — see the ground-connectivity
+  section under WORLD scene assembly.
+- **A fully covered simulator window throttles the RENDERER to ~2 Hz** —
+  measured live: one 320x240 colour camera AND a streaming LiDAR unit both
+  under 2 Hz until the window was visible, while `poll_sensors("state")`
+  stayed at its normal 38 ms. The window title gains "- background". Nothing
+  in the app can fix that; `Capture check:` now reads
+  `Engine.isProgramFocused` and warns, and `tools/camera_staging_probe.py`
+  refuses to measure in that state. Keep BeamNG visible (second monitor)
+  while streaming EITHER rig.
+- The per-camera freshness digest was 7 samples on the small cameras
+  (`_VISION_DIGEST_STRIDE` 4093 over the lattice) — few enough to miss real
+  frames, and a missed frame grows the measured age that the pose rewind
+  multiplies. It is 61 now (~1.4k samples, 6 KB a tick).
+
+**What the one live oracle run measured (2026-08-23 afternoon, west_coast_usa
+car park, every depth buffer filled, 200k camera returns against 224k
+LiDAR):**
+the road floor per 4 m ring agrees with the LiDAR's to **+3…+9 mm out to
+24 m** — the permanent ground source is right in the near field; the scene
+is recognisably the same in the side-by-side PNG; the camera road fraction is
+higher (52% vs 42%). Two differences are real sampling-distribution
+differences, not bugs, and belong on milestone 5's list: a parked car behind
+the ego lands one 0.4 m cell nearer from the 0.9 m rear camera (it sees the
+sloped rear glass) than from the 0.2 m rear LiDAR (the bumper), and a tree
+18 m behind-left enters the planner band from `repeater_left` (554 `NATURE`
+returns at 1.8–6.6 m) where the LiDAR's 61 sparse canopy returns were
+dropped — the cameras see low branches the rings miss. The far road could
+not be judged on that scene (things at 10–15 m ahead); the ground-band reach
+past 25 m wants a street capture.
+
+**Live checklist still open for this rung:** the `Unprojection check:` line
+on a vision attach in the APP, with every camera delivering and the total in
+the 100–150k band; the oracle capture on a STREET with a kerb and a clear road
+ahead (ground bias per ring out to 60 m; planner/AEB cells only one rig
+produces, listed by range); RAW BEV and WORLD on the camera rig reading like
+the LiDAR's in character — road surface filling, kerbs as a line, walls as
+slabs — with SCENE BUILD not logging over budget; the `Marking check:` line on
+a marked road; the rear camera's tiles showing ground just behind the bumper;
+a mode switch mid-stream both ways still clean; and then milestone 4 (the
+staging measurement: a live drive's cloud against a lockstep one) before
+milestone 5 (flip `VISION_DRIVING_ENABLED` and re-run the whole AEB phantom
+checklist — hills, brake dive, bushes, kerbs, reverse — plus the tree case
+above). `vehicle_fit` still clusters in the LiDAR's polar lattice and will
+behave differently on the denser camera cloud; that re-derivation is spec §4's
+and is not done.
 
 ### Frame pipeline
 
@@ -744,6 +911,56 @@ were re-chosen every frame from a re-ordered array so they shimmered, and a wall
 confetti has gaps between the confetti by construction. Now world-anchored `(x, y, height-bin)`
 voxels keep min/max height over a `WORLD_COLUMN_MEMORY_M` window, collapse into vertical runs, merge
 into slabs and extrude. A dense 10 m wall costs **24 vertices against 2,560**.
+
+### The ground is ONE height per cell, CONNECTED to the car (2026-08-23)
+
+The promotion rule hands the ground mesh the lowest short run of every
+0.125 m column, and four columns land in one 0.25 m cell — so where one
+column saw the ground under a parked car and its neighbour saw only the
+roof, the cell held BOTH as stacked `(x, y, layer)` layers. Measured on the
+first live camera capture: **155k ground cells over 65k distinct (x, y)**,
+the stacks a median 3.3 m apart — car tops, wall tops, hedge tops, building
+roofs — every one drawn as a floating patch of floor, and every refresh
+pushed onto `_keyed_corner_means`, the slow fallback the box-sum fast path
+exists to avoid (58 ms of a 280 ms refresh). The camera rig, which sees the
+top of everything from 1.3 m, tripled what the LiDAR produced (31k stacked);
+the defect itself predates vision mode and the fix applies to both rigs.
+
+Two rules now, in `_ground_cells` + `connected_ground` (scipy.ndimage.label
+— scipy ships as beamngpy's own dependency):
+
+- **Per (x, y) the candidate NEAREST THE EGO'S OWN GROUND PLANE wins**, not
+  the lowest — a bridge deck the car is driving on beats the road seen
+  beneath it. The layer field is then zeroed: left in place it stopped
+  `bridge_gaps` joining cells straddling a 0.75 m contour, and the x and y
+  passes each invented a fill at the same (x, y) in different layers, which
+  was a stack again.
+- **Only ground REACHABLE from the car by gentle steps is ground**, decided
+  AFTER bridging (before it, ring-sampled ground is rows with holes and
+  nothing connects): a raster pass cuts edges steeper than
+  `WORLD_GROUND_STEP_M` (0.5 m) between 4-neighbours, labels what remains,
+  and keeps components holding a seed near the car; cut rims rejoin where
+  they adjoin a kept cell gently (the kerb line), and fragments past the
+  bridge's reach rejoin in `WORLD_GROUND_REACH_HOPS` bounded distance-
+  transform hops with a slope allowance — a level road ring 2 m past the
+  last kept cell returns, a roof 2 m up beside it never does. No seed at all
+  (the car over a hole in the store) filters nothing. Measured on the live
+  capture: what is dropped is almost entirely ≥1 m above the ego plane —
+  the street around a sunken car park — with 46 near-level road cells lost
+  inside 20 m. The known cost is the slab ceiling's, in the same direction:
+  terrain behind a genuine cliff is not drawn until a gentler way onto it
+  is seen. Pinned by four tests in `test_world_scene.py` ("a roof is not
+  ground but a kerbed pavement is", the hillside, the no-seed fallback, the
+  readmitted fragment).
+
+With the stacks gone the ground half of the live refresh went 105 ms → 24
+(`_corner_means` always takes the box path), and `merge_cell_runs` lost its
+last Python loop the same day: the cross-row merge is a `lexsort` chain now —
+runs sorted by `(layer, x0, x1, y)` merge exactly where y stays consecutive —
+measured 64 ms → 12 on the same scene, and every one of those Python
+iterations used to hold the GIL. Live capture, both rigs, steady state at
+full stores: **~280 ms per refresh → ~170** (the budget is the 120 ms
+cadence; the duty stretch above absorbs the remainder on worst-case scenes).
 
 ### The blocks are finer than the ground, and that asymmetry is measured (2026-08-12)
 
@@ -1266,7 +1483,11 @@ own `_track_ego_motion` clears the stores, and it clears **stores only**, becaus
 would touch compose-thread state from the refresh thread; the **first build after construction or
 clear runs inline** so the first frame carries a world; SCENE BUILD still means "the store
 refresh", but its budget is now the **cadence** (120 ms), not the display tick — both the
-over-budget log and `test_covering_the_ground_stays_inside_the_scene_budget` measure against it;
+over-budget log and `test_covering_the_ground_stays_inside_the_scene_budget` measure against it,
+and since 2026-08-23 a build that overruns the cadence stretches its own interval to
+`last_build / WORLD_STORE_REFRESH_DUTY` so the refresh thread never runs back-to-back — it
+shares the process's GIL with the worker tick and the compose thread, and saturating it taxed
+both;
 and a refresh error clears from the compose thread only after the future is reaped, when nothing
 is in flight. Face shading is baked into the cached colour, so the crease cue re-aims at the
 refresh rate — bounded staleness on a 1.1–1.3:1 cue. Pinned by `test_two_rate_pipeline.py` and

@@ -53,6 +53,11 @@ class CameraMount:
     horizontal_fov_deg: float
     vertical_fov_deg: float
     resolution: tuple[int, int]
+    sample_stride: tuple[int, int] = (6, 4)
+    """(column, row) pixel stride the unprojection rung samples the depth and
+    annotation images at. Per mount because rows are the RANGE axis for ground
+    seen from a camera, and only the long-range windshield camera needs them
+    fine (see config.CAMERA_SAMPLE_STRIDES)."""
 
 
 @dataclass(frozen=True)
@@ -64,10 +69,26 @@ class VehicleGeometry:
     rear_m: float
     height_m: float
     mounts: Mapping[str, SensorMount]
+    body_floor_z: float | None = None
+    """The bounding-box bottom measured along the BODY's up axis from the
+    reference node -- the plane the simulator references every sensor
+    `pos.z` to. `ground_z_vehicle` is the same corner measured along WORLD Z;
+    the two agree on level ground and diverge by half the length times the
+    sine of the pitch on a grade, which is why unprojection places a camera
+    with this one. None (older callers, tests) falls back to ground_z_vehicle."""
 
     @property
     def width_m(self) -> float:
         return self.left_m + self.right_m
+
+    @property
+    def sensor_floor_z(self) -> float:
+        """Where a vehicle-frame `pos.z` of 0 sits relative to the node."""
+        return (
+            self.ground_z_vehicle
+            if self.body_floor_z is None
+            else self.body_floor_z
+        )
 
     @property
     def length_m(self) -> float:

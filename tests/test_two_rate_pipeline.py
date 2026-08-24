@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from beamng_lidar_bev.config import WORLD_POSE_JUMP_RESET_M
 from beamng_lidar_bev.models import PerceptionSnapshot, VehicleGeometry
@@ -51,6 +52,19 @@ def _snapshot(
 # --- The prefetched state poll -----------------------------------------------
 
 
+def _state_taker(**fields: object) -> SimpleNamespace:
+    """The attributes `_take_vehicle_state` reads, driven unbound."""
+    namespace = SimpleNamespace(
+        _yaw_observation=None, _yaw_rate_rps=0.0, _state_future=None
+    )
+    namespace._observe_state_yaw = lambda state, at: (
+        BeamNgWorker._observe_state_yaw(namespace, state, at)
+    )
+    for name, value in fields.items():
+        setattr(namespace, name, value)
+    return namespace
+
+
 def test_a_prefetched_state_is_advanced_by_its_own_velocity() -> None:
     future: Future = Future()
     future.set_result(
@@ -59,7 +73,7 @@ def test_a_prefetched_state_is_advanced_by_its_own_velocity() -> None:
             time.perf_counter() - 0.1,
         )
     )
-    worker = SimpleNamespace(_state_future=future)
+    worker = _state_taker(_state_future=future)
 
     state = BeamNgWorker._take_vehicle_state(worker)  # type: ignore[arg-type]
 
@@ -75,9 +89,7 @@ def test_a_stale_prefetch_is_discarded_and_repolled() -> None:
     future: Future = Future()
     future.set_result(({"pos": (0.0, 0.0, 0.0)}, time.perf_counter() - 5.0))
     fresh = {"pos": (7.0, 7.0, 7.0)}
-    worker = SimpleNamespace(
-        _state_future=future, _get_vehicle_state=lambda: fresh
-    )
+    worker = _state_taker(_state_future=future, _get_vehicle_state=lambda: fresh)
 
     state = BeamNgWorker._take_vehicle_state(worker)  # type: ignore[arg-type]
 
@@ -88,9 +100,7 @@ def test_a_failed_prefetch_falls_back_to_a_fresh_poll() -> None:
     future: Future = Future()
     future.set_exception(ConnectionError("bridge went away"))
     fresh = {"pos": (1.0, 2.0, 3.0)}
-    worker = SimpleNamespace(
-        _state_future=future, _get_vehicle_state=lambda: fresh
-    )
+    worker = _state_taker(_state_future=future, _get_vehicle_state=lambda: fresh)
 
     state = BeamNgWorker._take_vehicle_state(worker)  # type: ignore[arg-type]
 
@@ -100,11 +110,53 @@ def test_a_failed_prefetch_falls_back_to_a_fresh_poll() -> None:
 
 def test_without_a_prefetch_the_state_is_polled_synchronously() -> None:
     fresh = {"pos": (1.0, 2.0, 3.0)}
-    worker = SimpleNamespace(
-        _state_future=None, _get_vehicle_state=lambda: fresh
-    )
+    worker = _state_taker(_state_future=None, _get_vehicle_state=lambda: fresh)
 
     assert BeamNgWorker._take_vehicle_state(worker) is fresh  # type: ignore[arg-type]
+
+
+def test_a_prefetched_heading_is_advanced_by_the_measured_yaw_rate() -> None:
+    """
+    The position was always advanced by velocity x age; the heading was not,
+    on the reasoning that it moves under a degree per 40 ms tick. A tick
+    that stretches to 100-250 ms makes that 3-8 degrees at 30 deg/s, and a
+    cloud stamped into WORLD's world-anchored stores with a stale heading is
+    rotated about the car -- reported as "the whole world turns with me".
+    RAW BEV cannot show it (the same state transforms the cloud both ways).
+    """
+    worker = _state_taker()
+    # A third of a second of polls 0.04 s apart, turning left at 30 deg/s,
+    # leading continuously into a prefetched state whose round trip finished
+    # 0.2 s ago at the same turn rate.
+    rate = np.radians(30.0)
+    polls = 8
+    done_at = time.perf_counter() - 0.2
+    t0 = done_at - polls * 0.04
+    for index in range(polls):
+        angle = rate * index * 0.04
+        BeamNgWorker._observe_state_yaw(
+            worker, {"dir": (np.cos(angle), np.sin(angle), 0.0)}, t0 + index * 0.04
+        )
+    assert worker._yaw_rate_rps == pytest.approx(rate, rel=0.05)
+
+    angle = rate * polls * 0.04
+    future: Future = Future()
+    future.set_result(
+        (
+            {
+                "pos": (0.0, 0.0, 0.0),
+                "vel": (0.0, 0.0, 0.0),
+                "dir": (np.cos(angle), np.sin(angle), 0.0),
+            },
+            done_at,
+        )
+    )
+    worker._state_future = future
+    state = BeamNgWorker._take_vehicle_state(worker)  # type: ignore[arg-type]
+    # ~0.2 s of turn advanced onto the stale heading: ~6 degrees, a little
+    # more for the time the test itself takes before the age is measured.
+    heading = np.degrees(np.arctan2(state["dir"][1], state["dir"][0]))
+    assert heading == pytest.approx(np.degrees(angle) + 6.0, abs=1.5)
 
 
 def test_dropping_the_prefetch_clears_it_for_teardown() -> None:

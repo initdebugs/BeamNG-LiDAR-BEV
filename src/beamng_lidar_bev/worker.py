@@ -42,6 +42,7 @@ from .config import (
     BEAMNG_HOME,
     BEAMNG_HOST,
     BEAMNG_PORT,
+    CAMERA_FRAME_STAGING_S,
     CAMERA_NEAR_FAR_PLANES,
     CAMERA_UPDATE_TIME_S,
     CONTROL_INTERVAL_MS,
@@ -83,8 +84,10 @@ from .config import (
     STALL_SPEED_MPS,
     STEERING_SIGN,
     TRANSITION_DISTANCES_M,
+    VISION_DRIVING_ENABLED,
     WORLD_ACTOR_FADE_S,
     WORLD_ACTOR_REGISTRY_INTERVAL_S,
+    WORLD_ACTOR_RETRY_S,
     WORLD_ACTOR_STATE_INTERVAL_S,
 )
 from .controller import (
@@ -98,6 +101,8 @@ from .controller import (
 from .geometry import (
     derive_camera_rig,
     derive_vehicle_geometry,
+    outside_ego_body,
+    rotate_about_up,
     vec3,
     vehicle_axes,
     world_points_to_bev,
@@ -116,6 +121,7 @@ from .models import (
     ArcPlan,
     BevFrame,
     CameraImage,
+    CameraMount,
     ControlCommand,
     DrivingPlan,
     ParkingJob,
@@ -166,6 +172,12 @@ from .semantics import (
     pack_rgb,
     pack_rgb_rows,
 )
+from .unprojection import (
+    CameraRays,
+    build_rig_rays,
+    pose_from_state,
+    unproject_frame,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -205,6 +217,10 @@ _ACQUISITION_STALE_S = 0.5
 # a strike count: three ticks is under a tenth of a second, which is far too
 # eager to survive a map load.
 _POLL_FAILURE_GRACE_S = 2.0
+# Time constant of the yaw-rate estimate the prefetched heading and the
+# camera frames are advanced with; short, because the thing it guards against
+# is a tick that stretched, and a long filter would lag exactly then.
+_YAW_RATE_TAU_S = 0.08
 # A prefetched vehicle state older than this is re-polled instead of used: the
 # position compensation below is linear in the age, so a state from before an
 # app stall would be extrapolated across the whole stall.
@@ -225,10 +241,15 @@ _MEMORY_LOG_INTERVAL_S = 5.0
 # -- a working rig producing black frames, which cost a full benchmark round
 # to diagnose live.
 _VISION_SILENCE_WARN_S = 5.0
-# Stride for the per-camera change digest. A prime, so the sampled bytes drift
-# across the frame instead of landing on one pixel column; ~600 bytes sampled
-# from a 1.2 MB buffer per camera per tick.
-_VISION_DIGEST_STRIDE = 4093
+# Stride for the per-camera freshness digest, over the LATTICE indices the
+# unprojection gathers anyway. A prime, so the samples drift across the frame
+# instead of landing on one pixel column. It went 4093 -> 61 with rung 0.5:
+# at 4093 a small camera's digest was SEVEN depth samples, few enough to miss
+# real frame changes for seconds at a stretch -- and a missed change grows the
+# frame's measured age, which the pose rewind then multiplies by velocity, so
+# the whole camera's cloud slid backwards down the road. ~1.4k samples for the
+# largest camera now, a 6 KB gather against the 40 ms tick.
+_VISION_DIGEST_STRIDE = 61
 # How often a spawned-but-not-yet-connected simulator is checked for still
 # being alive. One second: this runs only between Launch and the bridge
 # opening, and each tick is a `poll()` plus, at most, one bounded socket probe.
@@ -326,6 +347,14 @@ class BeamNgWorker(QObject):
         self._vision_streaming_since: float | None = None
         self._logged_vision_check = False
         self._logged_vision_silence = False
+        # Rung 0.5: the per-camera ray tables, built once at attach, and when
+        # each camera's depth buffer was last seen to CHANGE -- the only part
+        # of a frame's age the worker can measure, since the simulator stamps
+        # nothing. The eye height is the tallest camera's, for porosity.
+        self._camera_rays: dict[str, CameraRays] = {}
+        self._camera_frame_seen: dict[str, float] = {}
+        self._vision_eye_height_m = 0.0
+        self._logged_unprojection = False
         self._frame_times: deque[float] = deque(maxlen=60)
         self._poll_failures = 0
         self._first_failure_at: float | None = None
@@ -339,6 +368,12 @@ class BeamNgWorker(QObject):
         self._last_actor_registry_at = -float("inf")
         self._last_actor_state_at = -float("inf")
         self._last_actor_success_at = -float("inf")
+        self._actor_refused_at = -float("inf")
+        self._logged_actor_refusal = False
+        # Yaw rate measured from successive polled states, for advancing the
+        # prefetched heading and rewinding camera frames.
+        self._yaw_observation: tuple[float, float] | None = None
+        self._yaw_rate_rps = 0.0
 
         self._self_driving = False
         self._controller: DrivingController | None = None
@@ -656,34 +691,9 @@ class BeamNgWorker(QObject):
             self._sensors = []
             self._sensor_names = []
 
-            if self._sensor_mode == SENSOR_MODE_VISION:
-                # Rung 0 of the vision ladder: colour cameras only, so the
-                # semantic palette is not needed and not loaded.
-                mount_count = self._attach_camera_rig(
-                    vehicle, geometry, sensor_prefix
-                )
-                self._geometry = geometry
-                self._palette = None
-                self._frame_times.clear()
-                self._poll_failures = 0
-                self._first_failure_at = None
-                self._last_speed = 0.0
-                self._last_forward_speed = 0.0
-                self._camera_digests = {}
-                self._vision_streaming_since = time.perf_counter()
-                self._logged_vision_check = False
-                self._logged_vision_silence = False
-                self.status_changed.emit(
-                    "STREAMING", f"{mount_count} cameras active on {player_vid}"
-                )
-                self.sensor_mode_changed.emit(SENSOR_MODE_VISION)
-                self.sensors_ready.emit(player_vid, geometry)
-                self._poll_timer.start()
-                # Deliberately NO self-driving and NO AEB arming: both reason
-                # over the LiDAR point cloud, and Vision mode does not produce
-                # one yet. The unprojection rung is what restores them.
-                return
-
+            # Both instrument sets produce the same annotated cloud now: the
+            # camera rig renders the engine's annotation channel and the
+            # palette matches it exactly as it matches the LiDAR's colours.
             annotations = self._load_annotations()
             palette = SemanticPalette.from_annotations(annotations)
             # Every paint-ish class by its palette colour, INCLUDING the ones
@@ -697,9 +707,28 @@ class BeamNgWorker(QObject):
                 in (MARKING_CLASSES | {"DRIVING_INSTRUCTIONS", "SPEED_BUMP"})
             }
 
-            mount_count = len(geometry.mounts)
+            if self._sensor_mode == SENSOR_MODE_VISION:
+                # Rung 0.5 of the vision ladder: every camera renders depth
+                # and annotation beside colour, and the tick unprojects them
+                # into the same cloud the LiDAR set produces.
+                mount_count = self._attach_camera_rig(
+                    vehicle, geometry, sensor_prefix
+                )
+                self._camera_digests = {}
+                self._camera_frame_seen = {}
+                self._vision_streaming_since = time.perf_counter()
+                self._logged_vision_check = False
+                self._logged_vision_silence = False
+                self._logged_unprojection = False
+            else:
+                mount_count = len(geometry.mounts)
             bbox_z = self._bbox_bottom(vehicle)
-            for index, mount in enumerate(geometry.mounts.values()):
+            lidar_mounts = (
+                ()
+                if self._sensor_mode == SENSOR_MODE_VISION
+                else tuple(geometry.mounts.values())
+            )
+            for index, mount in enumerate(lidar_mounts):
                 self.status_changed.emit(
                     "ATTACHING",
                     f"Attaching {mount.name} LiDAR ({index + 1}/{mount_count})",
@@ -708,40 +737,7 @@ class BeamNgWorker(QObject):
                     f"{sensor_prefix}_{mount.name}",
                     self._bng,
                     vehicle,
-                    requested_update_time=LIDAR_UPDATE_TIME_S,
-                    update_priority=0.0,
-                    pos=mount.position_vehicle,
-                    dir=mount.direction_vehicle,
-                    up=(0.0, 0.0, 1.0),
-                    frequency=LIDAR_UPDATE_HZ,
-                    # Every optic is per-mount, not global: the front unit
-                    # reaches much further on a narrow, dense sweep, and the
-                    # roof unit trades vertical aperture for ground-ring
-                    # spacing. See SensorMount.
-                    vertical_resolution=mount.vertical_resolution,
-                    vertical_angle=mount.vertical_fov_deg,
-                    horizontal_angle=mount.horizontal_fov_deg,
-                    max_distance=mount.max_distance_m,
-                    density=mount.density,
-                    is_rotate_mode=False,
-                    is_360_mode=False,
-                    is_using_shared_memory=True,
-                    is_visualised=False,
-                    # BeamNG writes each latest 30 Hz scan directly into shared
-                    # memory so the display loop never waits on four requests.
-                    is_streaming=True,
-                    # The road-scan unit runs unannotated while the visual-
-                    # paint experiment is on: its colour channel then carries
-                    # whatever the engine renders instead of class colours,
-                    # and the one-shot `Colour check:` line reports what that
-                    # actually is. See LIDAR_ROAD_VISUAL_COLOUR.
-                    is_annotated=not (
-                        LIDAR_ROAD_VISUAL_COLOUR and mount.name == "road"
-                    ),
-                    is_static=False,
-                    is_snapping_desired=False,
-                    is_force_inside_triangle=False,
-                    is_dir_world_space=False,
+                    **self.lidar_sensor_kwargs(mount),
                 )
                 self._sensor_names.append(mount.name)
                 self._sensors.append(sensor)
@@ -755,7 +751,7 @@ class BeamNgWorker(QObject):
             self._last_speed = 0.0
             self._last_forward_speed = 0.0
         except Exception as exc:
-            LOGGER.exception("Could not attach LiDAR sensors")
+            LOGGER.exception("Could not attach sensors")
             self._cleanup_sensors()
             self.status_changed.emit("READY", f"Sensor attach failed: {exc}")
             self.fatal_error.emit(
@@ -764,12 +760,15 @@ class BeamNgWorker(QObject):
             )
             return
 
+        vision = self._sensor_mode == SENSOR_MODE_VISION
         self.status_changed.emit(
-            "STREAMING", f"{mount_count} LiDAR sensors active on {player_vid}"
+            "STREAMING",
+            f"{mount_count} {'cameras' if vision else 'LiDAR sensors'} active "
+            f"on {player_vid}",
         )
         # Before sensors_ready, so the GUI knows which instrument set it is
         # enabling controls for when that signal lands.
-        self.sensor_mode_changed.emit(SENSOR_MODE_LIDAR)
+        self.sensor_mode_changed.emit(self._sensor_mode)
         self.sensors_ready.emit(player_vid, geometry)
         self._poll_timer.start()
         # Both emergency brakes arm themselves. They are protective rather than
@@ -777,6 +776,12 @@ class BeamNgWorker(QObject):
         # collision is otherwise unavoidable -- so defaulting them off would
         # mean the safety net is missing exactly when nobody thought about it.
         # Self-driving stays opt-in, because that one changes what the car does.
+        #
+        # In Vision mode the same two calls run and `_set_aeb` refuses them
+        # until VISION_DRIVING_ENABLED: the camera lattice is a new sampling
+        # distribution and the phantom-braking checklist has not been re-run
+        # on it. One arming path, one refusal, rather than a second branch
+        # here that could drift from the slot's own rule.
         self._set_aeb(True, rearward=False)
         self._set_aeb(True, rearward=True)
 
@@ -808,9 +813,10 @@ class BeamNgWorker(QObject):
         if not enabled:
             self._disengage_self_driving("Self-driving disengaged")
             return
-        if self._sensor_mode == SENSOR_MODE_VISION:
-            # Both control systems reason over the LiDAR point cloud, which
-            # Vision mode does not produce yet (rung 0 streams images only).
+        if self._vision_refuses_driving():
+            # The camera cloud exists now (rung 0.5), but the planner's band
+            # was fitted to LiDAR sampling and has not been re-proved on it
+            # live. VISION_DRIVING_ENABLED is the gate.
             self.self_driving_changed.emit(False)
             self.status_changed.emit(
                 "STREAMING" if self._sensors else "READY",
@@ -918,9 +924,11 @@ class BeamNgWorker(QObject):
         drops the accumulated paint as well as the bays, so re-arming starts
         from what the sensors can see now rather than from a stale lot.
         """
-        if enabled and self._sensor_mode == SENSOR_MODE_VISION:
-            # The bay scan reads the SEMANTIC marking store, which only the
-            # LiDAR set fills; the camera rig produces no returns to classify.
+        if enabled and self._vision_refuses_driving():
+            # The bay scan reads the SEMANTIC marking store. The camera rig
+            # fills it now (the annotation channel labels decals exactly as
+            # the LiDAR's does), but the parking manoeuvre drives on the
+            # planner's band, which is behind the same live gate.
             self.parking_changed.emit(False)
             self.status_changed.emit(
                 "STREAMING" if self._sensors else "READY",
@@ -976,7 +984,7 @@ class BeamNgWorker(QObject):
             if was:
                 self.parking_drive_changed.emit(False)
             return
-        if self._sensor_mode == SENSOR_MODE_VISION:
+        if self._vision_refuses_driving():
             # Reached only if a bay somehow survived the mode switch; the scan
             # itself is already refused above. Say which system is missing
             # rather than "select a bay", which would be unactionable here.
@@ -1106,7 +1114,7 @@ class BeamNgWorker(QObject):
         if not enabled:
             self._disengage_aeb(f"{label} disabled", rearward=rearward)
             return
-        if self._sensor_mode == SENSOR_MODE_VISION:
+        if self._vision_refuses_driving():
             changed.emit(False)
             self.status_changed.emit(
                 "STREAMING" if self._sensors else "READY",
@@ -1154,10 +1162,21 @@ class BeamNgWorker(QObject):
         changed.emit(True)
         self.status_changed.emit("STREAMING", f"{label} armed")
 
-    @staticmethod
-    def _porosity_sensor_height(geometry: VehicleGeometry) -> float:
+    def _vision_refuses_driving(self) -> bool:
         """
-        The eye height AEB's porosity test reasons from: the ROOF unit.
+        Whether the control systems are refused because the cloud is the
+        camera rig's. One rule for all four slots (self-driving, both AEBs,
+        parking) so they cannot drift: Vision mode AND the live gate still
+        closed. See VISION_DRIVING_ENABLED.
+        """
+        return (
+            self._sensor_mode == SENSOR_MODE_VISION and not VISION_DRIVING_ENABLED
+        )
+
+    def _porosity_sensor_height(self, geometry: VehicleGeometry) -> float:
+        """
+        The eye height AEB's porosity test reasons from: the ROOF unit, or in
+        Vision mode the tallest camera (the windshield pair).
 
         It has to be the roof unit and not one of the 0.20 m mounts, because
         those sit BELOW anything worth testing -- a 0.6 m bush hides the ground
@@ -1169,6 +1188,8 @@ class BeamNgWorker(QObject):
         the conservative direction, since the test can only ever remove
         obstacles.
         """
+        if self._sensor_mode == SENSOR_MODE_VISION:
+            return float(self._vision_eye_height_m)
         roof = geometry.mounts.get("roof")
         return float(roof.position_vehicle[2]) if roof is not None else 0.0
 
@@ -1347,9 +1368,18 @@ class BeamNgWorker(QObject):
 
     @pyqtSlot()
     def _poll_once(self) -> None:
-        if self._sensor_mode == SENSOR_MODE_VISION:
-            self._poll_vision_once()
-            return
+        """
+        One display tick, for EITHER instrument set.
+
+        The two sets differ only in acquisition -- the LiDAR units stream a
+        cloud, the cameras stream depth and annotation images that
+        `unprojection` turns into one -- and everything from the concatenated
+        `points_world + colours` on is shared: the BEV split, the semantic
+        pass, both bands, the plan, AEB, the frame and the snapshot. That is
+        the perception waist the vision ladder is built to refill, and
+        keeping it one code path is what makes "the car drives in Vision
+        mode" the same car, not a second implementation of it.
+        """
         if (
             self._bng is None
             or self._vehicle is None
@@ -1359,6 +1389,7 @@ class BeamNgWorker(QObject):
         ):
             return
 
+        vision = self._sensor_mode == SENSOR_MODE_VISION
         started = time.perf_counter()
         geometry = self._geometry
         road_points = _EMPTY_BEV
@@ -1389,48 +1420,14 @@ class BeamNgWorker(QObject):
                 np.degrees(np.arcsin(np.clip(forward_axis[2], -1.0, 1.0)))
             )
             self._watch_manual_braking(started)
-            point_chunks: list[np.ndarray] = []
-            colour_chunks: list[np.ndarray] = []
-
-            reach: list[tuple[str, int, float]] = []
-            for index, sensor in enumerate(self._sensors):
-                reading = sensor.stream()
-                points = self._coerce_points(reading.get("pointCloud"))
-                if not self._logged_reach and len(points):
-                    reach.append(
-                        self._sensor_reach(index, points, vec3(state["pos"]))
-                    )
-                if not len(points):
-                    continue
-                colours = self._coerce_colours(reading.get("colours"), len(points))
-                # The names list is parallel to _sensors from attach; offline
-                # stubs may arm sensors without it, and they have no road unit.
-                if index < len(self._sensor_names):
-                    self._watch_visual_colours(
-                        self._sensor_names[index], colours, points
-                    )
-                finite = np.isfinite(points).all(axis=1)
-                if not finite.all():
-                    points = points[finite]
-                    colours = colours[finite]
-                if not len(points):
-                    continue
-                point_chunks.append(points)
-                colour_chunks.append(colours)
-
-            if reach and not self._logged_reach:
-                self._logged_reach = True
-                # The one number the long-range front unit has to be judged on,
-                # and the offline suite cannot reach it: whether narrowing the
-                # sweep bought the azimuth density that reaching 150 m needs.
-                LOGGER.info(
-                    "Sensor reach: %s | AEB acts out to %.0f m",
-                    " | ".join(
-                        f"{name} {count} returns, furthest {far:.0f} m"
-                        for name, count, far in reach
-                    ),
-                    AEB_MAX_HORIZON_M,
+            vision_images: list[CameraImage] = []
+            if vision:
+                point_chunks, colour_chunks, vision_images, fresh = (
+                    self._acquire_vision_cloud(state, started)
                 )
+            else:
+                point_chunks, colour_chunks = self._acquire_lidar_cloud(state)
+                fresh = bool(point_chunks)
 
             if point_chunks:
                 had_returns = True
@@ -1444,15 +1441,8 @@ class BeamNgWorker(QObject):
                 colours = colours[in_range]
                 points_world = points_world[in_range]
 
-                ego_margin = 0.18
-                inside_ego = (
-                    (bev[:, 0] >= -geometry.left_m - ego_margin)
-                    & (bev[:, 0] <= geometry.right_m + ego_margin)
-                    & (bev[:, 1] >= -geometry.rear_m - ego_margin)
-                    & (bev[:, 1] <= geometry.front_m + ego_margin)
-                )
-                if inside_ego.any():
-                    keep = ~inside_ego
+                keep = outside_ego_body(bev, geometry)
+                if not keep.all():
                     bev = bev[keep]
                     heights = heights[keep]
                     colours = colours[keep]
@@ -1500,7 +1490,11 @@ class BeamNgWorker(QObject):
             )
             if stale:
                 self._frame_times.clear()
-            if had_returns:
+            # `fresh` rather than `had_returns`: the camera buffers persist
+            # between simulator frames, so a vision tick always has returns
+            # and only a tick that read a genuinely NEW frame counts toward
+            # ACQUISITION -- the same honesty rule the LiDAR metric follows.
+            if fresh:
                 self._frame_times.append(finished)
 
             plan: DrivingPlan | None = None
@@ -1828,6 +1822,18 @@ class BeamNgWorker(QObject):
             self._poll_failures = 0
             self._first_failure_at = None
             self.frame_ready.emit(frame)
+            if vision:
+                # The camera grid keeps its own frame beside the BEV one: the
+                # images are what the CAMERAS view draws, and the metrics it
+                # used to carry now ride on the BevFrame like everything else.
+                self.vision_frame_ready.emit(
+                    VisionFrame(
+                        images=tuple(vision_images),
+                        acquisition_fps=frame.acquisition_fps,
+                        poll_ms=frame.poll_ms,
+                        speed_mps=frame.speed_mps,
+                    )
+                )
 
             # Actuate only after the frame is out. Vehicle.control() is a
             # blocking ack, and the display must not wait on it.
@@ -1875,7 +1881,181 @@ class BeamNgWorker(QObject):
             # touch a socket again until the next tick joins this future.
             self._prefetch_vehicle_state()
         except Exception as exc:
-            self._note_poll_failure(exc, "LiDAR")
+            self._note_poll_failure(exc, "Camera" if vision else "LiDAR")
+
+    def _acquire_lidar_cloud(
+        self, state: dict[str, Any]
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """Stream every LiDAR unit: parallel lists of world points and colours."""
+        point_chunks: list[np.ndarray] = []
+        colour_chunks: list[np.ndarray] = []
+
+        reach: list[tuple[str, int, float]] = []
+        for index, sensor in enumerate(self._sensors):
+            reading = sensor.stream()
+            points = self._coerce_points(reading.get("pointCloud"))
+            if not self._logged_reach and len(points):
+                reach.append(
+                    self._sensor_reach(index, points, vec3(state["pos"]))
+                )
+            if not len(points):
+                continue
+            colours = self._coerce_colours(reading.get("colours"), len(points))
+            # The names list is parallel to _sensors from attach; offline
+            # stubs may arm sensors without it, and they have no road unit.
+            if index < len(self._sensor_names):
+                self._watch_visual_colours(
+                    self._sensor_names[index], colours, points
+                )
+            finite = np.isfinite(points).all(axis=1)
+            if not finite.all():
+                points = points[finite]
+                colours = colours[finite]
+            if not len(points):
+                continue
+            point_chunks.append(points)
+            colour_chunks.append(colours)
+
+        if reach and not self._logged_reach:
+            self._logged_reach = True
+            # The one number the long-range front unit has to be judged on,
+            # and the offline suite cannot reach it: whether narrowing the
+            # sweep bought the azimuth density that reaching 150 m needs.
+            LOGGER.info(
+                "Sensor reach: %s | AEB acts out to %.0f m",
+                " | ".join(
+                    f"{name} {count} returns, furthest {far:.0f} m"
+                    for name, count, far in reach
+                ),
+                AEB_MAX_HORIZON_M,
+            )
+        return point_chunks, colour_chunks
+
+    def _acquire_vision_cloud(
+        self, state: dict[str, Any], now: float
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[CameraImage], bool]:
+        """
+        Stream every camera: the unprojected cloud, the colour images for the
+        grid, and whether any camera delivered a genuinely new frame.
+
+        Three channels, three different treatments. COLOUR is copied whole,
+        once, because the grid paints all of it and stream_raw hands back a
+        view of the live buffer the simulator keeps writing into. DEPTH and
+        ANNOTATION are never copied: the ray table's lattice is gathered
+        straight from the live view, one vectorised read per channel, which
+        is ~1/24th of the bytes at the default strides. A torn depth read --
+        the simulator landing a frame mid-gather -- mixes two frames a
+        sixtieth of a second apart along one row boundary, which the
+        accumulation stores absorb; copying 2.7 MB per camera per tick to
+        prevent it would not fit the tick.
+
+        Each frame's AGE is measured from when its depth lattice last changed
+        (the digest), so the cloud is placed from the pose the car had then
+        rather than now -- see CAMERA_FRAME_STAGING_S for the part that
+        cannot be measured from here.
+        """
+        assert self._geometry is not None
+        geometry = self._geometry
+        point_chunks: list[np.ndarray] = []
+        colour_chunks: list[np.ndarray] = []
+        images: list[CameraImage] = []
+        any_fresh = False
+        reach: list[tuple[str, int, float, float]] = []
+        origin = vec3(state["pos"])
+
+        for index, camera in enumerate(self._sensors):
+            name = (
+                self._sensor_names[index]
+                if index < len(self._sensor_names)
+                else str(index)
+            )
+            raw = camera.stream_raw()
+            width, height = camera.resolution
+
+            colour = raw.get("colour")
+            if colour is not None and len(colour) == width * height * 4:
+                # Copied exactly once, here, before anything reads it twice.
+                pixels = np.frombuffer(colour, dtype=np.uint8).copy()
+                images.append(
+                    CameraImage(
+                        name=name, rgba=pixels.reshape((height, width, 4))
+                    )
+                )
+
+            rays = self._camera_rays.get(name)
+            if rays is None:
+                # A camera with no ray table is a display-only camera (or an
+                # offline stub); its colour still reaches the grid above.
+                continue
+            depth_raw = raw.get("depth")
+            if depth_raw is None or len(depth_raw) != width * height * 4:
+                continue
+            # Fresh-frame detection on the depth lattice itself: a strided
+            # gather the unprojection needs anyway, so the digest is free.
+            depth_digest = bytes(
+                np.frombuffer(depth_raw, dtype=np.float32)[
+                    rays.pixel_index[::_VISION_DIGEST_STRIDE]
+                ]
+            )
+            if depth_digest != self._camera_digests.get(name):
+                self._camera_digests[name] = depth_digest
+                self._camera_frame_seen[name] = now
+                any_fresh = True
+            seen = self._camera_frame_seen.get(name)
+            age = (
+                CAMERA_FRAME_STAGING_S
+                if seen is None
+                else CAMERA_FRAME_STAGING_S + max(0.0, now - seen)
+            )
+
+            result = unproject_frame(
+                rays,
+                depth_raw,
+                raw.get("annotation"),
+                pose_from_state(state, age, self._yaw_rate_rps),
+                geometry,
+                UNKNOWN_SEMANTIC_RGB,
+            )
+            if result is None:
+                continue
+            points, colours, sampled = result
+            if not self._logged_unprojection:
+                reach.append(
+                    (name, sampled, self._furthest_m(points, origin), age)
+                )
+            if not len(points):
+                continue
+            point_chunks.append(points)
+            colour_chunks.append(colours)
+
+        self._watch_vision_liveness(now, any_fresh, images)
+        if reach and any_fresh and not self._logged_unprojection:
+            self._logged_unprojection = True
+            # The `Sensor reach:` equivalent: per-camera counts and reach are
+            # what decide the strides, and the frame age is the one number
+            # the ego-motion milestone has to be judged against.
+            LOGGER.info(
+                "Unprojection check: %s | total %d points | mean frame age "
+                "%.0f ms (staging %.0f ms assumed) | eye height %.2f m",
+                " | ".join(
+                    f"{name} {count} returns, furthest {far:.0f} m"
+                    for name, count, far, _ in reach
+                ),
+                sum(count for _, count, _, _ in reach),
+                1000.0 * float(np.mean([age for *_, age in reach])),
+                1000.0 * CAMERA_FRAME_STAGING_S,
+                self._vision_eye_height_m,
+            )
+        return point_chunks, colour_chunks, images, any_fresh
+
+    @staticmethod
+    def _furthest_m(points: np.ndarray, origin: np.ndarray) -> float:
+        if not len(points):
+            return 0.0
+        offsets = points[:, :2] - origin[:2].astype(np.float32)
+        ranges = np.hypot(offsets[:, 0], offsets[:, 1])
+        finite = ranges[np.isfinite(ranges)]
+        return float(finite.max()) if len(finite) else 0.0
 
     def _note_poll_failure(self, exc: Exception, what: str) -> None:
         """
@@ -1914,21 +2094,105 @@ class BeamNgWorker(QObject):
                 f"{what} streaming stopped after repeated connection errors: {exc}"
             )
 
+    @staticmethod
+    def lidar_sensor_kwargs(mount: SensorMount) -> dict[str, Any]:
+        """
+        The `Lidar` constructor arguments for one mount, after name, bng and
+        vehicle. Public and pure so tools/unprojection_oracle.py builds the
+        SAME unit the app does -- an oracle that differed from the app in any
+        constructor argument would be measuring the difference.
+        """
+        return dict(
+            requested_update_time=LIDAR_UPDATE_TIME_S,
+            update_priority=0.0,
+            pos=mount.position_vehicle,
+            dir=mount.direction_vehicle,
+            up=(0.0, 0.0, 1.0),
+            frequency=LIDAR_UPDATE_HZ,
+            # Every optic is per-mount, not global: the front unit reaches
+            # much further on a narrow, dense sweep, and the roof unit trades
+            # vertical aperture for ground-ring spacing. See SensorMount.
+            vertical_resolution=mount.vertical_resolution,
+            vertical_angle=mount.vertical_fov_deg,
+            horizontal_angle=mount.horizontal_fov_deg,
+            max_distance=mount.max_distance_m,
+            density=mount.density,
+            is_rotate_mode=False,
+            is_360_mode=False,
+            is_using_shared_memory=True,
+            is_visualised=False,
+            # BeamNG writes each latest 30 Hz scan directly into shared memory
+            # so the display loop never waits on four requests.
+            is_streaming=True,
+            # The road-scan unit runs unannotated while the visual-paint
+            # experiment is on: its colour channel then carries whatever the
+            # engine renders instead of class colours, and the one-shot
+            # `Colour check:` line reports what that actually is. See
+            # LIDAR_ROAD_VISUAL_COLOUR.
+            is_annotated=not (LIDAR_ROAD_VISUAL_COLOUR and mount.name == "road"),
+            is_static=False,
+            is_snapping_desired=False,
+            is_force_inside_triangle=False,
+            is_dir_world_space=False,
+        )
+
+    @staticmethod
+    def camera_sensor_kwargs(mount: CameraMount) -> dict[str, Any]:
+        """
+        The `Camera` constructor arguments for one mount, after name, bng and
+        vehicle -- the rung-0.5 rig: colour for the grid, depth and
+        annotation for the unprojection. Public and pure for the same reason
+        `lidar_sensor_kwargs` is.
+
+        `integer_depth=False` and `postprocess_depth=False` are both TRAPS the
+        spec names: the default quantises depth to 0-255 silently, and the
+        postprocess is a 256-iteration Python loop per frame.
+        """
+        return dict(
+            requested_update_time=CAMERA_UPDATE_TIME_S,
+            update_priority=0.0,
+            pos=mount.position_vehicle,
+            dir=mount.direction_vehicle,
+            up=(0.0, 0.0, 1.0),
+            resolution=mount.resolution,
+            field_of_view_y=mount.vertical_fov_deg,
+            near_far_planes=CAMERA_NEAR_FAR_PLANES,
+            is_using_shared_memory=True,
+            is_render_colours=True,
+            is_render_annotations=True,
+            is_render_instance=False,
+            is_render_depth=True,
+            integer_depth=False,
+            postprocess_depth=False,
+            is_visualised=False,
+            is_streaming=True,
+            is_static=False,
+            is_snapping_desired=False,
+            is_force_inside_triangle=False,
+            is_dir_world_space=False,
+        )
+
     def _attach_camera_rig(
         self, vehicle: Vehicle, geometry: VehicleGeometry, sensor_prefix: str
     ) -> int:
         """
         Build the eight-camera Vision rig on the connected vehicle.
 
-        Colour channel only at this rung: annotation is a second full geometry
-        pass (measured 42 -> 33 Hz sim rate) and depth doubles the copied
-        bytes, and nothing consumes either yet. Streaming shared memory is the
+        All three channels from rung 0.5 on: depth and annotation are what the
+        unprojection consumes, colour is what the grid draws. Annotation is a
+        second full geometry pass (measured 42 -> 33 Hz sim rate for eight
+        cameras) and depth doubles the bytes the simulator writes -- both are
+        paid for now because both are read. Streaming shared memory is the
         only viable transport -- the poll path was measured at 204 ms per
         8-camera frame, ~150x slower.
         """
         from beamngpy.sensors import Camera
 
         rig = derive_camera_rig(geometry)
+        self._camera_rays = build_rig_rays(rig)
+        self._vision_eye_height_m = max(
+            float(mount.position_vehicle[2]) for mount in rig.values()
+        )
         for index, mount in enumerate(rig.values()):
             self.status_changed.emit(
                 "ATTACHING",
@@ -1938,37 +2202,22 @@ class BeamNgWorker(QObject):
                 f"{sensor_prefix}_{mount.name}",
                 self._bng,
                 vehicle,
-                requested_update_time=CAMERA_UPDATE_TIME_S,
-                update_priority=0.0,
-                pos=mount.position_vehicle,
-                dir=mount.direction_vehicle,
-                up=(0.0, 0.0, 1.0),
-                resolution=mount.resolution,
-                field_of_view_y=mount.vertical_fov_deg,
-                near_far_planes=CAMERA_NEAR_FAR_PLANES,
-                is_using_shared_memory=True,
-                is_render_colours=True,
-                is_render_annotations=False,
-                is_render_instance=False,
-                is_render_depth=False,
-                is_visualised=False,
-                is_streaming=True,
-                is_static=False,
-                is_snapping_desired=False,
-                is_force_inside_triangle=False,
-                is_dir_world_space=False,
+                **self.camera_sensor_kwargs(mount),
             )
             self._sensor_names.append(mount.name)
             self._sensors.append(sensor)
         LOGGER.info(
-            "Vision rig: %d cameras at %dx%d, update %.0f ms, colour only | %s",
+            "Vision rig: %d cameras at %dx%d, update %.0f ms, colour + depth + "
+            "annotation, %d lattice samples | %s",
             len(rig),
             rig[next(iter(rig))].resolution[0],
             rig[next(iter(rig))].resolution[1],
             CAMERA_UPDATE_TIME_S * 1000.0,
+            sum(rays.sample_count for rays in self._camera_rays.values()),
             ", ".join(
                 f"{m.name} hfov {m.horizontal_fov_deg:.0f} z "
-                f"{m.position_vehicle[2]:.2f}"
+                f"{m.position_vehicle[2]:.2f} stride "
+                f"{m.sample_stride[0]}x{m.sample_stride[1]}"
                 for m in rig.values()
             ),
         )
@@ -1982,7 +2231,8 @@ class BeamNgWorker(QObject):
         "texture = settings.getValue('GraphicTextureQuality'),"
         "lighting = settings.getValue('GraphicLightingQuality'),"
         "aa = settings.getValue('GraphicAntialias'),"
-        "motion_blur = settings.getValue('PostFXMotionBlurEnabled')"
+        "motion_blur = settings.getValue('PostFXMotionBlurEnabled'),"
+        "focused = Engine.isProgramFocused and Engine.isProgramFocused() or false"
         "} end) "
         "if ok then return jsonEncode(res) else return jsonEncode({}) end"
     )
@@ -2017,94 +2267,17 @@ class BeamNgWorker(QObject):
 
         LOGGER.info(
             "Capture check: quality overall=%s shader=%s texture=%s lighting=%s"
-            " | antialias=%s | motion blur=%s",
+            " | antialias=%s | motion blur=%s | window focused=%s",
             values.get("overall", "?"),
             values.get("shader", "?"),
             values.get("texture", "?"),
             values.get("lighting", "?"),
             values.get("aa", "?"),
             values.get("motion_blur", "?"),
+            values.get("focused", "?"),
         )
         for warning in capture_setting_warnings(values):
             LOGGER.warning("Capture check: %s", warning)
-
-    def _poll_vision_once(self) -> None:
-        """
-        The Vision-mode display tick: stream every camera, emit one frame.
-
-        Mirrors `_poll_once`'s honesty rules rather than its body: a frame is
-        emitted on every tick (an all-black grid with live metrics, never a
-        frozen one), the acquisition rate counts genuinely new frames only,
-        and failures run against the same time-based budget.
-        """
-        if (
-            self._bng is None
-            or self._vehicle is None
-            or self._geometry is None
-            or not self._sensor_set_is_complete()
-        ):
-            return
-        started = time.perf_counter()
-        try:
-            state = self._take_vehicle_state()
-            velocity = vec3(state.get("vel", (0.0, 0.0, 0.0)))
-            self._last_speed = float(np.linalg.norm(velocity))
-            forward_axis = vehicle_axes(state)[1]
-            self._last_forward_speed = float(velocity @ forward_axis)
-
-            images: list[CameraImage] = []
-            any_fresh = False
-            for index, camera in enumerate(self._sensors):
-                name = (
-                    self._sensor_names[index]
-                    if index < len(self._sensor_names)
-                    else str(index)
-                )
-                raw = camera.stream_raw().get("colour")
-                if raw is None or len(raw) == 0:
-                    continue
-                # stream_raw hands back a memoryview of the LIVE shared
-                # buffer -- the simulator is still writing into it -- so it is
-                # copied exactly once, here, before anything reads it twice.
-                pixels = np.frombuffer(raw, dtype=np.uint8).copy()
-                width, height = camera.resolution
-                if pixels.size != width * height * 4:
-                    continue
-                digest = pixels[::_VISION_DIGEST_STRIDE].tobytes()
-                if digest != self._camera_digests.get(name):
-                    self._camera_digests[name] = digest
-                    any_fresh = True
-                images.append(
-                    CameraImage(
-                        name=name, rgba=pixels.reshape((height, width, 4))
-                    )
-                )
-
-            finished = time.perf_counter()
-            stale = (
-                self._frame_times
-                and finished - self._frame_times[-1] > _ACQUISITION_STALE_S
-            )
-            if stale:
-                self._frame_times.clear()
-            if any_fresh:
-                self._frame_times.append(finished)
-            self._watch_vision_liveness(finished, any_fresh, images)
-
-            frame = VisionFrame(
-                images=tuple(images),
-                acquisition_fps=self._calculate_fps(),
-                poll_ms=(finished - started) * 1000.0,
-                speed_mps=self._last_speed,
-            )
-            self._poll_failures = 0
-            self._first_failure_at = None
-            self.vision_frame_ready.emit(frame)
-            # Same contract as the LiDAR tick: last statement, after the last
-            # socket use, so the prefetch thread never overlaps one.
-            self._prefetch_vehicle_state()
-        except Exception as exc:
-            self._note_poll_failure(exc, "Camera")
 
     def _watch_vision_liveness(
         self, now: float, any_fresh: bool, images: list[CameraImage]
@@ -2127,7 +2300,7 @@ class BeamNgWorker(QObject):
             )
             LOGGER.info(
                 "Vision check: first fresh frames %.1f s after attach | "
-                "%d cameras delivering | colour only at this rung",
+                "%d cameras delivering | colour + depth + annotation",
                 since,
                 len(images),
             )
@@ -3257,28 +3430,79 @@ class BeamNgWorker(QObject):
         The prefetched state finished its round-trip up to a tick ago, so the
         position is advanced by `vel * age` -- a linear correction that restores
         the pose-to-cloud alignment a synchronous poll had, leaving only the
-        acceleration term (about a centimetre at full braking). The heading is
-        left alone: over these ages it moves under a degree even at full lock.
+        acceleration term (about a centimetre at full braking). The HEADING is
+        advanced too, by the yaw rate measured between successive states
+        (2026-08-23): it used to be left alone on the reasoning that it moves
+        under a degree over a 40 ms tick, which is true -- but a tick that
+        stretches to 100-250 ms turns that into 3-8 degrees at an ordinary
+        30 deg/s, and every cloud stamped into WORLD's world-anchored stores
+        during a turn was rotated by that much about the car. RAW BEV cannot
+        show the error (the same state transforms the cloud both ways and it
+        cancels), which is exactly why it was only ever reported from WORLD:
+        "the whole world turns with me, then corrects after a few seconds of
+        driving" -- the seconds being the road store's memory by the metre.
         """
         future, self._state_future = self._state_future, None
         if future is None:
-            return self._get_vehicle_state()
+            state = self._get_vehicle_state()
+            self._observe_state_yaw(state, time.perf_counter())
+            return state
         try:
             state, done_at = future.result()
         except Exception:
             LOGGER.debug("Prefetched state poll failed; re-polling", exc_info=True)
-            return self._get_vehicle_state()
+            state = self._get_vehicle_state()
+            self._observe_state_yaw(state, time.perf_counter())
+            return state
         age = time.perf_counter() - done_at
         if age > _STATE_PREFETCH_MAX_AGE_S:
             # From before an app stall; extrapolating across it would be worse
             # than the round-trip it saves.
-            return self._get_vehicle_state()
+            state = self._get_vehicle_state()
+            self._observe_state_yaw(state, time.perf_counter())
+            return state
+        self._observe_state_yaw(state, done_at)
         if age > 0.0 and "pos" in state:
             position = vec3(state["pos"]) + vec3(
                 state.get("vel", (0.0, 0.0, 0.0))
             ) * age
             state["pos"] = tuple(float(value) for value in position)
+            if "dir" in state and self._yaw_rate_rps != 0.0:
+                state["dir"] = tuple(
+                    float(value)
+                    for value in rotate_about_up(
+                        vec3(state["dir"]), self._yaw_rate_rps * age
+                    )
+                )
         return state
+
+    def _observe_state_yaw(self, state: dict[str, Any], at: float) -> None:
+        """
+        Update the yaw-rate estimate from the heading of a freshly polled
+        state and the time its round trip finished.
+
+        A plain difference of successive headings over their interval,
+        lightly low-passed: the state is polled every tick, so the estimate
+        is 25 Hz and the filter only takes the edge off the quantisation. It
+        is what `_take_vehicle_state` advances the prefetched heading with and
+        what the vision acquisition rewinds each camera frame with.
+        """
+        direction = state.get("dir")
+        if direction is None:
+            return
+        forward = vec3(direction)
+        heading = float(np.arctan2(forward[1], forward[0]))
+        previous = self._yaw_observation
+        self._yaw_observation = (heading, at)
+        if previous is None:
+            return
+        dt = at - previous[1]
+        if dt <= 1e-3 or dt > 1.0:
+            return
+        delta = (heading - previous[0] + np.pi) % (2.0 * np.pi) - np.pi
+        rate = float(delta / dt)
+        blend = min(1.0, dt / _YAW_RATE_TAU_S)
+        self._yaw_rate_rps += blend * (rate - self._yaw_rate_rps)
 
     def _prefetch_vehicle_state(self) -> None:
         """
@@ -3413,9 +3637,23 @@ class BeamNgWorker(QObject):
         elapsed = self._frame_times[-1] - self._frame_times[0]
         return (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0.0
 
+    def _actor_enrichment_refused(self, now: float) -> bool:
+        """
+        Whether the simulator recently refused actor enrichment.
+
+        Both halves of it -- the 1 Hz registry (`get_current_info`, measured
+        120 ms) and the 10 Hz state poll (`get_states`, 39 ms even when
+        rejected) -- are blocking round trips on the worker thread, and
+        BeamNG.tech rejects the state poll outright in free-roam. Retrying a
+        known refusal ten times a second cost the tick ~0.5 s of every
+        second; one refusal now rests both for WORLD_ACTOR_RETRY_S.
+        """
+        return now - self._actor_refused_at < WORLD_ACTOR_RETRY_S
+
     def _refresh_actor_registry(self, now: float) -> None:
         if (
             self._bng is None
+            or self._actor_enrichment_refused(now)
             or now - self._last_actor_registry_at
             < WORLD_ACTOR_REGISTRY_INTERVAL_S
         ):
@@ -3439,8 +3677,11 @@ class BeamNgWorker(QObject):
             return ()
         self._refresh_actor_registry(now)
         if (
-            now - self._last_actor_state_at < WORLD_ACTOR_STATE_INTERVAL_S
+            self._actor_enrichment_refused(now)
+            or now - self._last_actor_state_at < WORLD_ACTOR_STATE_INTERVAL_S
         ):
+            if now - self._last_actor_success_at > WORLD_ACTOR_FADE_S:
+                self._actor_observations = ()
             return self._actor_observations
         self._last_actor_state_at = now
         if not self._actor_registry:
@@ -3477,8 +3718,22 @@ class BeamNgWorker(QObject):
                 )
             self._actor_observations = tuple(observations)
             self._last_actor_success_at = now
-        except Exception:
-            LOGGER.warning("Actor pose enrichment unavailable", exc_info=True)
+        except Exception as exc:
+            self._actor_refused_at = now
+            if not self._logged_actor_refusal:
+                # Once per attach, and without the traceback: in free-roam
+                # this is the expected answer, and ten tracebacks a second
+                # buried every other line in the log.
+                self._logged_actor_refusal = True
+                LOGGER.warning(
+                    "Actor pose enrichment unavailable (%s); retrying every "
+                    "%.0f s. Expected in free-roam -- traffic is drawn from "
+                    "the cloud alone.",
+                    str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                    WORLD_ACTOR_RETRY_S,
+                )
+            else:
+                LOGGER.debug("Actor pose enrichment still unavailable")
             if now - self._last_actor_success_at > WORLD_ACTOR_FADE_S:
                 self._actor_observations = ()
         return self._actor_observations
@@ -3508,6 +3763,10 @@ class BeamNgWorker(QObject):
         self._last_actor_registry_at = -float("inf")
         self._last_actor_state_at = -float("inf")
         self._last_actor_success_at = -float("inf")
+        self._actor_refused_at = -float("inf")
+        self._logged_actor_refusal = False
+        self._yaw_observation = None
+        self._yaw_rate_rps = 0.0
 
     def _cleanup_sensors(self) -> None:
         # The single funnel every teardown path goes through -- stop_sensors,
@@ -3530,9 +3789,13 @@ class BeamNgWorker(QObject):
         self._sensors.clear()
         self._sensor_names.clear()
         self._camera_digests = {}
+        self._camera_frame_seen = {}
+        self._camera_rays = {}
+        self._vision_eye_height_m = 0.0
         self._vision_streaming_since = None
         self._logged_vision_check = False
         self._logged_vision_silence = False
+        self._logged_unprojection = False
         self._geometry = None
         self._mirrored_geometry = None
         self._memory.clear()

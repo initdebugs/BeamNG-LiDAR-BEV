@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from beamng_lidar_bev.scene_worker import SceneWorker
 
 
@@ -113,3 +115,29 @@ def test_a_slow_refresh_never_blocks_the_composes_behind_it() -> None:
 
     release.set()
     worker.shutdown()
+
+
+def test_an_overrunning_refresh_stretches_its_own_cadence() -> None:
+    """
+    The refresh pool shares the process with the worker tick and the compose
+    thread; a build slower than the cadence used to run back-to-back and tax
+    both through the GIL. The interval must stretch to last build / duty.
+    """
+    from beamng_lidar_bev.config import (
+        WORLD_STORE_REFRESH_DUTY,
+        WORLD_STORE_REFRESH_INTERVAL_S,
+    )
+
+    worker = SceneWorker.__new__(SceneWorker)
+    worker._last_build_ms = 300.0
+    interval = max(
+        WORLD_STORE_REFRESH_INTERVAL_S,
+        worker._last_build_ms / 1000.0 / WORLD_STORE_REFRESH_DUTY,
+    )
+    assert interval == pytest.approx(0.5)
+    worker._last_build_ms = 30.0
+    interval = max(
+        WORLD_STORE_REFRESH_INTERVAL_S,
+        worker._last_build_ms / 1000.0 / WORLD_STORE_REFRESH_DUTY,
+    )
+    assert interval == pytest.approx(WORLD_STORE_REFRESH_INTERVAL_S)

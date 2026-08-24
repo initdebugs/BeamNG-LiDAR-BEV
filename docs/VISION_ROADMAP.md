@@ -21,7 +21,7 @@ simulator does with it.
 | 0 | Foundations: beamngpy 1.36, 0.39, Vision mode rung 0 | — | Can cameras stream at all? | **DONE 2026-08-22** |
 | 0v | Rung-0 live verification | ~30 min | Do the mounts and rates hold on the real car? | **DONE 2026-08-23** |
 | 1 | The kerb experiment | 1 afternoon | Is stereo good enough for the planner's kerb requirement? | **DONE 2026-08-23 — FAILED, see below** |
-| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | **NEXT** |
+| 2 | Rung 0.5: engine-depth unprojection | 3–4 weeks | The car drives in Vision mode | **IN PROGRESS** — milestones 1–3 landed 2026-08-23 |
 | 3 | Rung 1: stereo depth | 3–6 weeks | The car drives on vision geometry for OBSTACLES; the ground band stays on engine depth | re-shaped by phase 1 |
 | 4 | Rung 2: sim-trained semantics | 4–8 weeks | Meaning comes from pixels, on every map | after 3 |
 | 5 | Rung 3 decision: learned BEV / occupancy | 2–3 months | Is the true Tesla architecture worth the ML project? | decide after 4 |
@@ -176,7 +176,7 @@ geometry. A re-run on a differently-textured road surface would strengthen it,
 and nothing here tests a kerb against a WET or high-contrast surface where
 matching would be easier.
 
-## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks) — **NEXT**
+## Phase 2 — Rung 0.5: engine-depth unprojection (3–4 weeks) — **IN PROGRESS**
 
 Phase 1's verdict promotes this from scaffolding to the permanent source of the
 ground band: engine depth is no longer a stepping stone that stereo replaces,
@@ -191,19 +191,90 @@ traps, subsampling budget, frame-skew compensation).
 
 Milestones, in order:
 
-- [ ] Pure `unprojection.py`: per-camera ray LUT, depth decode, cosine
+- [x] Pure `unprojection.py`: per-camera ray LUT, depth decode, cosine
       divide, strided subsample — pinned offline against synthetic depth
-      images.
-- [ ] Worker: vision ticks emit `BevFrame`/`PerceptionSnapshot`; BEV and
-      WORLD light up in Vision mode.
-- [ ] Oracle harness: LiDAR-mode and Vision-mode clouds diffed on the same
-      scene (drive the same stretch in both modes; compare band outputs).
-- [ ] Per-camera ego-motion compensation measured and applied (frames are
-      staged ~1–2 frames apart; ~1.9 m at speed).
+      images. **Landed 2026-08-23**, 21 tests (`tests/test_unprojection.py`):
+      a flat floor comes back flat to 0.5 mm across a 100° frame (the
+      planar-Z proof), handedness, the pitched rear camera, sky/bodywork
+      culls, frame-age rewind, the rig's sample budget. 5.5 ms per tick for
+      the whole rig at 960×720 (12.6 before float32 end-to-end and the
+      one-word annotation gather).
+- [x] Worker: vision ticks emit `BevFrame`/`PerceptionSnapshot`; BEV and
+      WORLD light up in Vision mode. **Landed 2026-08-23.** `_poll_once` is
+      one tick for either instrument set — acquisition is the only split;
+      everything from `points_world + colours` on is the LiDAR's code. The
+      header gained a separate LIDAR/VISION instrument toggle beside the
+      WORLD/RAW BEV/CAMERAS view toggle, so the cloud views work on cameras.
+      The driving controls stay refused behind `VISION_DRIVING_ENABLED`
+      (milestone 5). Offline-proven only; the app has not been run on the
+      rig since.
+- [x] Oracle harness: `tools/unprojection_oracle.py` — both rigs on the
+      player's car at once, one lockstep capture, both clouds through the
+      real bands. **Landed and run once live 2026-08-23** on the west_coast_usa
+      car park the car happened to be parked in:
+      - **Handedness settled**: planner-band IoU direct 0.151 vs mirrored
+        0.015 — image right is vehicle right, as `camera_basis` assumes.
+      - **Ground band**: road floor per 4 m ring agrees with the LiDAR to
+        +3…+9 mm out to 24 m. The far road was occluded on that scene, so
+        the reach past 25 m is still unmeasured — re-run on a street.
+      - Two honest sampling differences for milestone 5: a parked car
+        behind lands one 0.4 m cell nearer from the 0.9 m rear camera (rear
+        glass) than from the 0.2 m rear LiDAR (bumper); and a tree 18 m
+        behind-left enters the planner band from `repeater_left` (554
+        returns at 1.8–6.6 m) where the LiDAR's 61 canopy returns were
+        dropped — the cameras see low branches the rings miss.
+- [~] Per-camera ego-motion compensation measured and applied (frames are
+      staged ~1–2 frames apart; ~1.9 m at speed). The measurable half — the
+      time since each camera's depth lattice last changed — is applied per
+      camera, position AND heading (`pose_from_state(state, age, yaw_rate)`;
+      the stale-heading half was the live "world turns with me" report, see
+      below). The fixed staging part, `CAMERA_FRAME_STAGING_S`, is zero
+      until measured; `tools/camera_staging_probe.py` measures it (swing a
+      probe camera, count stepped frames until the buffer follows) and
+      REFUSES while the simulator window is covered — in that state the
+      renderer throttles to ~2 Hz and every latency reads as throttle.
 - [ ] Re-enable self-driving + AEB in Vision mode behind the full live
       checklist re-run — the sampling distribution is new, so the whole AEB
-      phantom checklist applies (hills, brake dive, bushes, kerbs, reverse).
+      phantom checklist applies (hills, brake dive, bushes, kerbs, reverse,
+      and the tree case above). The code change is flipping
+      `VISION_DRIVING_ENABLED`; the rest is driving.
 - [ ] **Milestone: the car drives in Vision mode** (on engine depth).
+
+Also landed alongside, by request: the rear camera is 130° and pitched 15°
+down (`CAMERA_REAR_PITCH_DEG`) — it is the reversing camera, and its frame now
+reaches the ground ~0.3 m behind the lens.
+
+### The first live drive (2026-08-23 evening) and what it found
+
+The mode worked — cameras attached, cloud produced, WORLD lit up — but slow
+("like 10 FPS") and the WORLD view "remembered": on a turn the whole scene
+turned with the car and took a few seconds of driving to correct. Diagnosed
+from the log and live probes; all fixes landed, none vision-specific:
+
+- The "turning world" was the prefetched state's STALE HEADING rotating
+  every cloud stamped into the world-anchored stores during a turn (RAW BEV
+  cannot show it — the same state transforms the cloud both ways). Fixed by
+  a measured yaw rate advancing the prefetched heading and rewinding each
+  camera frame.
+- The worker thread spent ~0.5 s of every second on REFUSED actor
+  enrichment round trips (get_states 39 ms at 10 Hz + get_current_info
+  120 ms at 1 Hz, each logging a traceback). One refusal now rests both for
+  15 s (`WORLD_ACTOR_RETRY_S`).
+- The scene refresh ran 200–460 ms against its 120 ms cadence,
+  back-to-back, taxing every thread through the GIL. The ground store held
+  90k stacked "ground" cells — car roofs, wall tops, building roofs
+  promoted as floor — now collapsed to one height per cell and filtered by
+  connectivity to the car (`connected_ground`); the slab merge lost its
+  Python loop. ~280 ms → ~170 on the live capture, and an overrunning build
+  now stretches its own cadence (`WORLD_STORE_REFRESH_DUTY`).
+- **A fully covered simulator window throttles the renderer to ~2 Hz** —
+  LiDAR included; measured live, and `poll_sensors` stays normal so it
+  looks like app lag. `Capture check:` warns now. Keep BeamNG visible while
+  streaming.
+
+Still open from that session: the staging measurement itself (the probe
+needs the sim window focused), and a re-drive to confirm the turn artefact
+and the frame rate are gone.
 
 ## Phase 3 — Rung 1: stereo (3–6 weeks; RE-SHAPED by phase 1's verdict)
 

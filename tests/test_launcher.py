@@ -124,3 +124,14 @@ def test_an_unreadable_setting_is_never_warned_about() -> None:
     assert capture_setting_warnings({}) == ()
     assert capture_setting_warnings({"shader": None, "motion_blur": None}) == ()
     assert capture_setting_warnings({"shader": 0, "motion_blur": "false"}) == ()
+
+
+def test_an_unfocused_simulator_window_is_warned_about() -> None:
+    """Fully covered, the renderer throttles to ~2 Hz (measured live) and
+    every sensor -- LiDAR included -- crawls; a warning names the fix."""
+    warnings = capture_setting_warnings({"focused": False})
+    assert len(warnings) == 1
+    assert "foreground" in warnings[0]
+    assert capture_setting_warnings({"focused": True}) == ()
+    # Unknown stays silent: an older game version is not evidence of a fault.
+    assert capture_setting_warnings({}) == ()

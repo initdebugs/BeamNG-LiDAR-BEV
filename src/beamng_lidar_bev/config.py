@@ -304,7 +304,19 @@ CAMERA_FRONT_BUMPER_HFOV_DEG = 110.0
 # camera spans 125-235. `test_the_rig_leaves_no_gap_all_the_way_round` pins it.
 CAMERA_PILLAR_HFOV_DEG = 90.0
 CAMERA_REPEATER_HFOV_DEG = 90.0
-CAMERA_REAR_HFOV_DEG = 110.0
+# 130 since 2026-08-23, up from 110, and PITCHED DOWN (CAMERA_REAR_PITCH_DEG):
+# the rear camera is the reversing camera, and a reversing camera's job is the
+# ground immediately behind the bumper -- the kerb, the bollard, the neighbour's
+# wing -- which a level 110-degree view cut off at the frame bottom a couple of
+# metres out. Widening past the 110 the other mounts stop at costs centre
+# density (3.9 px/deg at 960 wide against 5.9), which is affordable here because
+# nothing long-range is asked of this camera: forward AEB range comes from the
+# windshield pair, and the rear brake arms at a crawl. The 16:12 vertical
+# aperture at 130 wide is ~116 degrees, so pitched 15 down the frame still
+# reaches 43 degrees above the horizon (a following car's windscreen at 5 m)
+# and the bottom edge meets the ground ~0.3 m behind the lens.
+CAMERA_REAR_HFOV_DEG = 130.0
+CAMERA_REAR_PITCH_DEG = 15.0
 # B-pillar cameras look forward-outboard, repeaters (front fenders) look
 # rear-outboard -- the HW4 pattern. Yaw is measured from straight ahead
 # (pillars) and from straight behind (repeaters).
@@ -320,6 +332,79 @@ CAMERA_REPEATER_YAW_DEG = 45.0
 # invisible in-world, so a generous standoff costs nothing. If the rear camera
 # is ever reported dark, it wants the same treatment.
 CAMERA_FRONT_BUMPER_STANDOFF_M = 0.30
+
+# --- Vision mode rung 0.5: engine-depth unprojection -----------------------------
+#
+# Phase 2 of docs/VISION_ROADMAP.md. Every camera renders the DEPTH and
+# ANNOTATION channels beside colour, and the worker rebuilds the perception
+# waist (`points_world + colours + state`) from them through `unprojection.py`,
+# so the planner, both AEBs, the BEV and WORLD all run on the camera rig.
+#
+# Phase 1's verdict made this the PERMANENT ground-band source rather than
+# scaffolding: computed stereo resolved a kerb at 15 m and nowhere beyond it
+# (measured 2026-08-23, tools/kerb_experiment.py), so engine depth keeps kerbs
+# and the road surface for good; stereo, when it lands, takes obstacles only.
+#
+# Measured costs the rung is budgeted against (spec section 2): annotation is a
+# second full geometry pass per camera (sim 42 -> 33 Hz for eight), depth
+# doubles the bytes the simulator writes. The worker does NOT copy the depth or
+# annotation buffers -- it gathers only the strided sample below straight from
+# the live shared memory, one vectorised read per channel per camera.
+#
+# Per-camera (column, row) sample strides. Rows are the RANGE axis for ground
+# seen from a camera: a row at depression theta meets the ground at h/tan(theta)
+# and consecutive sampled rows land (r^2/h) * dtheta apart, exactly the LiDAR
+# ring-spacing arithmetic with the row stride standing in for the channel
+# pitch. So the windshield main camera -- the only long-range instrument in the
+# rig -- keeps a finer row stride than anything else: at 960x720 / 50 deg its
+# focal length is ~1029 px, so a row stride of 2 is 0.11 deg and the ground is
+# sampled every 0.6 m at 20 m from the 1.3 m windshield height. The wide and
+# side cameras are context and near field, where a coarser lattice is ample.
+# Budget at 960x720: ~280k sampled pixels across the rig, of which roughly half
+# are sky and far plane and are culled before anything else runs, landing near
+# the six-unit LiDAR rig's 100-150k. Raise a stride before touching the
+# resolution if the tick binds; the `Unprojection check:` line reports the
+# per-camera counts that decide it.
+CAMERA_SAMPLE_STRIDES = {
+    "front_main": (4, 2),
+    "front_wide": (6, 3),
+    "front_bumper": (6, 4),
+    "pillar_left": (6, 4),
+    "pillar_right": (6, 4),
+    "repeater_left": (8, 4),
+    "repeater_right": (8, 4),
+    "rear": (6, 4),
+}
+CAMERA_DEFAULT_SAMPLE_STRIDE = (6, 4)
+# Depth decodes as raw float32 x far plane, in linear metres of PLANAR Z
+# (measured: 10 m read 9.65, 25 m -> 24.17, 50 m -> 49.51). Sky and anything
+# past the far plane come back AT the far plane, so a sample within this
+# fraction of it is not a surface and is dropped before unprojection -- along
+# with anything past LIDAR_RANGE_M, which the downstream cull would discard
+# anyway but which this avoids transforming at all.
+CAMERA_DEPTH_FAR_FRACTION = 0.98
+# A sample nearer than this is bodywork or the lens's own housing (the bumper
+# camera sees bonnet; the repeaters see the fender) and never a return.
+CAMERA_DEPTH_MIN_M = 0.30
+# The fixed part of each camera frame's age: the simulator stages frames "a
+# frame or two" behind with no timestamp, and the worker can only measure the
+# part AFTER the buffer changed (the digest age). UNMEASURED as of 2026-08-23
+# and therefore zero -- roadmap phase 2's ego-motion milestone is the
+# measurement, and tools/camera_staging_probe.py is how it is taken (it needs
+# the simulator window VISIBLE: covered, the renderer throttles to ~2 Hz and
+# every latency reads as ~700 ms). Points are placed from the pose the car had
+# `age` ago; at the 40 km/h cap an unmodelled 60 ms is 0.66 m, in the late
+# direction for AEB -- and in a turn, every unmodelled millisecond rotates the
+# cloud about the car before it is stamped into the world stores.
+CAMERA_FRAME_STAGING_S = 0.0
+# Whether self-driving, both AEBs and parking may engage on the unprojected
+# camera cloud. OFF until the phase-2 live checklist has been run: the bands
+# were fitted to LiDAR sampling and the camera lattice is a new distribution
+# (no azimuth stripes, density falling as 1/r^2), so every phantom-braking case
+# -- hills, brake dive, bushes, kerbs, reverse -- has to be re-proved live
+# before a full-authority brake is allowed to read it. Flipping this is the
+# whole of roadmap milestone 5's code change; the rest of it is driving.
+VISION_DRIVING_ENABLED = False
 
 DISPLAY_RADIUS_M = 105.0
 # poll_sensors("state") is a blocking round-trip measured at 32.7 ms (p95 35.3),
@@ -446,6 +531,42 @@ WORLD_ROAD_RADIUS_M = 100.0
 # (55/40 is 1.9x the cells), so this is still the constant to move first if
 # SCENE BUILD starts logging heavily.
 WORLD_SURFACE_RADIUS_M = 55.0
+# The ground is ONE height per cell and must be CONNECTED to where the car
+# stands (2026-08-23). Promotion hands the ground mesh the lowest short run
+# of every 0.125 m column, and four columns land in one 0.25 m cell -- so
+# where one column saw the ground under a parked car and its neighbour saw
+# only the roof, the cell held BOTH as stacked layers. Measured on a car-park
+# capture: 155k ground cells over 65k distinct (x, y), the stacks a median
+# 3.3 m apart (car tops, wall tops, hedge tops, building roofs), every one of
+# them drawn as a floating patch of floor and every refresh pushed onto the
+# slow keyed corner path. The camera rig, which sees the top of everything,
+# tripled what the LiDAR produced; the defect itself predates it.
+#
+# Two rules now. Per (x, y) the candidate NEAREST THE EGO'S OWN GROUND PLANE
+# wins (not the lowest: a bridge deck the car is driving on beats the road
+# seen beneath it). Then a raster connected-component pass keeps only cells
+# reachable from seeds around the car by steps of at most
+# WORLD_GROUND_STEP_M between 4-neighbours -- a kerb (0.15 m) and a hillside
+# pass, a car roof (1.4 m up in one cell) and a building roof never do. The
+# seeds are the cells within WORLD_GROUND_SEED_RADIUS_M of the car whose
+# height is within WORLD_GROUND_SEED_HEIGHT_M of the ego plane; if there are
+# none (the car is over a hole in the store) nothing is filtered, which is
+# exactly the old behaviour. The known cost, in the same direction as the
+# slab ceiling's: terrain behind a cliff steeper than 0.5 m per 0.25 m is not
+# drawn until the car can see a gentler way onto it.
+WORLD_GROUND_STEP_M = 0.5
+WORLD_GROUND_SEED_RADIUS_M = 4.0
+WORLD_GROUND_SEED_HEIGHT_M = 1.0
+# Fragments the bridge could not join -- ground rings at range further apart
+# than WORLD_ROAD_BRIDGE_CELLS -- are readmitted in bounded hops: an occupied
+# cell within WORLD_GROUND_REACH_CELLS of a kept cell joins it when its height
+# fits the step plus WORLD_GROUND_REACH_GRADE over the gap. Measured on the
+# car-park capture, the plain component pass dropped 9% of the camera's
+# level road at 20-30 m; two 3 m hops recover most of it while a roof 2 m up
+# beside the road (0.5 + 0.3 x 0.5 m allowed against 2 m) still fails.
+WORLD_GROUND_REACH_CELLS = 12
+WORLD_GROUND_REACH_HOPS = 2
+WORLD_GROUND_REACH_GRADE = 0.30
 # The outer band of the road surface is dissolved into the air rather than cut
 # off, because the road stops at its own radius while everything else runs on to
 # WORLD_RADIUS_M. A hard rim reads as a cliff -- a drawn edge where there is
@@ -479,8 +600,26 @@ WORLD_GROUND_FIELD_FILL_CELLS = 3
 # a big map, and allocating for it would be the wrong answer either way.
 WORLD_GROUND_FIELD_MAX_SPAN_CELLS = 512
 WORLD_POSE_JUMP_RESET_M = 25.0
+# The most of its own thread's time the store refresh may consume when a
+# build overruns the cadence. The refresh runs on a one-thread pool in the
+# same PROCESS as the worker tick and the compose thread, and its Python-level
+# passes hold the GIL; back-to-back 150 ms builds (a big cloud, full stores)
+# ran that thread flat out and taxed every other thread's tick. Overrunning
+# builds now stretch the interval to last_build / duty, trading ground
+# freshness -- which was already lost to the overrun -- for everyone else's
+# latency, which was not.
+WORLD_STORE_REFRESH_DUTY = 0.6
 WORLD_ACTOR_REGISTRY_INTERVAL_S = 1.0
 WORLD_ACTOR_STATE_INTERVAL_S = 0.1
+# After the simulator REJECTS an actor-state request, how long before the next
+# one. BeamNG.tech refuses `vehicles.get_states` in free-roam -- the normal
+# workflow -- and until 2026-08-23 the worker asked again every 100 ms and
+# logged a traceback each time: measured 39 ms per rejected round trip, plus
+# 120 ms for the 1 Hz registry refresh, so the worker THREAD spent roughly
+# half of every second blocked on the socket for nothing, which is most of
+# what a 10 Hz vision tick looked like. Every round trip on this thread
+# delays the tick that follows it, so a known-refused request is not free.
+WORLD_ACTOR_RETRY_S = 15.0
 WORLD_ACTOR_COAST_S = 0.35
 WORLD_ACTOR_FADE_S = 0.8
 # The QML actor delegate builds its model UP from its node, so the node is the

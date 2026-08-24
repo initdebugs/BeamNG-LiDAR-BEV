@@ -62,6 +62,14 @@ def capture_setting_warnings(values: dict[str, object]) -> tuple[str, ...]:
             "PostFXMotionBlurEnabled is on -- it smears every captured frame, "
             "and capture is what this rig exists for"
         )
+    if values.get("focused") is False:
+        warnings.append(
+            "the simulator window is not in the foreground -- when it is "
+            "fully covered the renderer throttles to ~2 Hz (measured live "
+            "2026-08-23: one 320x240 camera AND a LiDAR unit both delivered "
+            "under 2 Hz until the window was visible again). Keep BeamNG "
+            "visible, e.g. on a second monitor, while streaming"
+        )
     return tuple(warnings)
 
 

@@ -19,3 +19,6 @@ tools/camera_probe/
 # reproducible by re-running the capture. The verdict they produced lives
 # in docs/VISION_ROADMAP.md phase 1.
 tools/kerb_data/
+# The oracle's lockstep captures (20+ MB each); the side-by-side PNG beside
+# them stays tracked as evidence, like the colour probe.
+tools/oracle_data/*.npz

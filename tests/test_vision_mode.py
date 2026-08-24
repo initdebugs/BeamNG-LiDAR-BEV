@@ -5,12 +5,20 @@ import math
 import numpy as np
 import pytest
 
+from beamng_lidar_bev.config import CAMERA_NEAR_FAR_PLANES
 from beamng_lidar_bev.geometry import (
     CAMERA_NAMES,
     camera_vertical_fov_deg,
     derive_camera_rig,
 )
-from beamng_lidar_bev.models import VehicleGeometry, VisionFrame
+from beamng_lidar_bev.models import (
+    BevFrame,
+    CameraMount,
+    VehicleGeometry,
+    VisionFrame,
+)
+from beamng_lidar_bev.semantics import SemanticPalette
+from beamng_lidar_bev.unprojection import build_camera_rays
 from beamng_lidar_bev.vision_view import (
     grid_dimensions,
     toggle_focus,
@@ -73,7 +81,10 @@ def test_forward_is_negative_y_never_the_intuitive_positive() -> None:
     rig = derive_camera_rig(_geometry())
     for name in ("front_main", "front_wide", "front_bumper"):
         assert rig[name].direction_vehicle == (0.0, -1.0, 0.0)
-    assert rig["rear"].direction_vehicle == (0.0, 1.0, 0.0)
+    # The rear camera looks back (+Y) and DOWN: it is the reversing camera,
+    # and its job is the ground immediately behind the bumper.
+    rear = rig["rear"].direction_vehicle
+    assert rear[0] == 0.0 and rear[1] > 0.9 and rear[2] < 0.0
 
 
 def test_side_cameras_sit_outside_the_body_shell() -> None:
@@ -163,26 +174,70 @@ def test_clicking_a_tile_focuses_it_and_any_click_returns_to_the_grid() -> None:
 
 
 class StreamingCameraStub:
-    """A Camera the way the worker drives one: stream_raw only, never poll."""
+    """
+    A Camera the way the worker drives one: stream_raw only, never poll.
 
-    def __init__(self, width: int = 4, height: int = 3) -> None:
+    Three channels, as the rung-0.5 rig renders: colour for the grid, DEPTH
+    (planar Z as raw float32 / far plane) and ANNOTATION (a palette colour)
+    for the unprojection. A repaint changes the depth by a hair, which is
+    what a new simulator frame looks like to the worker's digest.
+    """
+
+    def __init__(
+        self,
+        width: int = 4,
+        height: int = 3,
+        depth_m: float = 20.0,
+        annotation: tuple[int, int, int] = (255, 0, 0),
+        with_depth: bool = True,
+    ) -> None:
         self.resolution = (width, height)
         self.stream_raw_calls = 0
         self._pixel = 17
+        self._depth_m = depth_m
+        self._annotation = annotation
+        self._with_depth = with_depth
+        self._frame = 0
 
     def repaint(self) -> None:
-        """Change the buffer, as a new simulator frame would."""
+        """Change the buffers, as a new simulator frame would."""
         self._pixel = (self._pixel + 41) % 256
+        self._frame += 1
 
     def stream_raw(self) -> dict[str, bytes]:
         self.stream_raw_calls += 1
         width, height = self.resolution
-        return {"colour": bytes([self._pixel]) * (width * height * 4)}
+        count = width * height
+        raw = {"colour": bytes([self._pixel]) * (count * 4)}
+        if self._with_depth:
+            depth = np.full(
+                count,
+                (self._depth_m + 1e-3 * self._frame) / CAMERA_NEAR_FAR_PLANES[1],
+                dtype=np.float32,
+            )
+            raw["depth"] = depth.tobytes()
+            annotation = np.zeros((count, 4), dtype=np.uint8)
+            annotation[:, :3] = self._annotation
+            annotation[:, 3] = 255
+            raw["annotation"] = annotation.tobytes()
+        return raw
 
     def poll(self) -> None:
         raise AssertionError(
             "The display loop must not issue blocking camera polls"
         )
+
+
+def _stub_mount(name: str, width: int, height: int) -> CameraMount:
+    return CameraMount(
+        name=name,
+        position_vehicle=(0.0, -0.6, 1.3),
+        direction_vehicle=(0.0, -1.0, 0.0),
+        horizontal_fov_deg=60.0,
+        vertical_fov_deg=camera_vertical_fov_deg(60.0, (width, height)),
+        resolution=(width, height),
+        sample_stride=(1, 1),
+    )
 
 
 class VehicleStub:
@@ -209,6 +264,12 @@ def _armed_vision_worker(
     worker._sensors = cameras  # type: ignore[assignment]
     worker._sensor_names = [f"cam_{index}" for index in range(len(cameras))]
     worker._geometry = _geometry()
+    worker._palette = SemanticPalette.from_annotations({"STREET": (255, 0, 0)})
+    worker._camera_rays = {
+        name: build_camera_rays(_stub_mount(name, *camera.resolution))
+        for name, camera in zip(worker._sensor_names, cameras)
+    }
+    worker._vision_eye_height_m = 1.3
     worker.vision_frame_ready.connect(frames.append)
     return worker, frames
 
@@ -217,22 +278,101 @@ def test_the_worker_defaults_to_lidar_mode() -> None:
     assert BeamNgWorker()._sensor_mode == SENSOR_MODE_LIDAR
 
 
-def test_a_vision_tick_streams_every_camera_and_emits_one_frame() -> None:
+def test_a_vision_tick_streams_every_camera_and_emits_both_frames() -> None:
+    """
+    Rung 0.5: a vision tick emits the camera grid's frame AND the BEV frame,
+    because the unprojected cloud rejoins the common pipeline -- the same
+    tick, the same frame object the LiDAR set produces.
+    """
     cameras = [StreamingCameraStub() for _ in range(8)]
     worker, frames = _armed_vision_worker(cameras)
-    bev_frames: list[object] = []
+    bev_frames: list[BevFrame] = []
     worker.frame_ready.connect(bev_frames.append)
 
     worker._poll_once()
 
     assert [camera.stream_raw_calls for camera in cameras] == [1] * 8
-    assert bev_frames == []
     assert len(frames) == 1
     frame = frames[0]
     assert len(frame.images) == 8
     assert frame.images[0].rgba.shape == (3, 4, 4)
     assert frame.images[0].rgba.dtype == np.uint8
     assert frame.speed_mps == pytest.approx(5.0)
+    assert len(bev_frames) == 1
+    bev = bev_frames[0]
+    assert bev.raw_point_count == 8 * 4 * 3
+    assert bev.speed_mps == pytest.approx(5.0)
+
+
+def test_the_unprojected_cloud_lands_where_the_depth_says_and_is_classified() -> None:
+    """
+    A wall 20 m down the optical axis of a camera 0.6 m ahead of the node,
+    painted STREET in the annotation channel, comes out of the tick as ROAD
+    points 20.6 m ahead -- the whole waist, end to end, through the real
+    semantic pass.
+    """
+    camera = StreamingCameraStub(depth_m=20.0, annotation=(255, 0, 0))
+    worker, _ = _armed_vision_worker([camera])
+    bev_frames: list[BevFrame] = []
+    worker.frame_ready.connect(bev_frames.append)
+    snapshots: list[object] = []
+    worker.perception_ready.connect(snapshots.append)
+
+    worker._poll_once()
+
+    bev = bev_frames[0]
+    assert len(bev.road_points) == 12 and len(bev.obstacle_points) == 0
+    assert np.allclose(bev.road_points[:, 1], 20.6, atol=0.01)
+    assert len(snapshots) == 1
+    world = snapshots[0].points_world
+    # VehicleStub faces world +Y from (1, 2, 3): the wall is at y = 22.6.
+    assert np.allclose(world[:, 1], 22.6, atol=0.01)
+
+
+def test_a_camera_without_depth_still_reaches_the_grid_but_not_the_cloud() -> None:
+    cameras = [StreamingCameraStub(with_depth=False), StreamingCameraStub()]
+    worker, frames = _armed_vision_worker(cameras)
+    bev_frames: list[BevFrame] = []
+    worker.frame_ready.connect(bev_frames.append)
+
+    worker._poll_once()
+
+    assert len(frames[0].images) == 2
+    assert bev_frames[0].raw_point_count == 12
+
+
+def test_self_driving_and_aeb_lift_their_refusal_when_the_gate_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The refusal is ONE rule for every slot, gated on VISION_DRIVING_ENABLED:
+    flipping that constant is the whole code change of roadmap milestone 5.
+    """
+    import beamng_lidar_bev.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "VISION_DRIVING_ENABLED", True)
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+
+    worker.set_aeb(True)
+    worker.set_rear_aeb(True)
+    worker.set_self_driving(True)
+
+    assert worker._aeb_enabled is True
+    assert worker._rear_aeb_enabled is True
+    assert worker._self_driving is True
+
+
+def test_porosity_reasons_from_the_tallest_camera_in_vision_mode() -> None:
+    """
+    The see-through veto needs the eye height of the unit that can see OVER
+    a short object. In LiDAR mode that is the roof unit; on the camera rig
+    it is the windshield pair, and the LiDAR geometry's roof mount must not
+    be consulted for a rig that does not have one.
+    """
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    assert worker._porosity_sensor_height(_geometry()) == pytest.approx(1.3)
+    worker._sensor_mode = SENSOR_MODE_LIDAR
+    assert worker._porosity_sensor_height(_geometry()) == 0.0
 
 
 def test_the_image_is_a_private_copy_not_the_shared_buffer() -> None:
@@ -250,7 +390,9 @@ def test_the_image_is_a_private_copy_not_the_shared_buffer() -> None:
 
 def test_rereads_of_an_unchanged_buffer_do_not_count_as_acquisition() -> None:
     """The tick re-reads shared memory faster than the cameras update, so the
-    acquisition metric counts genuinely NEW frames -- the LiDAR rule."""
+    acquisition metric counts genuinely NEW frames -- the LiDAR rule. The
+    digest is taken on the DEPTH lattice now, which the unprojection gathers
+    anyway, so freshness costs nothing extra."""
     camera = StreamingCameraStub()
     worker, frames = _armed_vision_worker([camera])
 
@@ -261,6 +403,25 @@ def test_rereads_of_an_unchanged_buffer_do_not_count_as_acquisition() -> None:
     camera.repaint()
     worker._poll_once()
     assert frames[2].acquisition_fps > 0.0
+
+
+def test_a_frames_age_is_counted_from_when_its_depth_last_changed() -> None:
+    """
+    The simulator stamps nothing, so the only measurable part of a frame's
+    age is how long since its buffer changed. The worker keeps that per
+    camera and places each camera's cloud from the pose the car had then.
+    """
+    camera = StreamingCameraStub()
+    worker, _ = _armed_vision_worker([camera])
+
+    worker._poll_once()
+    first_seen = worker._camera_frame_seen["cam_0"]
+    worker._poll_once()
+    assert worker._camera_frame_seen["cam_0"] == first_seen
+
+    camera.repaint()
+    worker._poll_once()
+    assert worker._camera_frame_seen["cam_0"] > first_seen
 
 
 def test_vision_mode_refuses_self_driving_and_both_aebs() -> None:
@@ -367,10 +528,13 @@ def test_cleanup_forgets_the_camera_digests() -> None:
     worker, _ = _armed_vision_worker([StreamingCameraStub()])
     worker._poll_once()
     assert worker._camera_digests
+    assert worker._camera_rays
 
     worker._cleanup_sensors()
 
     assert worker._camera_digests == {}
+    assert worker._camera_frame_seen == {}
+    assert worker._camera_rays == {}
 
 
 def test_shrinking_an_image_is_resampled_and_magnifying_it_is_not() -> None:

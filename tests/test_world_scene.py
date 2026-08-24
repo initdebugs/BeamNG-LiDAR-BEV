@@ -2307,3 +2307,120 @@ def test_no_scan_means_no_parking_geometry() -> None:
     assert len(frame.parking_vertices) == 0
     assert len(frame.parking_indices) == 0
     assert frame.parking_slots == ()
+
+
+# --- Ground connectivity -------------------------------------------------------
+
+
+def _grid_cells(spans, cell=0.25):
+    """Cells and heights from ((x0, x1, y0, y1, height), ...) in metres."""
+    import numpy as np
+
+    cells, heights = [], []
+    for x0, x1, y0, y1, h in spans:
+        for cx in np.arange(x0, x1, cell):
+            for cy in np.arange(y0, y1, cell):
+                cells.append((int(round(cx / cell)), int(round(cy / cell))))
+                heights.append(h)
+    return (
+        np.asarray(cells, dtype=np.int32),
+        np.asarray(heights, dtype=np.float32),
+    )
+
+
+def test_a_roof_is_not_ground_but_a_kerbed_pavement_is() -> None:
+    """
+    The promotion rule hands the ground mesh the lowest short run of every
+    column, and from camera height that includes the tops of things: measured
+    on a car-park capture, 89k of 155k ground cells were car roofs, wall tops
+    and building roofs stacked over real ground, every one drawn as a
+    floating patch of floor. Ground must be REACHABLE from the car by gentle
+    steps: a kerb (0.15 m) connects, a roof (1.5 m in one cell) never does.
+    """
+    import numpy as np
+
+    from beamng_lidar_bev.world_scene import connected_ground
+
+    cells, heights = _grid_cells(
+        (
+            (-6.0, 6.0, -6.0, 20.0, 0.0),  # the road around the car
+            (6.0, 9.0, -6.0, 20.0, 0.15),  # a kerbed pavement alongside
+            (-4.0, -1.0, 8.0, 12.0, 1.5),  # a car roof "floating" on the road
+        )
+    )
+    # The car-roof cells REPLACE the road cells under them (one height per
+    # xy): drop the road cells that coincide.
+    roof = heights == 1.5
+    packed = cells[:, 0].astype(np.int64) * 100000 + cells[:, 1]
+    shadowed = np.isin(packed, packed[roof]) & ~roof
+    cells, heights = cells[~shadowed], heights[~shadowed]
+
+    kept = connected_ground(
+        cells, heights, np.asarray((0.0, 0.0)), 0.0, 0.25
+    )
+
+    assert kept[heights == 0.0].all(), "the road itself must survive"
+    assert kept[heights == 0.15].all(), "a kerbed pavement connects by a step"
+    assert not kept[heights == 1.5].any(), "a roof is never reachable"
+
+
+def test_a_hillside_connects_through_its_own_slope() -> None:
+    import numpy as np
+
+    from beamng_lidar_bev.world_scene import connected_ground
+
+    spans = [(-4.0, 4.0, -4.0, 4.0, 0.0)]
+    # A 20% grade climbing away: 0.1 m per 0.5 m band, reaching 4 m up.
+    for index in range(80):
+        y0 = 4.0 + index * 0.5
+        spans.append((-4.0, 4.0, y0, y0 + 0.5, 0.1 * (index + 1)))
+    cells, heights = _grid_cells(spans)
+
+    kept = connected_ground(
+        cells, heights, np.asarray((0.0, 0.0)), 0.0, 0.25
+    )
+
+    assert kept.all(), "a continuous slope is ground all the way up"
+
+
+def test_without_a_seed_nothing_is_filtered() -> None:
+    """The car over a hole in the store keeps the whole picture -- the old
+    behaviour -- rather than losing everything to an unanchored filter."""
+    import numpy as np
+
+    from beamng_lidar_bev.world_scene import connected_ground
+
+    cells, heights = _grid_cells(((10.0, 14.0, 10.0, 14.0, 3.0),))
+
+    kept = connected_ground(
+        cells, heights, np.asarray((0.0, 0.0)), 0.0, 0.25
+    )
+
+    assert kept.all()
+
+
+def test_a_level_fragment_across_an_unbridged_gap_is_readmitted() -> None:
+    """
+    At range the ground arrives as rings further apart than the bridge
+    closes; a level patch of road 2 m past the last kept cell is still road.
+    Measured before the reach hops: 9% of the camera cloud's level road at
+    20-30 m was dropped. A patch the same distance away but 2 m UP stays out.
+    """
+    import numpy as np
+
+    from beamng_lidar_bev.world_scene import connected_ground
+
+    cells, heights = _grid_cells(
+        (
+            (-4.0, 4.0, -4.0, 10.0, 0.0),
+            (-4.0, 4.0, 12.0, 14.0, 0.05),  # level, 2 m past the edge
+            (6.5, 9.0, -2.0, 2.0, 2.0),  # a wall top 2.5 m to the side, 2 m up
+        )
+    )
+
+    kept = connected_ground(
+        cells, heights, np.asarray((0.0, 0.0)), 0.0, 0.25
+    )
+
+    assert kept[heights == 0.05].all(), "a level fragment within reach returns"
+    assert not kept[heights == 2.0].any(), "height still vetoes the hop"

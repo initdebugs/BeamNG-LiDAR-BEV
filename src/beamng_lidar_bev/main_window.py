@@ -40,6 +40,7 @@ from .config import (
     LIDAR_UPDATE_HZ,
     MAX_SPEED_MPS,
     SENSOR_HEIGHT_ABOVE_GROUND_M,
+    VISION_DRIVING_ENABLED,
     WORLD_STORE_REFRESH_INTERVAL_S,
 )
 from .geometry import CAMERA_NAMES
@@ -65,20 +66,38 @@ _SCENE_BUDGET_WARN_INTERVAL_S = 15.0
 _BRIDGE_WAIT_GRACE_S = 300.0
 
 
+VIEW_WORLD = "WORLD"
+VIEW_RAW_BEV = "RAW BEV"
+VIEW_CAMERAS = "CAMERAS"
+# The persisted name of the camera grid before the view and the instrument
+# set were separated (2026-08-23): selecting it used to switch the rig too.
+_LEGACY_VISION_VIEW = "VISION"
+
+
 def resolve_visualization(
-    requested: str | None, *, world_available: bool
+    requested: str | None,
+    *,
+    world_available: bool,
+    cameras_available: bool = True,
 ) -> str:
     """
-    Resolve a persisted view choice without selecting a broken renderer.
+    Resolve a persisted view choice without selecting a view that cannot
+    draw anything.
 
-    VISION is always available -- it is a plain QWidget grid with no Qt Quick
-    3D dependency -- so it survives a broken WORLD renderer unchanged.
+    The three views are GUI-only: WORLD and RAW BEV draw the cloud whichever
+    instrument set produced it, and CAMERAS draws the rig's images, which
+    exist only while the camera rig is the instrument set
+    (`cameras_available`). CAMERAS has no Qt Quick 3D dependency, so it
+    survives a broken WORLD renderer unchanged; it does not survive the LiDAR
+    rig, which has no images to show.
     """
-    if requested == "VISION":
-        return "VISION"
+    if requested in (VIEW_CAMERAS, _LEGACY_VISION_VIEW):
+        if cameras_available:
+            return VIEW_CAMERAS
+        requested = VIEW_WORLD
     if not world_available:
-        return "RAW BEV"
-    return "RAW BEV" if requested == "RAW BEV" else "WORLD"
+        return VIEW_RAW_BEV
+    return VIEW_RAW_BEV if requested == VIEW_RAW_BEV else VIEW_WORLD
 
 
 def bridge_wait_message(waited_s: float) -> str | None:
@@ -97,12 +116,25 @@ def bridge_wait_message(waited_s: float) -> str | None:
     return None
 
 
-def sensor_mode_for_visualization(view: str) -> str:
+def resolve_sensor_mode(requested: str | None) -> str:
+    """A persisted instrument-set choice; anything unrecognised is LiDAR."""
+    return (
+        SENSOR_MODE_VISION
+        if str(requested or "").upper() == SENSOR_MODE_VISION
+        else SENSOR_MODE_LIDAR
+    )
+
+
+def controls_offered(sensor_mode: str) -> bool:
     """
-    Which instrument set a view needs: VISION streams cameras, both LiDAR
-    views (and anything future that is not VISION) stream the LiDAR rig.
+    Whether the driving controls (self-driving, both AEBs, parking) are
+    offered for an instrument set. Mirrors the worker's own refusal
+    (`_vision_refuses_driving`): the camera cloud feeds every band now, but
+    the bands were fitted to LiDAR sampling and the live phantom checklist
+    gates them -- VISION_DRIVING_ENABLED. The worker still refuses on its
+    own; this only keeps the buttons from bouncing.
     """
-    return SENSOR_MODE_VISION if view == "VISION" else SENSOR_MODE_LIDAR
+    return sensor_mode != SENSOR_MODE_VISION or VISION_DRIVING_ENABLED
 
 
 class MainWindow(QMainWindow):
@@ -140,7 +172,7 @@ class MainWindow(QMainWindow):
         self._last_status = "OFFLINE"
         self._compact_mode: bool | None = None
         self._dense_mode = False
-        self._active_visualization = "RAW BEV"
+        self._active_visualization = VIEW_RAW_BEV
         # Mirrors the worker's sensor_mode_changed -- the worker owns the
         # truth here exactly as it does for the driving toggles.
         self._active_sensor_mode = SENSOR_MODE_LIDAR
@@ -151,12 +183,14 @@ class MainWindow(QMainWindow):
         if self.world_view.failure_message:
             self._on_world_rendering_failed(self.world_view.failure_message)
         self._start_worker()
-        requested_view = self._settings.value("visualization", "WORLD")
+        # The instrument set first: the view it allows depends on it. The
+        # worker records the choice while idle and confirms it back through
+        # sensor_mode_changed, which is what enables the CAMERAS view.
+        requested_mode = self._settings.value("sensor_mode", SENSOR_MODE_LIDAR)
+        self._select_sensor_mode(resolve_sensor_mode(str(requested_mode)))
+        requested_view = self._settings.value("visualization", VIEW_WORLD)
         self._select_visualization(
-            resolve_visualization(
-                str(requested_view) if requested_view is not None else None,
-                world_available=self.world_view.is_ready,
-            )
+            str(requested_view) if requested_view is not None else None
         )
 
         self._set_status("OFFLINE", "Looking for a running BeamNG.tech session")
@@ -536,7 +570,7 @@ class MainWindow(QMainWindow):
         self.view_button_group.setExclusive(True)
         self.world_view_button = QPushButton("WORLD")
         self.raw_bev_button = QPushButton("RAW BEV")
-        self.vision_button = QPushButton("VISION")
+        self.vision_button = QPushButton("CAMERAS")
         for button in (
             self.world_view_button,
             self.raw_bev_button,
@@ -548,21 +582,68 @@ class MainWindow(QMainWindow):
             self.view_button_group.addButton(button)
             view_toggle_layout.addWidget(button)
         self.world_view_button.clicked.connect(
-            lambda checked: checked and self._select_visualization("WORLD")
+            lambda checked: checked and self._select_visualization(VIEW_WORLD)
         )
         self.raw_bev_button.clicked.connect(
-            lambda checked: checked and self._select_visualization("RAW BEV")
+            lambda checked: checked and self._select_visualization(VIEW_RAW_BEV)
         )
         self.vision_button.setToolTip(
-            "Stream the eight-camera Tesla-style rig instead of the LiDAR "
-            "set and show every camera live. Switching while streaming "
-            "re-attaches the sensors; self-driving and AEB need the LiDAR "
-            "set and disengage in Vision mode."
+            "Show every camera of the rig live. Available while the camera "
+            "rig is the instrument set (VISION, to the right)."
         )
         self.vision_button.clicked.connect(
-            lambda checked: checked and self._select_visualization("VISION")
+            lambda checked: checked and self._select_visualization(VIEW_CAMERAS)
         )
+        # Enabled by the worker's sensor_mode_changed(VISION) and by nothing
+        # else: the grid has images to draw only while the camera rig is the
+        # instrument set, and the worker is what knows which set is live.
+        self.vision_button.setEnabled(False)
         header.addWidget(view_toggle)
+
+        # The INSTRUMENT SET, separate from the view since rung 0.5: both
+        # rigs produce the same cloud now, so WORLD and RAW BEV draw either,
+        # and only the CAMERAS view is tied to one of them. Unlike the view
+        # toggle this one is not GUI-only -- the worker owns the mode and
+        # re-attaches through its one teardown funnel on a live switch.
+        sensor_toggle = QFrame()
+        sensor_toggle.setObjectName("viewToggle")
+        sensor_toggle_layout = QHBoxLayout(sensor_toggle)
+        sensor_toggle_layout.setContentsMargins(3, 3, 3, 3)
+        sensor_toggle_layout.setSpacing(2)
+        self.sensor_button_group = QButtonGroup(self)
+        self.sensor_button_group.setExclusive(True)
+        self.lidar_mode_button = QPushButton("LIDAR")
+        self.vision_mode_button = QPushButton("VISION")
+        for button in (self.lidar_mode_button, self.vision_mode_button):
+            button.setObjectName("viewToggleButton")
+            button.setCheckable(True)
+            button.setFixedHeight(28)
+            self.sensor_button_group.addButton(button)
+            sensor_toggle_layout.addWidget(button)
+        self.lidar_mode_button.setToolTip(
+            "Stream the six-unit LiDAR set. Switching while streaming "
+            "re-attaches the sensors."
+        )
+        self.vision_mode_button.setToolTip(
+            "Stream the eight-camera Tesla-style rig instead of the LiDAR "
+            "set: depth and annotation are unprojected into the same cloud "
+            "the LiDAR set produces, so WORLD and RAW BEV keep working. "
+            "Switching while streaming re-attaches the sensors. "
+            + (
+                ""
+                if VISION_DRIVING_ENABLED
+                else "Self-driving, AEB and parking stay off on the camera "
+                "cloud until its live checklist has been run."
+            )
+        )
+        self.lidar_mode_button.clicked.connect(
+            lambda checked: checked and self._select_sensor_mode(SENSOR_MODE_LIDAR)
+        )
+        self.vision_mode_button.clicked.connect(
+            lambda checked: checked
+            and self._select_sensor_mode(SENSOR_MODE_VISION)
+        )
+        header.addWidget(sensor_toggle)
 
         self.legend_widget = QWidget()
         legend = QHBoxLayout(self.legend_widget)
@@ -765,9 +846,9 @@ class MainWindow(QMainWindow):
             )
             return
         self._set_parking_checked(scanning)
-        if scanning and self._active_visualization != "WORLD":
+        if scanning and self._active_visualization != VIEW_WORLD:
             # _select_visualization syncs the view buttons itself.
-            self._select_visualization("WORLD")
+            self._select_visualization(VIEW_WORLD)
         self.parking_requested.emit(scanning)
 
     def _on_launch_ready(self) -> None:
@@ -829,16 +910,16 @@ class MainWindow(QMainWindow):
         self.streaming_changed.emit(True)
         self._set_attach_enabled(False)
         self._set_stop_enabled(True)
-        # The control systems reason over the LiDAR cloud, which Vision mode
-        # does not produce yet; the worker refuses them there, so offering the
-        # buttons would only bounce. Parking is in the same position and for
-        # the same reason -- the bay scan reads the SEMANTIC marking store,
-        # which only the LiDAR set produces.
-        self._set_self_drive_enabled(not vision)
-        self._set_aeb_enabled(not vision)
-        self._set_rear_aeb_enabled(not vision)
-        self._set_parking_enabled(not vision)
-        self.park_here_button.setEnabled(not vision)
+        # The control systems read the unprojected camera cloud now, but the
+        # worker refuses them in Vision mode until VISION_DRIVING_ENABLED (the
+        # bands were fitted to LiDAR sampling; the live checklist gates them),
+        # so the buttons are offered only where they would not bounce.
+        offered = controls_offered(self._active_sensor_mode)
+        self._set_self_drive_enabled(offered)
+        self._set_aeb_enabled(offered)
+        self._set_rear_aeb_enabled(offered)
+        self._set_parking_enabled(offered)
+        self.park_here_button.setEnabled(offered)
         self.vehicle_label.setText(
             f"EGO {vehicle_id}  |  {geometry.length_m:.2f} x {geometry.width_m:.2f} m"
         )
@@ -911,28 +992,12 @@ class MainWindow(QMainWindow):
         )
 
     def _on_vision_frame(self, frame: VisionFrame) -> None:
-        now = time.perf_counter()
-        self._display_times.append(now)
-        display_fps = 0.0
-        if len(self._display_times) >= 2:
-            elapsed = self._display_times[-1] - self._display_times[0]
-            if elapsed > 0:
-                display_fps = (len(self._display_times) - 1) / elapsed
-
+        """
+        The camera grid's frame. Every metric rides the BevFrame the same
+        tick emits (`_on_frame`, which runs in both modes now that the camera
+        cloud is a real cloud), so this only paints the images.
+        """
         self.vision_view.set_frame(frame)
-        self.acquisition_value.setText(f"{frame.acquisition_fps:.1f} Hz")
-        self.display_value.setText(f"{display_fps:.1f} fps")
-        # Cameras stream images, not returns; an honest dash beats a zero
-        # that reads as "no data arriving".
-        self.points_value.setText("—")
-        # And nothing builds a WORLD scene in Vision mode: `perception_ready`
-        # is emitted only from the LiDAR tick, so SceneWorker is idle and the
-        # last WORLD build time would otherwise sit here looking live. It was
-        # observed reading 91.2 ms minutes after the switch -- the same class
-        # of lie as a STREAMING badge over a frozen view.
-        self.scene_value.setText("—")
-        self.latency_value.setText(f"{frame.poll_ms:.1f} ms")
-        self.speed_value.setText(f"{frame.speed_mps * 3.6:.1f} km/h")
 
     def _on_sensor_mode_changed(self, mode: str) -> None:
         """The worker owns the mode, exactly as it owns the driving toggles."""
@@ -940,52 +1005,74 @@ class MainWindow(QMainWindow):
             return
         self._active_sensor_mode = mode
         self._append_log(
-            "Sensor mode: Vision (camera rig)"
+            "Sensor mode: Vision (camera rig, engine-depth unprojection)"
             if mode == SENSOR_MODE_VISION
             else "Sensor mode: LiDAR"
         )
+        self._sync_sensor_buttons(mode)
+        # The CAMERAS view draws the rig's images, which the LiDAR set does
+        # not have; it follows the confirmed mode, and a view left pointing
+        # at it falls back to one that can draw.
+        self.vision_button.setEnabled(mode == SENSOR_MODE_VISION)
+        if (
+            self._active_visualization == VIEW_CAMERAS
+            and mode != SENSOR_MODE_VISION
+        ):
+            self._select_visualization(VIEW_WORLD)
 
-    def _select_visualization(self, requested: str) -> None:
+    def _sync_sensor_buttons(self, mode: str) -> None:
+        self.lidar_mode_button.setChecked(mode == SENSOR_MODE_LIDAR)
+        self.vision_mode_button.setChecked(mode == SENSOR_MODE_VISION)
+
+    def _select_sensor_mode(self, mode: str) -> None:
+        """
+        Ask the worker for an instrument set. NOT GUI-only: the worker owns
+        the switch -- it no-ops on a repeat, records the mode when idle, and
+        re-attaches through its one teardown funnel when sensors are live --
+        and confirms through sensor_mode_changed, which is what actually
+        moves `_active_sensor_mode` and the CAMERAS view's availability.
+        """
+        mode = resolve_sensor_mode(mode)
+        self._sync_sensor_buttons(mode)
+        self._settings.setValue("sensor_mode", mode)
+        self.sensor_mode_requested.emit(mode)
+
+    def _select_visualization(self, requested: str | None) -> None:
+        """GUI-only: which of the three views draws. Never touches the rig."""
         selected = resolve_visualization(
             requested,
             world_available=self.world_view.is_ready
             and self.world_view_button.isEnabled(),
+            cameras_available=self._active_sensor_mode == SENSOR_MODE_VISION,
         )
         self._active_visualization = selected
         widget = {
-            "WORLD": self.world_view,
-            "VISION": self.vision_view,
+            VIEW_WORLD: self.world_view,
+            VIEW_CAMERAS: self.vision_view,
         }.get(selected, self.bev)
         self.visual_stack.setCurrentWidget(widget)
-        self.world_view_button.setChecked(selected == "WORLD")
-        self.raw_bev_button.setChecked(selected == "RAW BEV")
-        self.vision_button.setChecked(selected == "VISION")
+        self.world_view_button.setChecked(selected == VIEW_WORLD)
+        self.raw_bev_button.setChecked(selected == VIEW_RAW_BEV)
+        self.vision_button.setChecked(selected == VIEW_CAMERAS)
         self.view_title.setText(
             {
-                "WORLD": "RECONSTRUCTED WORLD",
-                "VISION": "CAMERA ARRAY",
+                VIEW_WORLD: "RECONSTRUCTED WORLD",
+                VIEW_CAMERAS: "CAMERA ARRAY",
             }.get(selected, "EGO BIRD'S-EYE VIEW")
         )
-        raw_selected = selected == "RAW BEV"
-        self.stats_band.setVisible(selected != "WORLD")
+        raw_selected = selected == VIEW_RAW_BEV
+        self.stats_band.setVisible(selected != VIEW_WORLD)
         self.legend_widget.setVisible(raw_selected and not self._dense_mode)
         # The coverage overlay is drawn on the RAW BEV plot only, so the
         # toggles hide with it rather than promising something the other
         # views won't draw.
         self.lidar_debug_widget.setVisible(raw_selected)
         self._settings.setValue("visualization", selected)
-        # Unlike the WORLD/RAW BEV pair this is NOT GUI-only: VISION needs a
-        # different instrument set on the car. The worker owns the switch --
-        # it no-ops on a repeat, records the mode when idle, and re-attaches
-        # through its one teardown funnel when sensors are live.
-        self.sensor_mode_requested.emit(
-            sensor_mode_for_visualization(selected)
-        )
 
     def _on_world_rendering_failed(self, message: str) -> None:
         self._append_log(f"3D WORLD unavailable: {message}")
         self.world_view_button.setEnabled(False)
-        self._select_visualization("RAW BEV")
+        self._select_visualization(VIEW_RAW_BEV)
 
     def _on_scene_error(self, message: str) -> None:
         self._append_log(message)
@@ -1286,10 +1373,10 @@ class MainWindow(QMainWindow):
             self.stats_layout.setContentsMargins(16, 10, 16, 10)
 
         self.legend_widget.setVisible(
-            not dense and self._active_visualization == "RAW BEV"
+            not dense and self._active_visualization == VIEW_RAW_BEV
         )
         self.lidar_debug_widget.setVisible(
-            self._active_visualization == "RAW BEV"
+            self._active_visualization == VIEW_RAW_BEV
         )
         self.latency_container.setVisible(not dense)
         self.scene_container.setVisible(not dense)

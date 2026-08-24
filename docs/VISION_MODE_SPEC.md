@@ -1,7 +1,9 @@
 # Vision Mode — Project Specification
 
-Status: rung 0 landed 2026-08-22 (camera rig + live grid). Everything below
-rung 0 is implemented; everything above it is specified and unbuilt.
+Status: rung 0 landed 2026-08-22 (camera rig + live grid); rung 0.5 landed
+2026-08-23 (engine-depth unprojection feeding the whole downstream stack,
+driving controls gated behind `VISION_DRIVING_ENABLED` until the live
+checklist). Everything above rung 0.5 is specified and unbuilt.
 
 This document is the working spec for replacing the LiDAR stack with cameras,
 one honest step at a time. It consolidates two research passes: the live
@@ -22,7 +24,7 @@ a **ladder**, not a switch:
 | Rung | Name | Depth source | Semantics source | Status |
 |------|------|--------------|------------------|--------|
 | 0 | Camera rig + live grid | none (display only) | none | **DONE** |
-| 0.5 | Engine unprojection | engine Z-buffer | engine annotation | specified |
+| 0.5 | Engine unprojection | engine Z-buffer | engine annotation | **DONE** (driving gated) |
 | 1 | Stereo | **computed from image pairs** | engine annotation | specified |
 | 2 | Sim-trained networks | stereo | **learned from pixels** | specified |
 | 3 | Learned BEV / occupancy | one network, pixels → world | ditto | sketched |
@@ -273,7 +275,7 @@ GUI in this mode (they consume the LiDAR cloud; rung 0.5 restores them).
 - Graphics preset above "Lowest" (empty camera buffers otherwise) and
   `PostFXMotionBlurEnabled=false` for capture-quality frames.
 
-## 3. Rung 0.5 — engine unprojection (the previous report's "recommended")
+## 3. Rung 0.5 — engine unprojection (IMPLEMENTED 2026-08-23)
 
 Turn on the depth (+ annotation) channels and rebuild the perception waist:
 per camera, stride-subsample the depth image, unproject through a precomputed
@@ -281,7 +283,35 @@ per-pixel ray LUT, sample annotation at the same pixels, concatenate all
 eight into `points_world` + `colours`. The whole downstream stack — planner,
 AEB, semantics, BEV, WORLD — resumes working, now fed by cameras.
 
-Key facts and decisions:
+**Phase 1's verdict promoted this from scaffolding to the PERMANENT ground
+source** (see the roadmap): stereo resolved a kerb at 15 m and nowhere
+beyond, so kerbs and the road surface keep coming from here.
+
+As built (`unprojection.py`, pure; `worker._acquire_vision_cloud`;
+`tools/unprojection_oracle.py`; CLAUDE.md "Rung 0.5" has the load-bearing
+detail):
+
+- The ray table is built once per attach from `geometry.camera_basis`
+  (image right = `forward × up`, re-orthogonalised for the pitched rear
+  camera), sampled at pixel centres on a per-camera `(column, row)` stride
+  (`CAMERA_SAMPLE_STRIDES`), with the cosine divide baked in: directions
+  have optical-axis component exactly 1, so `origin + Z * direction` is the
+  planar-Z unprojection.
+- Depth and annotation are GATHERED from the live shared buffer at the
+  lattice only — never copied; colour is still copied once for the grid.
+- Each camera's cloud is placed from the pose the car had when its depth
+  lattice last changed (`pose_from_state(state, age)`); the unmeasured
+  staging remainder is `CAMERA_FRAME_STAGING_S` (0 until measured).
+- The worker's tick is one code path for both rigs from the concatenated
+  cloud on; the vision tick emits `BevFrame`, `PerceptionSnapshot` AND the
+  grid's `VisionFrame`.
+- **Handedness settled live**: the oracle's planner-band IoU against the
+  LiDAR cloud was 0.151 direct against 0.015 mirrored. Ground floor per ring
+  agreed with the LiDAR to +3…+9 mm out to 24 m on the one scene captured.
+- Cost: 5.5 ms per tick for the eight-camera unprojection at 960×720, plus
+  ~4 ms of colour copies.
+
+Key facts and decisions the design rested on, all still true:
 
 - **Depth decodes as `raw_float32 × far_plane`, linear metres** [measured:
   10 m read 9.65, 25 m → 24.17, 50 m → 49.51]. It is planar Z, not radial
@@ -300,8 +330,10 @@ Key facts and decisions:
   cameras. Mitigation: per-camera ego-motion compensation by estimated age,
   and tolerance in the accumulation stores; measure before trusting AEB.
 - Acceptance: BEV/WORLD indistinguishable in character from LiDAR mode;
-  `Sensor reach:`-equivalent line per camera; AEB fires on a wall (its live
-  checklist re-runs entirely — new sampling distribution).
+  `Sensor reach:`-equivalent line per camera (`Unprojection check:`); AEB
+  fires on a wall (its live checklist re-runs entirely — new sampling
+  distribution). The first two are not yet checked in the app; the third is
+  milestone 5, behind `VISION_DRIVING_ENABLED`.
 
 ## 4. Rung 1 — stereo: vision-only geometry, no networks
 
@@ -414,10 +446,15 @@ experiment at most; it must never replace the legible pipeline.
   through `attach_to_player` — the single funnel, so a half-swapped rig
   cannot exist.
 - **Module layout** keeps the one-directional rule: `config → models →
-  geometry → worker → vision_view/main_window`. `vision_view` is Qt-only and
-  BeamNGpy-free; the grid arithmetic is a pure function. Rung 0.5 adds a
-  pure `unprojection.py` (config/models/numpy only); rung 1 a `stereo.py`
-  wrapping the CUDA matcher behind the same points-out contract.
+  geometry → unprojection → worker → vision_view/main_window`. `vision_view`
+  is Qt-only and BeamNGpy-free; the grid arithmetic is a pure function.
+  `unprojection.py` (config/models/geometry/numpy only) is rung 0.5's; rung
+  1 adds a `stereo.py` wrapping the CUDA matcher behind the same points-out
+  contract.
+- **The view and the instrument set are separate toggles** (since rung 0.5):
+  WORLD / RAW BEV / CAMERAS is GUI-only; LIDAR / VISION is worker-owned and
+  re-attaches on a live switch. The CAMERAS view is enabled only by the
+  worker's `sensor_mode_changed(VISION)`.
 - **Data contracts**: `CameraMount` (per-camera optics, vehicle frame),
   `CameraImage`/`VisionFrame` (display), and — from rung 0.5 — the existing
   `points_world + colours + state` waist unchanged.

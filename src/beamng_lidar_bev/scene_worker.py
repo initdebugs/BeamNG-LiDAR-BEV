@@ -16,7 +16,7 @@ from PyQt6.QtCore import (
     pyqtSlot,
 )
 
-from .config import WORLD_STORE_REFRESH_INTERVAL_S
+from .config import WORLD_STORE_REFRESH_DUTY, WORLD_STORE_REFRESH_INTERVAL_S
 from .models import PerceptionSnapshot
 from .world_scene import WorldSceneAssembler
 
@@ -67,6 +67,7 @@ class SceneWorker(QObject):
         # refreshes; the flag makes that first refresh synchronous.
         self._last_refresh_at = -float("inf")
         self._refresh_inline = True
+        self._last_build_ms = 0.0
 
     @pyqtSlot(object)
     def submit(self, snapshot: PerceptionSnapshot) -> None:
@@ -101,7 +102,9 @@ class SceneWorker(QObject):
             return
         self._refresh_future = None
         try:
-            self.build_time_changed.emit(future.result())
+            built_ms = future.result()
+            self._last_build_ms = built_ms
+            self.build_time_changed.emit(built_ms)
         except Exception as exc:
             LOGGER.exception("3D scene store refresh failed")
             # No refresh is in flight now, so clearing from this thread is
@@ -123,16 +126,26 @@ class SceneWorker(QObject):
 
         self._collect_refresh()
         now = time.perf_counter()
+        # A build that overruns the cadence stretches the interval so the
+        # refresh thread never runs back-to-back: it shares the process with
+        # the worker tick and the compose thread, and saturating it taxes
+        # both through the GIL. See WORLD_STORE_REFRESH_DUTY.
+        interval = max(
+            WORLD_STORE_REFRESH_INTERVAL_S,
+            self._last_build_ms / 1000.0 / WORLD_STORE_REFRESH_DUTY,
+        )
         try:
             if (
-                now - self._last_refresh_at >= WORLD_STORE_REFRESH_INTERVAL_S
+                now - self._last_refresh_at >= interval
                 and self._refresh_future is None
             ):
                 self._last_refresh_at = now
                 if self._refresh_inline:
                     # First world after construction or clear: build it here
                     # so this very frame carries it.
-                    self.build_time_changed.emit(self._timed_refresh(snapshot))
+                    built_ms = self._timed_refresh(snapshot)
+                    self._last_build_ms = built_ms
+                    self.build_time_changed.emit(built_ms)
                     self._refresh_inline = False
                 else:
                     self._refresh_future = self._refresh_pool.submit(
@@ -175,6 +188,7 @@ class SceneWorker(QObject):
         self._assembler.clear()
         self._last_refresh_at = -float("inf")
         self._refresh_inline = True
+        self._last_build_ms = 0.0
 
     @pyqtSlot()
     def shutdown(self) -> None:

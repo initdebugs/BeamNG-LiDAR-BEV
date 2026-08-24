@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -68,6 +67,12 @@ from .config import (
     WORLD_GROUND_FIELD_CELL_M,
     WORLD_GROUND_FIELD_FILL_CELLS,
     WORLD_GROUND_FIELD_MAX_SPAN_CELLS,
+    WORLD_GROUND_REACH_CELLS,
+    WORLD_GROUND_REACH_GRADE,
+    WORLD_GROUND_REACH_HOPS,
+    WORLD_GROUND_SEED_HEIGHT_M,
+    WORLD_GROUND_SEED_RADIUS_M,
+    WORLD_GROUND_STEP_M,
     WORLD_MAX_BOUNDARY_POINTS,
     WORLD_MAX_COLUMNS,
     WORLD_MAX_ROAD_CELLS,
@@ -1644,6 +1649,119 @@ def _group_starts(sorted_keys: np.ndarray) -> np.ndarray:
     return np.flatnonzero(breaks)
 
 
+def connected_ground(
+    keys_xy: np.ndarray,
+    heights: np.ndarray,
+    ego_xy: np.ndarray,
+    ego_height: float,
+    cell_m: float,
+    step_m: float = WORLD_GROUND_STEP_M,
+    seed_radius_m: float = WORLD_GROUND_SEED_RADIUS_M,
+    seed_height_m: float = WORLD_GROUND_SEED_HEIGHT_M,
+    reach_cells: int = WORLD_GROUND_REACH_CELLS,
+    reach_hops: int = WORLD_GROUND_REACH_HOPS,
+    reach_grade: float = WORLD_GROUND_REACH_GRADE,
+) -> np.ndarray:
+    """
+    Which ground cells are reachable from the car by gentle steps.
+
+    `keys_xy` is `(N, 2)` integer cells, UNIQUE in (x, y), with one height
+    each; the answer is an `(N,)` mask. Two cells are joined when they are
+    4-neighbours and their heights differ by at most `step_m`; the kept set
+    is every component holding a seed -- a cell within `seed_radius_m` of
+    `ego_xy` (world metres) whose height is within `seed_height_m` of
+    `ego_height`. No seed at all (the car is over a hole in the store) keeps
+    everything, so a starved store degrades to the unfiltered picture rather
+    than to nothing.
+
+    Done on a raster rather than a graph because the cells already are one:
+    a steep edge between two occupied neighbours CUTS both cells out of the
+    label pass (scipy's, 8-connected on what remains), which is what turns a
+    height-aware connectivity question into a plain binary one. The cells it
+    cut are readmitted afterwards where they adjoin a kept cell by a gentle
+    step, so a kerb line -- which is itself the edge of a cut -- still draws
+    on the road side. A roof's rim is steep on every side, so the roof's
+    interior is its own component and never holds a seed.
+    """
+    from scipy import ndimage
+
+    count = len(keys_xy)
+    if count == 0:
+        return np.ones(0, dtype=bool)
+    x = keys_xy[:, 0].astype(np.intp)
+    y = keys_xy[:, 1].astype(np.intp)
+    x0, y0 = int(x.min()) - 1, int(y.min()) - 1
+    nx = int(x.max()) - x0 + 2
+    ny = int(y.max()) - y0 + 2
+    ix = x - x0
+    iy = y - y0
+    height = np.full((nx, ny), np.nan, dtype=np.float32)
+    height[ix, iy] = heights
+    occupied = np.zeros((nx, ny), dtype=bool)
+    occupied[ix, iy] = True
+
+    # A cell is CUT when any 4-neighbour is occupied and more than a step
+    # away in height. NaN against anything compares False, so an empty
+    # neighbour never cuts.
+    with np.errstate(invalid="ignore"):
+        dx = np.abs(height[1:, :] - height[:-1, :]) > step_m
+        dy = np.abs(height[:, 1:] - height[:, :-1]) > step_m
+    cut = np.zeros((nx, ny), dtype=bool)
+    cut[1:, :] |= dx
+    cut[:-1, :] |= dx
+    cut[:, 1:] |= dy
+    cut[:, :-1] |= dy
+
+    labels, _ = ndimage.label(occupied & ~cut, structure=np.ones((3, 3), dtype=int))
+
+    centre_x = (x.astype(np.float64) + 0.5) * cell_m
+    centre_y = (y.astype(np.float64) + 0.5) * cell_m
+    near = (centre_x - ego_xy[0]) ** 2 + (centre_y - ego_xy[1]) ** 2 <= seed_radius_m**2
+    level = np.abs(heights - ego_height) <= seed_height_m
+    seed_labels = np.unique(labels[ix[near & level], iy[near & level]])
+    seed_labels = seed_labels[seed_labels > 0]
+    if not len(seed_labels):
+        return np.ones(count, dtype=bool)
+
+    kept = np.isin(labels, seed_labels)
+    # Readmit cut cells that adjoin a kept cell by a gentle step, one pass:
+    # the kerb's own cells, the first row of a verge, the rim of a slope.
+    gentle = np.zeros((nx, ny), dtype=bool)
+    with np.errstate(invalid="ignore"):
+        ok_x = np.abs(height[1:, :] - height[:-1, :]) <= step_m
+        ok_y = np.abs(height[:, 1:] - height[:, :-1]) <= step_m
+    gentle[1:, :] |= ok_x & kept[:-1, :]
+    gentle[:-1, :] |= ok_x & kept[1:, :]
+    gentle[:, 1:] |= ok_y & kept[:, :-1]
+    gentle[:, :-1] |= ok_y & kept[:, 1:]
+    kept |= occupied & cut & gentle
+
+    # Then the fragments the bridge could not reach. At range the ground
+    # arrives as rings further apart than WORLD_ROAD_BRIDGE_CELLS closes, so
+    # a level patch of road can sit a couple of metres from the nearest kept
+    # cell with nothing between them. Each hop admits occupied cells within
+    # `reach_cells` of a kept one whose height fits a slope from it -- the
+    # step plus a grade over the gap -- so a roof two metres up beside the
+    # road still fails while a ring of road on a hill passes. Bounded hops,
+    # so a chain of fragments cannot walk out to something unreachable.
+    if not kept.all():
+        for _ in range(reach_hops):
+            distance, (near_x, near_y) = ndimage.distance_transform_edt(
+                ~kept, return_indices=True
+            )
+            candidate = occupied & ~kept & (distance <= reach_cells)
+            if not candidate.any():
+                break
+            with np.errstate(invalid="ignore"):
+                rise = np.abs(height - height[near_x, near_y])
+            allowed = step_m + reach_grade * distance * cell_m
+            added = candidate & (rise <= allowed)
+            if not added.any():
+                break
+            kept |= added
+    return kept[ix, iy]
+
+
 def _group_ends(sorted_keys: np.ndarray) -> np.ndarray:
     """Index of the last element of each run of equal values."""
     if not len(sorted_keys):
@@ -1693,12 +1811,13 @@ def merge_cell_runs(
     rather than forty stacked ones, and a box's six faces each carry their own
     shade, so the vertex cost is 24 apiece rather than 8.
 
-    **Runs along one axis are found with numpy and only the merge across the
-    other is a Python loop.** The whole thing used to iterate cells, which put a
-    dict lookup and a tuple build on every occupied 0.5 m square: measured on a
-    40 m-radius open area (17.6k road cells) that was 66 ms of meshing against a
-    40 ms tick, so WORLD ran at 9 Hz. Iterating runs instead makes the loop
-    proportional to structure rather than area.
+    **Runs along one axis are found with numpy, and since 2026-08-23 so is the
+    merge across the other.** The whole thing used to iterate cells, which put
+    a dict lookup and a tuple build on every occupied 0.5 m square: measured on
+    a 40 m-radius open area (17.6k road cells) that was 66 ms of meshing
+    against a 40 ms tick, so WORLD ran at 9 Hz. Iterating runs instead made the
+    loop proportional to structure rather than area -- and on a city scene
+    structure is still 10k runs a refresh, so the loop went too (see below).
 
     **Which axis runs along is chosen per call, and for walls it is worth an
     order of magnitude.** The loop costs one iteration per run, so scanning
@@ -1746,72 +1865,42 @@ def merge_cell_runs(
     run_y = sorted_keys[starts, 1]
     run_layer = sorted_keys[starts, 2]
 
-    rectangles: list[tuple[float, float, float, float]] = []
-    merged_values: list[np.ndarray] = []
-
-    def flush(runs: dict[tuple[int, int], list[Any]]) -> None:
-        for (x_start, x_end), (y_start, y_end, count, total) in runs.items():
-            rectangles.append(
-                (
-                    x_start * cell_size_m,
-                    (x_end + 1) * cell_size_m,
-                    y_start * cell_size_m,
-                    (y_end + 1) * cell_size_m,
-                )
-            )
-            merged_values.append(total / count)
-
-    active: dict[tuple[int, int], list[Any]] = {}
-    previous_layer: int | None = None
-    previous_y: int | None = None
-    index = 0
-    while index < len(starts):
-        row_end = index
-        while (
-            row_end < len(starts)
-            and run_layer[row_end] == run_layer[index]
-            and run_y[row_end] == run_y[index]
-        ):
-            row_end += 1
-
-        layer = int(run_layer[index])
-        row_y = int(run_y[index])
-        if layer != previous_layer or previous_y is None or row_y != previous_y + 1:
-            flush(active)
-            active = {}
-
-        spans = {
-            (int(run_x0[position]), int(run_x1[position])): position
-            for position in range(index, row_end)
-        }
-        flush({key: run for key, run in active.items() if key not in spans})
-        active = {key: run for key, run in active.items() if key in spans}
-        for span, position in spans.items():
-            if span in active:
-                run = active[span]
-                run[1] = row_y
-                run[2] += int(lengths[position])
-                run[3] = run[3] + run_sums[position]
-            else:
-                active[span] = [
-                    row_y,
-                    row_y,
-                    int(lengths[position]),
-                    run_sums[position].copy(),
-                ]
-        previous_layer = layer
-        previous_y = row_y
-        index = row_end
-    flush(active)
-
-    if not rectangles:
-        return np.empty((0, 4), dtype=np.float64), np.empty(
-            (0, values.shape[1]), dtype=np.float64
-        )
-    return (
-        np.asarray(rectangles, dtype=np.float64),
-        np.asarray(merged_values, dtype=np.float64),
+    # The merge ACROSS rows is a sort, not a loop. A run merges with the run
+    # on the next row exactly when that one has the same (x0, x1) in the same
+    # layer -- so sorting runs by (layer, x0, x1, y) puts every mergeable
+    # chain together, and a chain breaks wherever y stops being the previous
+    # y plus one. That is the greedy loop's behaviour to the rectangle: it kept
+    # a span alive only while the NEXT row carried the identical span, and
+    # flushed it at any skipped row. Measured on a car-park scene at steady
+    # state, the loop was 64 ms of a 160 ms refresh across 196 calls -- 10k
+    # Python iterations, and every one of them held the GIL, which is what
+    # starved the worker tick to 10 Hz while the refresh ran. This is ~3 ms.
+    chain_order = np.lexsort((run_y, run_x1, run_x0, run_layer))
+    c_layer = run_layer[chain_order]
+    c_x0 = run_x0[chain_order]
+    c_x1 = run_x1[chain_order]
+    c_y = run_y[chain_order]
+    chain_breaks = np.empty(len(chain_order), dtype=bool)
+    chain_breaks[0] = True
+    chain_breaks[1:] = (
+        (c_layer[1:] != c_layer[:-1])
+        | (c_x0[1:] != c_x0[:-1])
+        | (c_x1[1:] != c_x1[:-1])
+        | (c_y[1:] != c_y[:-1] + 1)
     )
+    chain_starts = np.flatnonzero(chain_breaks)
+    chain_ends = np.append(chain_starts[1:], len(chain_order)) - 1
+    counts = np.add.reduceat(lengths[chain_order].astype(np.float64), chain_starts)
+    totals = np.add.reduceat(run_sums[chain_order], chain_starts, axis=0)
+    rectangles = np.column_stack(
+        (
+            c_x0[chain_starts] * cell_size_m,
+            (c_x1[chain_starts] + 1) * cell_size_m,
+            c_y[chain_starts] * cell_size_m,
+            (c_y[chain_ends] + 1) * cell_size_m,
+        )
+    ).astype(np.float64)
+    return rectangles, totals / counts[:, None]
 
 
 @dataclass(frozen=True)
@@ -2472,13 +2561,37 @@ class WorldSceneAssembler:
         if not len(keys):
             return keys, heights, materials, limits
 
-        # Road appended LAST, so the stable sort's final entry per cell is the
-        # road reading -- the same "newest wins" mechanic `_update_road_cells`
-        # uses, doing duty here as "more specific wins".
-        packed = pack_cell_keys(keys)
-        order = np.argsort(packed, kind="stable")
-        winner = order[_group_ends(packed[order])]
-        return keys[winner], heights[winner], materials[winner], limits[winner]
+        # ONE height per (x, y), and the layer field no longer separates
+        # anything here -- see WORLD_GROUND_STEP_M in config for why. The
+        # candidate nearest the ego's own ground plane wins the cell: the
+        # ground under a parked car beats its roof, the road beats the
+        # hedge top beside it, and a bridge deck the car is ON beats the road
+        # seen beneath it. Road is appended last and gets a tie-break of its
+        # own, so an exact tie between a road reading and a promoted one at
+        # the same height still goes to the more specific claim.
+        ego_ground = float(ego[2]) + snapshot.vehicle_geometry.ground_z_vehicle
+        xy_packed = pack_cell_keys(
+            np.column_stack((keys[:, 0], keys[:, 1], np.zeros(len(keys), np.int32)))
+        )
+        distance = np.abs(heights - ego_ground).astype(np.float64)
+        distance[len(promoted):] -= 1e-6
+        order = np.lexsort((distance, xy_packed))
+        winner = order[
+            np.flatnonzero(
+                np.r_[True, xy_packed[order][1:] != xy_packed[order][:-1]]
+            )
+        ]
+        keys = keys[winner]
+        heights = heights[winner]
+        materials = materials[winner]
+        limits = limits[winner]
+        # The layer is spent: with one height per (x, y) it separates nothing,
+        # and left in place it would stop `bridge_gaps` joining two cells of
+        # one surface that straddle a 0.75 m contour -- the x pass and the y
+        # pass then each invent a filled cell at the same (x, y) in different
+        # layers, which is a stack again and the slow corner path again.
+        keys[:, 2] = 0
+        return keys, heights, materials, limits
 
     def _ground_mesh(
         self,
@@ -2554,6 +2667,22 @@ class WorldSceneAssembler:
             cells, values = bridge_gaps(
                 cells, values, axis, WORLD_ROAD_BRIDGE_CELLS
             )
+        # ...and only the ground the car can reach by gentle steps is ground.
+        # AFTER bridging, because the lattice is only dense once the sampling
+        # gaps are closed: before it, a ring-sampled road is rows of cells
+        # with empty cells between them and nothing is connected to anything.
+        # See WORLD_GROUND_STEP_M.
+        ego = np.asarray(snapshot.ego_pos_world, dtype=np.float64)
+        reachable = connected_ground(
+            cells[:, :2],
+            values[:, 0],
+            ego[:2],
+            float(ego[2]) + snapshot.vehicle_geometry.ground_z_vehicle,
+            WORLD_CELL_SIZE_M,
+        )
+        if not reachable.all():
+            cells = cells[reachable]
+            values = values[reachable]
         # Each cell contributes its values to its own four lattice corners; a
         # corner holds the mean of the cells touching it. A corner holds ONE of
         # each, which is the whole reason the surface is continuous: two cells

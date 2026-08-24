@@ -1772,3 +1772,47 @@ def test_the_watch_ends_when_the_bridge_opens_and_not_before() -> None:
     _run_watch(connected)
     assert not connected._launch_watch.running
     assert not connected._fatal
+
+
+def test_a_refused_actor_poll_backs_off_instead_of_retrying_every_tick() -> None:
+    """
+    BeamNG.tech rejects `vehicles.get_states` in free-roam -- the normal
+    workflow -- and each rejected round trip still blocks the worker thread
+    for ~39 ms (plus 120 ms for the 1 Hz registry refresh). Retried every
+    100 ms, that was roughly half of every second spent waiting on the socket
+    for nothing, which is most of what a 10 Hz tick looked like. One refusal
+    must rest BOTH round trips for WORLD_ACTOR_RETRY_S, and the log gets one
+    warning, not ten tracebacks a second.
+    """
+    from types import SimpleNamespace
+
+    from beamng_lidar_bev.config import WORLD_ACTOR_RETRY_S
+
+    calls = {"states": 0, "registry": 0}
+
+    class Vehicles:
+        @staticmethod
+        def get_current_info(include_config: bool = False):
+            calls["registry"] += 1
+            return {"clone": {"model": "x"}}
+
+        @staticmethod
+        def get_states(ids):
+            calls["states"] += 1
+            raise RuntimeError("The request was not handled by BeamNG.tech")
+
+    worker = BeamNgWorker()
+    worker._bng = SimpleNamespace(vehicles=Vehicles())  # type: ignore[assignment]
+    worker._player_vid = "thePlayer"
+
+    worker._poll_actor_observations(1000.0)
+    assert calls == {"states": 1, "registry": 1}
+
+    # Every tick for the next retry window: no further round trips at all.
+    for tick in range(1, 50):
+        worker._poll_actor_observations(1000.0 + tick * 0.1)
+    assert calls == {"states": 1, "registry": 1}
+
+    # Past the window it asks once more.
+    worker._poll_actor_observations(1000.0 + WORLD_ACTOR_RETRY_S + 0.2)
+    assert calls["states"] == 2
