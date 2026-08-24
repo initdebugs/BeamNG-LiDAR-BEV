@@ -186,6 +186,7 @@ LOGGER = logging.getLogger(__name__)
 # sensor_mode_changed, and the mode only takes physical effect at attach (a
 # switch mid-stream re-attaches through the same single funnel).
 SENSOR_MODE_LIDAR = "LIDAR"
+SENSOR_MODE_HYBRID = "HYBRID"
 SENSOR_MODE_VISION = "VISION"
 
 UNKNOWN_SEMANTIC_RGB = np.asarray((1, 2, 3), dtype=np.uint8)
@@ -799,7 +800,11 @@ class BeamNgWorker(QObject):
         `_cleanup_sensors`, so a half-swapped rig cannot exist.
         """
         mode = str(mode).upper()
-        if mode not in (SENSOR_MODE_LIDAR, SENSOR_MODE_VISION):
+        if mode not in (
+            SENSOR_MODE_LIDAR,
+            SENSOR_MODE_HYBRID,
+            SENSOR_MODE_VISION,
+        ):
             LOGGER.warning("Ignoring unknown sensor mode %r", mode)
             return
         if mode == self._sensor_mode:

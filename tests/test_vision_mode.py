@@ -27,6 +27,7 @@ from beamng_lidar_bev.vision_view import (
     wants_prescale,
 )
 from beamng_lidar_bev.worker import (
+    SENSOR_MODE_HYBRID,
     SENSOR_MODE_LIDAR,
     SENSOR_MODE_VISION,
     BeamNgWorker,
@@ -600,6 +601,21 @@ def test_switching_mode_mid_stream_reattaches_through_the_one_funnel() -> None:
 
     assert reattaches == [True]
     assert modes == [SENSOR_MODE_VISION]
+
+
+def test_switching_to_hybrid_mid_stream_reattaches_once() -> None:
+    worker, _ = _armed_vision_worker([StreamingCameraStub()])
+    worker._sensor_mode = SENSOR_MODE_LIDAR
+    calls: list[bool] = []
+    modes: list[str] = []
+    worker.attach_to_player = lambda: calls.append(True)  # type: ignore
+    worker.sensor_mode_changed.connect(modes.append)
+
+    worker.set_sensor_mode(SENSOR_MODE_HYBRID)
+    worker.set_sensor_mode(SENSOR_MODE_HYBRID)
+
+    assert calls == [True]
+    assert modes == [SENSOR_MODE_HYBRID]
 
 
 def test_a_mode_change_while_idle_only_records_the_choice() -> None:

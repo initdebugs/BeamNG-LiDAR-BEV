@@ -47,7 +47,12 @@ from .geometry import CAMERA_NAMES
 from .models import BevFrame, VehicleGeometry, VisionFrame
 from .scene_worker import SceneWorker
 from .vision_view import VisionView
-from .worker import SENSOR_MODE_LIDAR, SENSOR_MODE_VISION, BeamNgWorker
+from .worker import (
+    SENSOR_MODE_HYBRID,
+    SENSOR_MODE_LIDAR,
+    SENSOR_MODE_VISION,
+    BeamNgWorker,
+)
 from .world_view import WorldView
 
 LOGGER = logging.getLogger(__name__)
@@ -118,11 +123,17 @@ def bridge_wait_message(waited_s: float) -> str | None:
 
 def resolve_sensor_mode(requested: str | None) -> str:
     """A persisted instrument-set choice; anything unrecognised is LiDAR."""
+    mode = str(requested or "").upper()
     return (
-        SENSOR_MODE_VISION
-        if str(requested or "").upper() == SENSOR_MODE_VISION
+        mode
+        if mode in (SENSOR_MODE_LIDAR, SENSOR_MODE_HYBRID, SENSOR_MODE_VISION)
         else SENSOR_MODE_LIDAR
     )
+
+
+def sensor_mode_has_cameras(mode: str) -> bool:
+    """Whether an instrument mode includes the camera view's images."""
+    return mode in (SENSOR_MODE_HYBRID, SENSOR_MODE_VISION)
 
 
 def controls_offered(sensor_mode: str) -> bool:
