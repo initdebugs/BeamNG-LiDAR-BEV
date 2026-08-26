@@ -76,7 +76,12 @@ class BngStub:
 
 def test_vehicle_state_uses_free_roam_compatible_sensor() -> None:
     vehicle = VehicleStub()
-    worker = SimpleNamespace(_vehicle=vehicle, _self_driving=False)
+    # Parking counts as driving for the electrics poll: engaging it turns
+    # self-driving off, and without the gearbox reading every shift waits
+    # out its dwell blind.
+    worker = SimpleNamespace(
+        _vehicle=vehicle, _self_driving=False, _parking_driving=False
+    )
 
     state = BeamNgWorker._get_vehicle_state(worker)  # type: ignore[arg-type]
 

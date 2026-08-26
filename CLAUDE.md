@@ -455,6 +455,410 @@ Measured after: **mean 133 and 153 with 0.00% and 0.03% clipped**.
   `Research.Camera.getUseManualEV(id)` and `getManualEV(id)` on a freshly created
   sensor. `tools/camera_exposure_probe.py` does exactly that and then sweeps.
 
+### Training capture: the annotation channel CANNOT be the label (2026-08-24)
+
+**Two lots in the same session annotate their bays differently, and the camera
+sees the same thing on both.** One returns its dividers as thin marking lines,
+which `parking`'s stripe sweep handles. The other returns whole bay quads as
+solid slabs several metres wide — a slab is not a stripe, so
+`PARKING_STRIPE_MAX_WIDTH_M` rejects every one and the lot yields **no bays at
+all**. This is the decal-quad problem CLAUDE.md already records for
+`DRIVING_INSTRUCTIONS` and `SPEED_BUMP`, in its worst form: it is not that the
+annotation is coarse, it is that it means something *different per lot* with
+nothing in the data to say which.
+
+The camera images from those same two lots are indistinguishable in kind: thin
+white lines on grey tarmac. So the inconsistency lives entirely in the
+annotation layer, which is what makes a vision model the right instrument and
+makes **hand labelling the only honest source of ground truth** — an oracle
+that is right on one lot and wrong on the next cannot supervise a model meant
+to work on both.
+
+`capture.py` (config + numpy + stdlib; Qt-free and BeamNGpy-free like `planner`,
+`aeb` and `parking`) is the recording half, and it is **in the app rather than
+under `tools/` for one hard reason: the bridge takes exactly one client.** Every
+probe under `tools/` carries "STOP in the app, or close it" for that reason, so
+a capture script cannot run while the app is driving. Recording has to happen
+where the connection already is.
+
+Five things are load-bearing:
+
+- **`offer` never blocks and never raises into the tick.** It is called from
+  `_poll_once` ahead of `_actuate`, so a bounded queue DROPS a sample and counts
+  it rather than waiting — the rule the camera digest was already written to
+  after whole-buffer hashing cost a measured 9.8 ms of the 40 ms tick and
+  delayed every control and AEB command. JPEG encoding and the disk are on the
+  writer thread. `test_a_full_queue_drops_the_sample_rather_than_blocking_the_tick`
+  wedges the writer for 30 s and pins that the tick side stays under a second.
+- **A sample also needs the car to have MOVED** (`CAPTURE_MIN_TRAVEL_M`).
+  Parking up to label bays is the normal workflow, and a standstill re-samples
+  the same rays from the same place — five minutes of labelling would
+  otherwise write ~600 samples of one identical picture, which is precisely
+  what `CAPTURE_INTERVAL_S` is slow to avoid. The stopped pose is still
+  captured once, because the sample that arrived there passed the test.
+- **A sample is recorded only when a camera actually REFRESHED.** The tick
+  re-reads held frames far faster than the cameras update, so pairing a held
+  frame with a new pose asserts that the car moved and the picture did not —
+  which is precisely the relation the unprojection would be trained on.
+  `_cameras_fresh_since_capture` is sticky until a sample is taken, so a tick
+  that happens to be a re-read cannot make the window look stale.
+- **The frames are taken BY REFERENCE, and that is safe by construction.**
+  `_acquire_hybrid_camera_images` rebinds `_hybrid_camera_frames[name]` to a
+  fresh `live.copy()` on every refresh rather than writing into the array in
+  place, so a reference the writer thread still holds can never be overwritten.
+- **The rig is written into `meta.json` per session.** `derive_hybrid_camera_rig`
+  measures from the body faces in the simulator's own sensor frame, so a
+  different car gives different mounts; a dataset that assumed today's constants
+  would mislabel every frame shot in another vehicle.
+
+**Labels live INSIDE the recording session**, and that pairing is what avoids
+inventing a stable identity for the map — two levels can use overlapping world
+coordinates and nothing in the bridge reports a level name this code can rely on
+across BeamNG versions. So `set_labelling` refuses without an open session and
+says why. `BayLabelStore` is rewritten whole and replaced atomically on every
+change: the file is kilobytes, and a crash must cost the click in progress
+rather than the hour of clicking before it.
+
+**A click becomes a world point in the WORKER, not in the view.** `WorldScene.qml`
+gained `pickGroundPoint`, which raycasts the road mesh and hands
+`SceneBridge.groundPicked` a scene position; that is relabelled into BEV metres
+(`right, -z`, exactly as `parkingPicked` does) and the worker — which owns the
+pose — turns it into world XY. The same division of labour the bay pick already
+uses: **QML answers where in the scene, Python answers what that means.** Four
+consequences:
+
+- **`pickParkingBay` had to move from `pick` to `pickAll`.** The ground is
+  pickable now, and a single `pick` returns only the nearest hit, so a grazing
+  ray that met the road first would report a miss over a bay the click was
+  plainly on. Searching the list makes the two pickable surfaces independent.
+- **The pose is one tick stale by construction.** A label is placed standing
+  still, where that is sub-millimetre. Carrying the pose in `WorldFrame` instead
+  would be exact and would touch `models`, `world_scene` and every test that
+  builds one, to fix an error smaller than the click.
+- **`LABEL_MAX_RANGE_M` (30 m) refuses the far field.** The raycast will happily
+  answer 150 m out on a surface built from a handful of returns, and a label
+  there records the accumulated store's error rather than the paint's.
+- **There is a genuine hole in the ground mesh under the car** —
+  `outside_ego_body` culls every return inside the body, so no ground is ever
+  accumulated there and a click on the ego footprint correctly returns nothing.
+
+**Measured on the real GPU, not reasoned about**, per the pixel-questions rule:
+`tools/label_pick_probe.py` drives the real `WorldScene.qml` with the synthetic
+street from `preview_world.py`, fires `pickGroundPoint` at a grid of screen
+positions and prints the BEV metres. Measured: centre screen at 0.45/0.60 height
+returns 13.97 m and 5.38 m forward at 0.00 m right; 0.35 and 0.65 across at the
+same height return -3.26 m and +3.26 m; the sky and the ego footprint both
+return nothing. Signs, ordering and symmetry all hold.
+
+**The first real session measured two defects in the labelling, and both are
+fixed in the store rather than detected downstream** (12 labels over a small
+lot, 51 samples, 28 MB):
+
+- **Four clicks in the wrong ORDER make a bowtie, and no list of coordinates
+  looks wrong.** One bay of twelve came back with a shoelace area of 0.2 m²
+  against a true 17.5 — every corner in the right place, the polygon between
+  them crossing itself. `_wound` sorts corners by bearing about their centroid
+  on the way in, which always yields the simple polygon for a convex set, so
+  click order cannot matter. Removed rather than validated.
+- **A re-click on a second pass silently appended a second label.** Three pairs
+  0.10–0.16 m apart, so the count on screen read twelve over nine places — and
+  that count is the only thing a person labelling has to go on.
+  `LABEL_DUPLICATE_M` (1.5 m, well under `PARKING_BAY_WIDTH_MIN_M`) makes a
+  completed bay REPLACE its twin, because the usual reason to re-click a bay is
+  that the first attempt was bad, and `LabelResult.replaced_index` is what lets
+  the worker say so instead of reporting a bay it did not add.
+
+- **A row of bays SHARES its dividers**, so every interior line gets clicked
+  twice and twice at slightly different places — one painted line described as
+  two. A click within `LABEL_SNAP_M` (0.5 m) of a corner already labelled lands
+  exactly ON it, so the shared edge is genuinely shared and the second bay can
+  be clicked roughly. It searches the pending quad as well as the saved bays.
+  **The snap radius IS the labelling precision**, and that resolves its one
+  conflict with the replacement rule above: re-clicking a bay to move a corner
+  less than 0.5 m snaps straight back, which is correct because the first
+  session's own click scatter was ~0.2 m — a correction smaller than the noise
+  is not a correction. Move a corner further and it does not snap.
+
+**One quad can be a whole ROW, and on some lots that is the only way to label
+at all.** A lot whose annotation covers whole bay quads rather than the divider
+lines has no interior dividers in the sensor data — WORLD draws one solid white
+slab and there is nothing to click. The slab's OUTLINE is visible, and the bay
+count is readable from the simulator's own window, so `LABEL_MAX_ROW_BAYS` lets
+four clicks plus a number describe the row. It is also 4 clicks instead of 4N on
+lots where the lines DO show. Three rules:
+
+- **The split axis is neither asked for nor taken from click order** (winding
+  makes order meaningless). Both axes are divided and the one whose bays land
+  inside the detector's own size bounds wins. Dividing the LONGER side is the
+  obvious rule and is wrong: two 2.4 m bays are 4.8 m across against a 5.5 m
+  depth, so the longer side is the depth and the row gets sliced into two
+  2.75 m-deep bays no lot has.
+- **At TWO bays the size test does not separate them, and the quad is refused
+  rather than guessed.** Measured over the bounds (width 2.1–3.4, depth
+  3.6–7.5), a 4.8×5.5, a 6.0×5.0 and a 6.4×5.5 quad each divide two ways that
+  are both entirely plausible, and no tie-break survives contact — prefer the
+  longer side and the first goes wrong, prefer the squarer bays and the second
+  does. At three and above the sizes resolve it uniquely every time, because
+  slicing a bay's depth three ways leaves something under a metre wide. Two bays
+  is eight clicks.
+- **A refused quad KEEPS its corners.** The count was wrong, not the clicking,
+  so only the number has to change; `BayLabelStore.split_refusal` carries the
+  reason in words and Undo abandons the corners.
+
+The nine good bays measured 3.08–3.28 m by 5.39–5.74 m, consistent enough that
+the clicking itself is clearly accurate; the width sits near the top of the
+detector's `PARKING_BAY_WIDTH_MAX_M`, which is the lot rather than the labeller.
+
+**`tools/dataset_report.py` is the instrument, and the visibility count is the
+number that matters.** Not "51 frames and 12 bays" but the (frame, camera, bay)
+triples where the bay was in shot — 296 over that session, spread 17/44/39%
+across 0–10/10–20/20–35 m, every bay seen by both cameras. A session that drove
+past its bays looking the other way reads as a big directory and almost no
+sightings. It answers visibility with a BEARING test rather than a full
+unprojection (ignoring occlusion and the vertical field), so it is an upper
+bound, and it needs neither BeamNG nor a GPU. `--repair` re-winds and
+de-duplicates labels placed before the store learned to, keeping `bays.json.bak`.
+
+**Five sessions in, the corpus reads 238 samples / 476 images / 49 bays over
+four lots, 1,511 sightings**, and three more instrument findings came out of it:
+
+- **A row divided evenly TAPERS if its quad is not square**, and every bay in
+  the row carries the same error. Measured: one 4-bay row ran 5.30 m deep at one
+  end and 4.47 at the other, each bay carrying a 0.28 m opposite-side mismatch
+  from a single outer corner clicked long. The report's `_SQUARE_TOLERANCE_M`
+  check is what surfaces it, and it is NOT mendable — `--repair` is offered only
+  for crossed corners and duplicates, because a skewed quad is a clicking
+  problem and pretending to fix it would invent geometry.
+- **A session recorded with the labelling never armed is a normal thing to
+  find**, not an error: 45 samples supervising nothing. Labels live inside the
+  session they were clicked in and cannot be added afterwards, so the only
+  remedies are to re-drive the lot or delete the directory — the report says so
+  rather than raising `FileNotFoundError` at it.
+- **The camera balance is per-LOT one-sided even when the corpus is not.** A row
+  driven from one side is served almost entirely by the camera facing it (269/54
+  and 420/104 on two sessions, in opposite directions on a third), which
+  aggregates to a healthy 60/40 while every individual lot is a single
+  viewpoint. Driving a row both ways is what fixes it, and `--all` is what makes
+  it visible.
+
+**Not live-checked**, and its checklist is: that RECORD writes growing
+`captures/<timestamp>/` directories with frames from BOTH cameras (`Capture
+check:` reports totals every 30 s, and a `DROPPED` count means the disk is not
+keeping up); that the tick does not visibly slow while recording, which the
+queue design says it cannot but only a drive proves; that four clicks in WORLD
+put a bay in `bays.json` whose corners land on the paint when re-projected;
+that the click lands where the cursor is at a camera orbit and a zoom, since
+the raycast is measured only at the default pose; and that a lot like the
+second one above — solid-slab annotations, no detected bays — can still be
+labelled in full, which is the whole case this exists for.
+
+### Pixel to ground, and it was right first time (2026-08-25)
+
+`projection.py` (config + models + geometry + numpy; Qt-free and BeamNGpy-free
+beside `capture` and `parking`) is the piece everything downstream waited on. It
+answers both directions: `project` puts world points on the image, which is what
+draws a label onto a recorded frame; `ground_points` puts pixels on the ground
+through a plane, which is the direction a paint model's output travels.
+
+**It is not the deleted `unprojection.py`.** That one decoded the engine's DEPTH
+buffer and went with VISION mode. What is recovered from it is the part that was
+about the CAMERA — `camera_basis` and the pinhole focal length, both measured
+live against the LiDAR cloud before deletion. HYBRID's cameras render colour
+only, so nothing about depth survives.
+
+Three conventions carry it, and each was a thing this project had already been
+wrong about once:
+
+- **A vehicle-frame vector is `-x·right − y·forward + z·up` in world.** +X is
+  LEFT and +Y is REARWARD, exactly as `derive_vehicle_geometry` builds its
+  extents (`left = -right`, `rearward = -forward`). Both flips or neither.
+- **`sensor_origin_vehicle` is added back on ALL THREE axes**, because the mount
+  probe measured a pure translation. `derive_hybrid_camera_rig` subtracts it on
+  x and y, so the pair cancels to the intended station.
+- **Image v runs DOWN**, so the row is `cy − f·y/z`. A sign error there mirrors
+  every projection about the horizon and still yields plausible pixels.
+
+**Verified against the real corpus, not against itself.**
+`tools/label_overlay.py` draws the hand-clicked bays onto the frames that saw
+them, and `--measure` sweeps a perpendicular brightness profile across each
+projected bay divider to find where the paint actually is. Measured over 17
+sessions, 234 dividers inside 20 m:
+
+| | |
+|---|---|
+| **bias** | **+0.00 px = +0.0 cm** |
+| per band | +0.51 / −0.23 / +0.07 px at 0–8 / 8–14 / 14–20 m |
+| spread | median 11.7 cm, p90 25.3 cm |
+
+The zero bias is the result: a wrong mount, a wrong focal length or a wrong axis
+sign all show up as a non-zero mean, and a wrong camera HEIGHT shows up as one
+that grows with range. Neither is there. **The residual spread is the CLICKING**
+— it matches the scatter already visible in the bay dimensions the dataset
+report prints, and it is why the quad is best trained as a bay REGION rather
+than as four thin lines: 12 cm on a 3 × 5.5 m rectangle is nothing, and on a
+0.12 m painted line it is everything.
+
+Two honest limits. The ground is a **flat plane at the ego's own ground plane**,
+because a recorded sample carries the pose and no terrain — `groundPicked` drops
+the render Y, so the stored corners have no height. Live, this should intersect
+`world_scene.GroundField` instead, which is the surface actually drawn and
+carries its own confidence mask. And a ray above the horizon meets the plane
+BEHIND the camera; `ground_points` reports no hit rather than that point, which
+is exactly the arithmetically-perfect nonsense that poisons a dataset silently.
+
+### The masks: an IGNORE class is what makes the dataset honest (2026-08-25)
+
+`tools/build_dataset.py` projects the clicked bays into every frame that saw
+them and fills them into a per-pixel mask -- the bridge between `capture` and
+anything trained. Four rules, and the first was found by LOOKING at the output
+rather than by reasoning about it:
+
+- **Class 255 IGNORE, or the dataset teaches the opposite of what is wanted.**
+  177 bays were clicked and far more were driven past, so a frame routinely
+  holds a whole row of obvious painted bays nobody labelled. The first preview
+  showed a mask covering a sliver at the frame edge with an entire painted row
+  supervised as BACKGROUND. Systematic false negatives are the worst label
+  noise there is: the model is told the thing it is looking for is not there,
+  in exactly the places it is. A pixel is trusted background only when its ray
+  misses the ground entirely (sky, a wall, a car -- never a bay) or lands within
+  `_TRUSTED_BACKGROUND_M` (4 m) of a bay somebody actually clicked; all other
+  tarmac is ignored. Measured on the built set: 4.6% bay, 0.8% divider, 69.3%
+  background, **25.4% ignored**.
+- **Three positive-ish values, because 12 cm of clicking error means different
+  things to a region and to a line.** 1 is the bay interior, 2 a 0.30 m band
+  along the two long edges -- the painted dividers, built in WORLD metres and
+  then projected so it stays perspective-correct. `label_overlay --measure` put
+  the labelling scatter at a median 11.7 cm, which is nothing across a
+  3 x 5.5 m rectangle and is the whole width of a 0.12 m line. Train the REGION.
+- **The split is by LOT, never by frame**, and smallest-lot-first. Samples 0.5 s
+  apart are near duplicates, so a random split reports a meaningless score.
+  Largest-first overshoots by a whole lot -- one lot holds a third of this
+  corpus, and asking for 20% held out 39%; a lot is indivisible, so the target
+  has to be approached from below.
+- **A bay counts when all four corners are in FRONT of the lens**, not when they
+  are inside the frame. A bay running off the edge is good signal for the part
+  that shows; a corner behind the camera projects to a mirror-image quad that is
+  arithmetically perfect and completely wrong.
+
+**Occlusion is the known hole**: a bay behind a parked car is still filled,
+which teaches a model to see paint through metal. It needs the car positions
+recorded per frame, which `capture` does not do -- the fitted boxes live on the
+scene thread, not the worker.
+
+### The first trained model, and what it measured (2026-08-25)
+
+`tools/train_paint.py` trains a small U-Net on the masks, in `.venv-train`
+rather than the app's venv — PyTorch is three gigabytes and has no business in a
+process answering a 40 ms tick; only the ONNX export comes back. Three Windows
+traps found by running it, all fixed: a `Dataset` defined inside a function
+cannot be pickled to `spawn`-ed DataLoader workers; torch 2.11's ONNX exporter
+needs a separate `onnxscript` and its failure must NOT be fatal after training
+has finished; and it prints a tick emoji into a cp1252 console, so the export
+dies with `UnicodeEncodeError` AFTER doing the work.
+
+**First run: 30 epochs, 1928 train / 283 val over 5 training lots, best bay IoU
+0.265.** Training loss fell 0.77 → 0.28 while validation IoU was flat from epoch
+4 — textbook overfitting on 5 lots. Measured on validation: **recall 57%,
+precision 46%**, over-predicting by only 1.2x inside the region it is scored on.
+
+**The previews look far worse than those numbers, and reading them naively is a
+mistake this section exists to prevent.** They show large predicted areas over
+apparently empty tarmac — but most of that sits in the IGNORED 34%, which is
+exactly where the unlabelled bays are, so an unknown share of it is *correct*
+and unscorable. The honest statement is that 0.265 is a LOWER BOUND, and that
+precision in particular is measured against labels known to be incomplete even
+inside the supervised region (an unlabelled bay adjacent to a labelled one falls
+within `_TRUSTED_BACKGROUND_M`).
+
+**`BayLabelStore.complete` is the flag that breaks the loop** (the "Every bay
+here is labelled" tick in TRAINING DATA, written into `bays.json`). It is a
+claim about the SESSION, because that is what the frames belong to: every bay
+driven past in it is labelled. `build_dataset` then skips the ignore map
+WHOLE for that session -- measured on a real frame, 54.3% ignored becomes 0% --
+so all of its tarmac becomes supervised background and the model can finally be
+told that a given patch is NOT a bay. Absent means partial, so every session
+recorded before the flag existed reads as what it actually was. **Ticking it
+when it is not true is worse than leaving it off**: it converts every missed bay
+into a confident false negative, which is the failure the ignore map was added
+to prevent in the first place.
+
+**`--val-session` is the cheap half of the fix, and it buys a MEASUREMENT
+rather than a model.** Precision against partial labels is unknowable — a bay
+the model found and nobody clicked scores as a false positive — so a single
+COMPLETE session held out is worth more than the same effort spread over
+training. Measured after marking one: val ignored **0.0%** against 28.8% in
+training. It takes the nominated session's whole LOT out of training and DROPS
+the lot's other sessions rather than reusing them: they are different drives
+past the SAME bays, so training on them is training on the validation answers —
+the identical leak lot-splitting exists to stop, which does not stop being a
+leak because the split was asked for by name. Nominating a session that is not
+marked complete warns and proceeds.
+
+**The complete-validation run REFUTED the labels-are-the-problem hypothesis,
+and that is the most useful thing measured so far.** Held out on the one
+COMPLETE session (157 images, 0.00% ignored, every pixel known): **precision
+46.3%** against 46% on the partial labels it replaced. Identical. The false
+positives were NOT unlabelled bays; the model really does put bay pixels where
+there are none. Recall rose to 68.7% and IoU to 38.2%, but those are a different
+lot and not comparable — precision is the number the experiment was for, and it
+did not move.
+
+What it does NOT refute is the training side: the TRAIN split is still 28.8%
+ignored, so the model was fitted with very weak negatives. Completing labels may
+still fix the model; it cannot be blamed for the measurement any more.
+
+**Three configuration experiments moved nothing, and that is the result.** All
+on the same complete-label validation session, so all comparable:
+
+| run | bay/paint IoU | precision | recall |
+|---|---|---|---|
+| region, class weight 0.5 | 0.344 | 46% | 69% |
+| region, class weight 0.25 | 0.344 | 47% | 77% |
+| **lines** (divider band only) | **0.181** | **21%** | 69% |
+
+- **The LINES target is much worse, and it was my suggestion.** The reasoning
+  looked good — a bay interior is featureless tarmac and the paint is the only
+  visible feature — and the measurement refuted it. Sweeping the whole PR curve
+  rather than trusting argmax, its best operating point is F1 33.7% against the
+  region target's 55.3%, so it is not a threshold artifact: the model genuinely
+  cannot separate paint from tarmac. In hindsight the reason is the reason
+  regions were chosen first: the labels sit ~12 cm off the real paint, and
+  widening the band to contain it (0.50 m, derived) makes the target align with
+  no visible feature at all. 12 cm across a 3 x 5.5 m rectangle is nothing;
+  across a line it is everything.
+- **Class weighting is not the dial either.** Inverse-sqrt gives the positive
+  class ~8x the background's, which looked like the cause of the over-prediction
+  — and at 0.25 the numbers are identical. Per-epoch precision swings 0.44-0.51
+  at a FIXED configuration, so a single flattering epoch means nothing; that is
+  how the weighting change was briefly mis-read as a 9-point gain.
+
+Two bugs the runs caught, both mine: `best.pt` was shared across targets so the
+lines experiment DESTROYED the region model (checkpoints are per-target now),
+and `positive = len(values) - 1` selected DIVIDER for the region target, so the
+"best" checkpoint was chosen on the wrong class while the log column said bay.
+
+**The previews say where to go next, and it is the DATA rather than the target.**
+The predicted DIVIDER bands visibly follow the real painted lines; the predicted
+REGION is the ragged part, spilling across the aisle. That is exactly what the
+geometry predicts: a bay interior is featureless tarmac, identical to the aisle
+in front of it, and the only thing that distinguishes them is the paint at the
+boundary. Asking a segmenter for the region is asking it to infer an area from
+its edges; asking it for the LINES is asking for the thing that is actually
+visible. The pairing from lines to bays already exists, is well tested, and is
+better at it than a U-Net: `parking.find_bays` over `MarkingMemory`. The region
+target was chosen because 12 cm of clicking scatter is a whole line-width —
+which remains true, and is an argument for a WIDE divider band, not for
+abandoning lines.
+
+**Superseded by the run above, kept for the reasoning:** the binding constraint
+looked like the LABELS rather than the model. More epochs cannot help
+a run that plateaued at epoch 4, and a bigger model cannot help one already
+overfitting. What would: labelling a lot COMPLETELY and recording that it is
+complete, so all of its tarmac becomes trusted background and both the training
+signal and the precision measurement stop being blind. Partial labelling is what
+forced the ignore mask, and the ignore mask is what makes the score
+uninterpretable.
+
 ### Frame pipeline
 
 `worker._poll_once` (every `DISPLAY_INTERVAL_MS`) → `sensor.stream()` on all four LiDARs →
@@ -2510,6 +2914,66 @@ go quiet, not silently become its neighbour. A click that hits no bay emits
 different message from "select the bay here" and a fabricated coordinate would depend on the
 match radius to stay a miss.
 
+### A lot that annotates whole QUADS still has to yield bays (2026-08-25)
+
+**Some lots return their bay dividers as thin marking lines and some return the whole bay quads as
+solid slabs, and the camera sees the same thing on both.** CLAUDE.md already records this from the
+labelling side; from the detector's it was total. `_stripes` keeps only offset runs narrower than
+`PARKING_STRIPE_MAX_WIDTH_M`, and a filled row is one run metres across, so every run was
+discarded. Measured on a synthetic six-bay row:
+
+| annotation | marking cells | dividers | bays |
+|---|---|---|---|
+| divider lines | 378 | 7 | 6 |
+| whole bay quads | 2,430 | 0 | **0** |
+
+And **every rejection counter read zero**, so the `Parking check:` line could not tell "the paint
+never annotated" from "the paint annotated as something this scan throws away" -- opposite
+problems with the same log line. `ScanReport.slabs_found` is what separates them.
+
+A run too wide to be a divider is now read as a bay ROW. One of its extents is a bay DEPTH and the
+other is the row's length, settled by `PARKING_BAY_MIN/MAX_DEPTH_M` rather than by assuming the
+longer side -- the same trap CLAUDE.md records for the hand labeller, where two 2.4 m bays measure
+4.8 m across against a 5.5 m depth, so the longer side is the DEPTH and slicing it invents bays no
+lot has. Dividing the length by `PARKING_SLAB_NOMINAL_WIDTH_M` gives the count, and the result is
+emitted as synthetic `_Stripe`s rather than as finished bays, so it passes through the same
+pairing, width, depth and occupancy filters every real divider does.
+
+Four things are load-bearing, and the first two were found by the tests going red:
+
+- **The count is a considered GUESS and cannot be anything else.** The dividers are exactly what
+  the annotation did not draw, and 18 m of frontage divides into 6 or 7 bays at widths that are
+  both entirely plausible -- measured, a six-bay row comes back as seven. That is why these are
+  candidates a person clicks, never something that steers on its own.
+- **A wide run is only a row when it is actually FILLED**, and getting this wrong does not merely
+  add wrong bays -- it CONSUMES the cells every later sweep needed. Separate rows, and dividers
+  too far apart to bound a bay, project onto the same wide band of offsets at some sweep angle:
+  measured, three rows worth 4 + 4 + 3 bays apart came back as **4 together**, because the first
+  sweep read the lot as one slab and left nothing behind it. A separate case turned four dividers
+  9 m apart into two invented bays. A filled quad is nearly solid at `PARKING_MARKING_CELL_M` --
+  2,430 cells of a possible 2,385 -- while merged lines fill under a fifth of their bounding box,
+  so `PARKING_SLAB_MIN_FILL` separates them with room to spare.
+- **A slab is claimed only once it has yielded dividers**, for the same reason an offset run that
+  bounds no bay is left in the cloud.
+- **NOT EVERYTHING ANNOTATED IS A BAY**, and this is the honest limit. Reported live: parking in
+  the outermost bay of a row whose annotation ran on past it over a hatched chevron zone that is
+  not a bay at all -- and it varies by lot. A solid quad carries nothing to tell them apart, so
+  what can be used is the SHAPE: only a contiguous stretch of columns that are one bay deep is
+  divided (`PARKING_SLAB_COLUMN_DEPTH_FRACTION`), which trims a zone of a different depth from the
+  row it adjoins. **A hatched area of the same depth is indistinguishable here and will be
+  offered.** The real answer for that case is the paint model -- the camera images from these lots
+  are thin white lines on grey tarmac either way, which is what makes the inconsistency an
+  annotation-layer problem and hand labelling the only honest ground truth.
+
+**Not live-checked**, and its checklist is: that a slab-annotated lot now offers bays at all
+(`Parking check:` reports `N filled slab(s)`, and a lot reporting slabs but no bays means the
+shape did not read as a row); that the offered bays land on the real painted bays rather than
+straddling them, which is the count guess being right or wrong and is the thing to look at first;
+that a lot with real divider LINES is completely unchanged; that a hatched or chevron area
+adjoining a row is trimmed when it is a different depth and is visibly offered when it is not; and
+that a lot with several rows still finds all of them, which is the failure the fill test exists to
+prevent and the one that costs bays rather than adding them.
+
 ### Translucent vertex colour DOES NOT BLEND in this scene, and a bay is an outline because of it
 
 The bays were built as a translucent wash first. Measured on the real GPU over the road, one flat
@@ -2773,6 +3237,352 @@ the normal release-controls funnel. Blockage remains latched until the car is st
 an unreadable gearbox uses limited signed-direction confirmation and opposite motion fails
 stopped rather than being guessed correct.
 
+### The manoeuvre stopped shuffling, and four of the five causes were bugs (2026-08-25)
+
+Reported live: the detection works, the driving into the bay does not -- it crosses the lines,
+shuffles, and crashes. Measured against the real controller closed-loop on a kinematic bicycle,
+re-projecting a world-anchored bay every tick exactly as the worker does. Before and after, over
+eight bay geometries:
+
+| | before | after |
+|---|---|---|
+| bays reached | 6 of 8 | **8 of 8** |
+| corner past the bay's side line | up to **0.74 m** (0.58 m of margin exists) | **0.00 m** |
+| parked off the bay centreline | 0.28-0.46 m | **0.00 m** |
+| skew at rest | up to **12.3 deg** | **0.0-3.7 deg** |
+| gear changes | 3-7, including **3 on a bay dead ahead** | 0 or 2 |
+
+**Every planned path is now re-sampled to a constant arc-length step, and that one change is most
+of it.** The constructions sample their own SEGMENTS rather than the finished path: a square-on
+bay came back as *two points* for the run-in and then the tail at a quarter of a metre, so a path
+could open with a single 6.3 m gap. `ParkingDriver` locates the car by the NEAREST SAMPLE, and
+across a gap like that sample 0 stays nearest for the first three metres of driving -- which
+silently redefined three quantities at once:
+
+- `cross_track` became **the distance travelled** rather than a tracking error;
+- `remaining` froze at the full path length, so the no-progress watchdog went blind;
+- pure pursuit measured its lookahead from the wrong place on the path.
+
+Measured on a bay 14 m DEAD AHEAD driven perfectly straight: the car covered 1.5 m, cross-track
+hit `PARKING_DRIVE_MAX_CROSS_TRACK_M`, and the controller announced *"Tracking error grew to
+1.5 m"* and re-planned -- three times, on a straight line. `resample` fixes the cause and
+`cross_track` measures to the two adjoining SEGMENTS rather than to a sample, so a stale index
+costs nothing.
+
+**Re-sampling is not free to bolt on, and the way it fails is instructive.** `resample`
+interpolates LINEARLY, so upsampling a curve puts the new points on its CHORDS -- discrete
+curvature then reads zero along a chord and spikes at every original vertex. Measured on a 6 m arc
+emitted at 0.41 m and re-sampled to 0.25: a clean 0.167 came back as **0.245 on every third
+sample**, a steering-limit violation that was an artefact of the sampling. The constructions
+therefore emit at `PARKING_PATH_STEP_M` resolution themselves, so `resample` never upsamples.
+
+**The canned path carried a real curvature KINK, and the old sampling had been hiding it.**
+`_reach` closed the residual to the target with a straight line from wherever the arc happened to
+finish -- and after the `PARKING_PATH_SLACK_M` clamp the arc does not in general finish pointing
+at the target, so the join was a corner. A kink's discrete curvature scales with the sample
+spacing and this one sat next to the coarsest gap in the path, so the existing curvature test
+(which only covers bays 8 m to the side and 14 m ahead) never saw it. `_tail_arc` closes the gap
+with an arc continuous with the sweep, solved in the sweep's own final frame -- the same
+rotated-frame trick `_reverse_reach` uses -- and a radius that cannot close it without exceeding
+the limit is *refused*, which is what the (approach, radius) search is for.
+
+**There were two planners and the cheap one won by default.** `plan_manoeuvre` tried the canned
+nose-in first and only searched if `_clear` refused it -- but `_clear` rejects only KNOWN-blocked
+cells, and `Occupancy` returns UNKNOWN for anything not positively classified as road. In an empty
+lot nothing is blocked, so the canned construction always "fitted", and it is the construction
+that cuts the corner. It was also driving at *exactly* `MIN_TURN_RADIUS_M` -- measured, full lock
+held for 9.4 m through a 90-degree bay -- leaving the tracker no authority to tighten. The search
+now runs first for a square-on bay and at `PARKING_PLAN_RADIUS_MARGIN`.
+
+**A SQUARE-ON bay is reversed into by preference, and that is arithmetic rather than taste.**
+Backing in, the rear axle is the pivot, so the body comes square while it is still outside the
+mouth; nose-first the front swings wide, and one arc through 90 degrees displaces the car by a
+whole turning radius, which an ordinary aisle cannot deliver without crossing the neighbour.
+`prefers_reverse` measures square-on against the CAR's heading rather than a modelled aisle,
+because there is no aisle model and the car is driving along the aisle when the bay is picked.
+
+**Nothing anywhere asked whether the path stayed between the lines, and paint is why.** There is
+no return to collide with on a bay line, so no corridor check, no occupancy cell and no cost term
+prefers staying inside; `_secure` inspects only the pose the car finishes in, which says nothing
+about the path that reached it. `bay_intrusion` measures how far the swept body strays past the
+bay's side lines. Three things about it were measured wrong first:
+
+- **It is bounded on BOTH axes.** The depth band is an infinite strip across the lot, so measured
+  on depth alone a car manoeuvring thirty metres away at the same depth read as a **13.64 m
+  intrusion** -- and rejected the very manoeuvre this test exists to prefer.
+- **Every leg is checked, not just the entry.** Checking only the last one was tried: once the
+  run-in became a leg of its own, that final leg was a clean straight every time while the leg
+  BEFORE it swung through the bay to line up -- **1.36 m over the line on every square-on
+  geometry, with the guard reporting the manoeuvre clean.**
+- The lateral bound is what makes asking every leg affordable: a positioning leg is still allowed
+  to pass the mouth and sit alongside.
+
+**The search committed a pointless 0.70 m reverse before ever asking whether it could just drive
+there.** `_analytic` is tried every `HYBRID_ANALYTIC_INTERVAL`th expansion, and the count started
+at 8 -- so the start pose was never shot at, and whichever primitive the search had already
+committed came back inside the answer. Exactly one `HYBRID_STEP_M` of reverse, which the executor
+then treated as a leg, hit its cusp almost at once, re-planned, and drew another one: the car
+reversed away from the bay 0.7 m at a time until the budget ran out. Counting from the first
+expansion fixes it.
+
+**A Reeds-Shepp shot is the shortest path to a pose and may arrive still TURNING.** The canned
+construction ends with a deliberate straight -- CLAUDE.md already records that the tightest
+feasible radius is preferred precisely because it leaves a longer one -- and the search had no
+such property, so the car reached its stop pose 12.3 degrees skewed against a 12.0 degree success
+limit, failed by a third of a degree, re-planned from inside the bay and reported it UNREACHABLE
+while sitting in it. Every searched manoeuvre is now planned to a pose set back by
+`PARKING_SEARCH_RUN_IN_M` with the last stretch appended as a straight.
+
+**Cusps have their own re-plan budget.** A multi-leg manoeuvre re-plans at every direction change
+by design -- that is what keeps leg two honest about where leg one really finished -- so charging
+those to `PARKING_MAX_REPLANS` meant a reverse manoeuvre spent most of it before anything had gone
+wrong, and handed back mid-park.
+
+**Raising the tracker gains was tried and MEASURED WORSE, which is the useful result.** The
+reasoning for a feed-forward of 1.0 is textbook: it is the curvature the path already carries, so
+a car on the path and pointing along it should need no correction. Taken to 1.0/1.0 the manoeuvre
+destabilised -- the worst line crossing went from 0.03 m to **0.51 m**, the phase traces filled
+with shuffling, and four converging cases stopped converging. Under-damped is what that is: three
+terms all pulling the same way at a 2.7 m lookahead on a 6 m radius. The gains are hoisted into
+config so the next attempt starts from a number rather than a guess.
+
+**Live-checked once, and it failed** -- see the section below for the four causes
+that only a real lot exposed. The checklist stands: that a real bay is entered without touching a line,
+which is the reported defect; that a square-on bay produces the reverse-then-approach shape rather
+than shuffling (`Park check:` names the legs); that the manoeuvre does not visibly hitch at engage
+or at a cusp, since the search runs 2-140 ms **on the 40 ms worker tick** and moving it to the
+scene worker's pool is the fix if it does; that a bay dead ahead needs no gear change at all; that
+`Park check:` reports UNREACHABLE rather than attempting a bay outside the envelope; and that the
+corridor check still stops the car for a neighbour parked over the line, since AEB is in STANDBY
+at parking speed by design.
+
+### The first live park: four more causes, and the offline harness could not see any of them (2026-08-25)
+
+Reported from the car: very slow, hunting left and right, bumping into things, and cycling
+standstill to 5 km/h and back. Three attempts logged. **Every one of these is invisible offline**,
+because the offline harness has no occupancy map, no gearbox and no lot -- which is exactly why
+the eight synthetic geometries were all parking cleanly while the real thing was not.
+
+- **`electrics` was polled only while SELF-DRIVING**, and engaging parking turns self-driving off.
+  So `_reported_gear` returned None on every tick and every `Park check:` line in the log read
+  `box reports None`. The manoeuvre then had to wait out `PARKING_SHIFT_DWELL_S` at a standstill
+  for each shift and creep on a probe throttle until motion confirmed the direction. Measured
+  offline it costs only ~2.4 s a manoeuvre, so it is not the headline -- but it made the log lie
+  about the one thing it was being read for.
+
+- **The turn cap was crawling the WHOLE manoeuvre, and that is most of "very slow".**
+  `_target_speed` caps to 0.8 m/s while there is heading left to lose, and the heading it reads is
+  the error against the leg's FINAL pose. Entering a square-on bay there is about 90 degrees to
+  lose from the moment the manoeuvre starts, so the cap was satisfied continuously and the car
+  crept from the aisle to the bay. `PARKING_TURN_SLOW_RANGE_M` confines it to the last few metres,
+  which is where squaring up is actually the job.
+
+- **`HYBRID_UNKNOWN_PENALTY` was charged PER PROBED CELL, so unseen ground cost 6.4x seen
+  ground.** `footprint_cost` samples the body at 15 cells on this vehicle and multiplied the
+  penalty by every one: a pose entirely in unknown space cost 3.75 against 0.7 for a whole step of
+  distance, so the search would drive 3.8 m out of its way to avoid ONE step of the unseen. The
+  module documents this as a mild preference -- "a route through open tarmac beats a route through
+  the unseen" -- and 6.4x is not mild. In a lot where most cells are unknown it plans grand tours:
+  measured live, a four-leg manoeuvre for a bay 3.5 m away and, on another attempt, a single
+  **thirteen-metre reverse**. It is the FRACTION of the body in unknown ground now.
+
+- **`HYBRID_GEAR_PENALTY` was far too cheap at 3.0**, which only became visible once the unknown
+  penalty stopped dominating it. At 0.7 m a step it priced a direction change at about three
+  metres of driving, so the search took any shuffle saving three metres -- backwards for parking,
+  where a cusp costs a full stop, a gear handshake and a re-plan. The sweep is in `config.py`; 15
+  cuts the worst case from 12 gear changes to 2 **and** finishes faster, because the shuffling was
+  never buying anything.
+
+**The two search constants interact, and that is the lesson to keep.** Normalising the unknown
+penalty on its own made the offline shuffling dramatically WORSE (26 gear changes over the eight
+geometries against 8 before), which looks like a contradiction until you notice that offline
+*everything* is unknown -- so the penalty is uniform there and cannot cause a detour at all. What
+it was doing offline was inflating the cost of every long path enough to keep the search greedy.
+Removing that inflation exposed how cheap a cusp was. Neither constant can be tuned without the
+other, and neither can be tuned against a harness with no occupancy in it.
+
+`Park plan:` is the diagnostic that came out of this, and it exists because the phase line cannot
+answer the question that mattered. `Park check: APPROACH -- leg 1 of 4` says what the car is doing
+and nothing about whether the PLAN was sane; a thirteen-metre reverse and a sensible one look
+identical in it. The plan line reports the leg count, each leg's length and direction, and the
+total against the direct distance to the bay as a ratio -- so a grand tour reads as `4.2x` and is
+recognisable at a glance. The phase line gained steering, cross-track and target speed for the
+other half of the question.
+
+### The parking rework: the manoeuvre is COMMITTED, smoothed, and tracked (2026-08-25)
+
+The 15:10 live session measured the failure as architecture, not tuning: seven different
+manoeuvres planned for one bay in two minutes (2, 4, 3, 2, 1, 2 and 3 legs -- every cusp, fault
+and failed secure re-ran the whole search, and the coarse search re-chose the topology from
+every slightly different pose), 30-49 m of driving for bays 8-16 m away, a 9.2 m two-leg shuffle
+generated to correct a 0.5 m pose error, full stops for obstructions 12.9 m down the path that
+then "cleared" and re-blocked at 10.7 and 5.0, and reverse legs with the wheel pinned at full
+lock while cross-track grew to 0.8 m. The rework imposes the production order of operations --
+plan once, partition at cusps, smooth per leg, profile speed per leg, track with error-state
+feedback, re-solve only on triggers -- and every piece of it was driven closed-loop against a
+plant that finally tells the truth. What follows is what is load-bearing, in the order the bugs
+were found.
+
+- **A cusp is NOT a replan trigger any more.** `_advance` steps to the next committed leg;
+  `plan_manoeuvre` runs once at engage (pinned by monkeypatch-counting in
+  `test_a_multi_leg_park_plans_the_manoeuvre_exactly_once`). A leg entered meaningfully off its
+  start -- more than `PARKING_LEG_REPAIR_M` of cross-track or `PARKING_LEG_REPAIR_DEG` of
+  heading, near-stationary, once per leg -- gets a LOCAL repair: the canned solver re-derives
+  THIS leg's path from the actual pose, validated against bay keepout and occupancy and against
+  its own END TANGENT (the canned solver's single-arc endgame reaches a pose still turning, and
+  a repair that ends 16 degrees skewed is worse than no repair). The cusp budget now pays for
+  repairs; the failure budget still pays for full replans.
+- **A blockage is a SPEED LIMIT first, a stop second, and a replan third.** `blocking_distance`
+  now bounds the driveable remaining path (stop `PARKING_BLOCK_STANDOFF_M` short) instead of
+  slamming the brake for anything anywhere ahead; BLOCKED latches only at the standoff; and a
+  blockage that persists `PARKING_BLOCKED_REPLAN_S` with the car stopped triggers ONE
+  route-around replan per episode -- the occupancy has the obstruction by then. The old
+  semantics only ever waited, which is right for a pedestrian and an infinite loop for a parked
+  car. Blocked handling runs BEFORE the tracking watchdogs, or the wait gets pre-empted by a
+  meaningless cross-track replan.
+- **`ParkingMap` accumulates from SCAN-ARM and is no longer cleared at engage**, so the first
+  search sees what the car has seen of the lot instead of one tick of returns in a sea of
+  UNKNOWN -- which is what made the search plan through space the corridor check then vetoed
+  mid-drive. Its hot path is vectorized (unique-cell reduction, amortized expiry) because the
+  free set is the whole road cloud every tick. The teardown funnel and pose-jump guard still
+  clear it.
+- **The analytic shot is PRICED, and over the whole Reeds-Shepp word family.** `shortest_path`
+  picks by LENGTH, and the shortest word between two poses is very often a reverse-heavy one a
+  few metres shorter than a forward-only word that is far cheaper once the reverse and cusp
+  penalties apply -- since the shot is the only way the search terminates, every plan inherited
+  that topology, which was most of the shuffling. `reeds_shepp.all_paths` exposes the family;
+  `_analytic` sorts by the search's own cost (arrival gear included), collision-checks in that
+  order, and skips words that cannot beat the best candidate (`cost_limit`). The search keeps
+  the best shot until the frontier cannot beat it or `HYBRID_SHOT_PATIENCE` runs out.
+- **`_reconstruct` integrates each primitive BACKWARD from its stored child pose.** Primitives
+  were reported as their 0.7 m endpoints -- chords, with the whole tangent change on one vertex,
+  which downstream read as one-sample 0.4 1/m spikes no car can steer. Sub-sampling forward from
+  the start was tried first and is WRONG: `came_from` entries get rewritten when a cheaper route
+  reaches the same cell through a different continuous pose, so forward integration propagates
+  the mismatch and disconnected the analytic tail by a measured 0.14 m. Anchoring on each child
+  keeps every link ending where the search said.
+- **Per-leg smoothing is a windowed MOVING AVERAGE with pinned end tangents**
+  (`parking_smooth.smooth_path`). Two rejected designs are worth keeping: a Laplacian descent
+  CLUSTERS vertices at the corners it rounds (shrinkage), and clustered samples read as more
+  curvature than the kink -- 0.405 became 0.52 "smoothed"; and re-resampling after smoothing
+  puts samples back on chords and re-concentrates what was just spread (the same trap
+  `PARKING_PATH_STEP_M` documents, from the other side). The end tangents are the pose-heading
+  contract between legs: rotating one hands the next leg a phantom 19-degree initial error that
+  perfect tracking then "confirms". Smoothed legs are re-validated against curvature, bay
+  intrusion and occupancy, with a tighter deviation retry, falling back to raw.
+- **Tracking is an error-state law about the REAR AXLE, and three structures matter more than
+  any gain.** (1) The control point: `PARKING_REAR_AXLE_OFFSET_M` puts the errors at the axle --
+  the bicycle's minimum-phase pivot -- because the reference NODE a metre and a half ahead of it
+  initially swings the wrong way in reverse, and controlling it there limit-cycled lock to lock.
+  (2) The matched point is the LOCAL perpendicular foot (`match_index`, a monotone hill-descent
+  walk), never an argmin: on any bend a car cutting inside is nearer to samples further around
+  the curve, so a nearest-sample match creeps ahead, its tangent demands more turn, and the
+  command saturates -- a positive feedback loop measured at full lock for five seconds. (3)
+  Lateral error commands a BOUNDED APPROACH ANGLE (`atan`, capped) that the heading loop tracks,
+  because a plain k_y*e term saturates the whole command and inside saturation there is no
+  damping at all. Feed-forward reads the path curvature a `PARKING_TRACK_PREVIEW_S` lead ahead
+  (actuator-lag compensation, clamped off the zero-by-construction endpoint curvature), the
+  command slews at `PARKING_STEER_RATE_PER_S`, and a clamped adaptive gain
+  (`controller._adapt_gain`'s pattern, fed by the worker's measured yaw) absorbs the fact that
+  `MIN_TURN_RADIUS_M` is a guess -- the `Steer check:` line prints commanded vs measured
+  curvature and the trim, and is the instrument for replacing the guess.
+- **The wheels PRE-AIM during the shift dwell**: `_shift` winds toward the next leg's entry
+  curvature while the box is being confirmed, so a leg starts with its curvature on instead of
+  spending its first metre winding. The stopping profile is lag-aware (`PARKING_CONTROL_LAG_S`
+  solves v^2 = 2a(d - v*lag)), which is what ended SHIFTING entries at 1.19 m/s, and a
+  curvature-scheduled cap (`PARKING_TURN_SPEED_*`) slows the tight middle of a swing, where
+  lag-induced deviation scales with speed.
+- **A small final-pose miss gets the analytic NUDGE, never the search** (`plan_nudge`): one
+  bounded pull-out arc chosen so the canned entry solver re-enters ALIGNED (end-tangent checked,
+  same as the repair), inside `PARKING_NUDGE_*`; the search's 0.7 m primitives cannot express a
+  half-metre correction and answered one with 9.2 m of shuffle, twice, live.
+- **The bay's side lines are VIRTUAL OBSTACLES for the search** (`bay_side_strips` +
+  `Occupancy.with_blocked`): paint returns nothing, so nothing real can forbid the search a path
+  across the neighbouring bay, and given the chance it takes one -- that is always shorter. The
+  clean round searches with the strips and is held to a 0.05 m planned intrusion (the driven
+  body adds a tracking transient on top of whatever the plan uses); the bare round and the
+  fallback survive so a line-clipping manoeuvre still beats no manoeuvre.
+- **The offline plant is HONEST now, and that is Phase 0 of everything above**: `_Bicycle`
+  pivots the rear axle and reports the node (`PLANT_NODE_OFFSET_M`), slews its achieved
+  curvature at `PLANT_STEER_RATE` (slower than the tracker commands, deliberately), takes a
+  `gain_error` on the steering map, and lags its pedals. The previous plant WAS the tracker's
+  assumption -- instant curvature at a point -- which is how eight offline geometries passed
+  while the live car saturated the wheel. `test_a_wrong_steering_map_is_absorbed_not_fatal`
+  drives +-10-15% map errors closed-loop.
+- **The heuristic is inflated** (`HYBRID_HEURISTIC_WEIGHT`): raw RS length under-guides a search
+  whose real costs carry reverse, cusp and unknown-ground surcharges -- measured, 7,473
+  expansions (1.2 s on the worker thread) for a square-on bay. With the weight, pricing, and
+  shot pruning, live-shaped plans (occupancy present) come back in ~1-450 ms and read F or F+R;
+  the no-occupancy right-side case still takes ~1.1 s and four legs, an offline-only oddity of
+  the all-UNKNOWN grid that the closed loop still parks through.
+
+**Live-checked ONCE (18:10 the same day): it parked, in 91 s, around a real neighbour -- and the
+log convicted three more defects, each fixed the same evening.** What worked: the committed legs
+survived their cusps, the gear handshakes took ~0.5 s each, the AEB-stop-then-"Replanning around
+an obstruction" path fired exactly as designed (rear brake at 2.9 m, evidence 1.06 m of height
+over 4,799 returns -- genuinely solid -- then a clean 2-leg route around it), and the secure
+check passed first try. What failed:
+
+- **The progress watchdog was 0.75 m/s in disguise.** "Progress" was `remaining` shrinking by a
+  fixed 0.03 m per 40 ms tick, and the new profile deliberately spends whole approach-tails
+  below that speed -- so three seconds of intentional creep read as "stopped making progress"
+  and fired a silent full replan mid-park, which produced the session's 4.6x nose-in detour
+  whose reverse leg then met the parked neighbour. The test is speed-relative now (a quarter of
+  the car's own per-tick travel), so slow is fine and circling still trips it. The replan was
+  also INVISIBLE: a successful `_replan_or_fail` returned straight into the shift, whose
+  "Selecting drive" overwrote the reason -- it now spends one tick saying
+  `Replanned -- <reason>`.
+- **The steering trim compared now against half a second ago.** Commanded-instant vs
+  yaw-that-lags made every transient a fake measurement: logged ratios -3.68 to +1.92, the gain
+  wandering 0.66-1.26 and injecting its own steering noise. The command is filtered with the
+  yaw filter's own constant and adaptation is gated on the command being STEADY; the sustained
+  arcs in the same log read **1.02-1.11**, which is the real measurement -- this car's steering
+  map is within ~10% of the `MIN_TURN_RADIUS_M` guess, so the gain should sit near 0.95 and
+  stay.
+- **The speed target surged 0.3-1.3 m/s down a reverse leg**: four caps (cruise, curvature,
+  end-of-leg turn, creep) hand the target back and forth, and their raw argmin through laggy
+  pedals is a sawtooth. The target is slewed now (`PARKING_TARGET_RAMP_*`) -- gentle up, fast
+  down, so braking never waits on the comfort filter.
+- `Park plan:` also gained provenance (`via search, keepout round, reverse entry` /
+  `canned nose-in` / `search FALLBACK -- may clip a line` / `nudge`), because the session's
+  4.0x initial plan and its final clean 2-legger were indistinguishable in the log
+  (`parking_drive.LAST_PLAN_NOTE`, worker-thread confined).
+
+**The second live check (19:02 the same day) found the search could be BORN DEAD, and the car
+standing somewhere is now proof those cells are drivable.** Four engagements in a row refused
+`UNREACHABLE -- no clear route` within ~120 ms each, from a spot the car had just driven to.
+One blocked cell inside the start FOOTPRINT kills everything at once: every child expansion
+sweeps the start pose's own body, so `motion_cost` returns None for all six moves, the search
+exhausts before its first step, and the canned families fail the same occupancy check --
+reproduced offline at 1.7 ms to refusal, the live signature exactly. Three ways a cell gets
+there, all courtesy of the rework: a STALE cell the body has covered since it was marked
+(persisting the map across engage made this possible, and the ego cull means nothing can ever
+re-observe ground under the car), a REAL kerb inside the 0.18 m clearance the collision probe
+inflates the body by (parking next to the row is the normal place to engage from), and the
+virtual keepout strips themselves when engaging from abeam the bay. Three layers now, one per
+cause: `Occupancy.without_start_overlap` exempts the blocked cells the start footprint probes
+for the whole search (`plan()` applies it at entry); `ParkingMap.occupancy_bev` drops blocked
+cells inside the ego body from the served view (the store is untouched -- once the car moves,
+the ground is observed again and the cell re-earns its state on real evidence); and
+`_search_manoeuvre` cuts the strip points overlapping the body before `with_blocked`. Pinned by
+`test_blocked_cells_at_the_car_do_not_refuse_a_reachable_bay` and the parking-map body-clear
+test. The corridor check still guards the actual drive with real returns, which is what makes
+the exemptions safe.
+
+**Still to check on the next drive**: that engaging from BESIDE the row -- the position that
+refused four times -- now plans and parks; that `Park plan:` prints ONCE per manoeuvre (any
+`Replanned --` line now names its trigger, and the spurious trigger is gone); that the gain
+settles near 0.95 and stays; that each leg's speed is one smooth trapezoid; that the initial
+plan for a reachable bay reads `via search, keepout round` at a sane ratio rather than the
+first session's 4.0x (if bad plans persist with good provenance, the suspect is the map still
+being thin at engage -- arm the scan a little earlier); that the engage hitch stays tolerable
+(a tight abeam scenario measured 1.7 s of search on the worker thread offline -- if it is felt
+live, moving the search to the scene worker's pool is the fix, per the older parking sections);
+that a deliberately poor final pose is fixed by one short nudge; and that bays are entered
+without crossing the painted line, which the offline suite can only bound to ~0.35 m of
+swept-corner transient under the honest plant -- tightening the tracker until that test's
+threshold can return to 0.15 is the standing tracking-quality target.
+
 ## Configuration gotchas
 
 `config.BEAMNG_EXE` is a **hardcoded absolute path** to the local BeamNG.tech install. Anyone
@@ -2902,6 +3712,40 @@ The parking constants have the same "looks like one quantity, is two" trap:
 - `PARKING_MARKING_MEMORY_M` (80) is deliberately four times `MEMORY_DISTANCE_M` (20). That one
   bounds the lifetime of a remembered ghost that can hard-block the planner; this one bounds how
   long a bay you can see is offered, and its worst failure is a stale suggestion.
+- `PARKING_PATH_STEP_M` (0.25) is the tracker's FRAME OF REFERENCE, not a drawing resolution.
+  `ParkingDriver` locates the car by walking segments of this grid (`match_index`), so
+  non-uniform spacing silently redefines `cross_track`, `remaining` and the feed-forward preview
+  all at once -- see the manoeuvre section. Two rules come with it: every construction must EMIT
+  at least this finely (upsampling a curve puts points on its chords and invents curvature at
+  every original vertex -- the same trap that forbids re-resampling AFTER smoothing), and
+  `PARKING_PATH_SAMPLES` is now only a floor under it.
+- `PARKING_MAX_REPLANS` (4, FAILURES) vs `PARKING_MAX_CUSP_REPLANS` (6, now LOCAL REPAIRS). Since
+  the 2026-08-25 rework a cusp does not replan at all -- the committed sequence survives it --
+  and the cusp budget pays for per-leg repairs from the actual pose instead. Sharing one budget
+  with failures is still the mistake it always was.
+- `PARKING_SEARCH_RUN_IN_M` (3.0) is what makes a SEARCHED manoeuvre finish square. A Reeds-Shepp
+  shot is the shortest path to a pose and can arrive still turning; the canned construction ends
+  with a deliberate straight and the search had no equivalent. Shortening it brings the skew back.
+- `PARKING_PLAN_RADIUS_MARGIN` (1.15) is steering authority in reserve, not slack. Planning at
+  exactly `MIN_TURN_RADIUS_M` leaves the tracker able to correct in one direction only.
+- `PARKING_BAY_KEEPOUT_M` (0.15) is the only thing in the whole stack that knows a bay has SIDES.
+  Paint is not an obstacle, so no corridor check, occupancy cell or cost term can see one.
+- `PARKING_TRACK_*` describe an error-state law now, not pure pursuit, and the STRUCTURE carries
+  more than the numbers: `APPROACH_GAIN`/`APPROACH_MAX_DEG` bound the angle lateral error may
+  demand (damping must survive saturation), `HEADING_GAIN` owns the loop, `FEEDFORWARD_GAIN` is
+  1.0 because the smoothed path is finally followable, and `PREVIEW_S` leads the feed-forward by
+  the wheel's own winding time. The old note -- textbook 1.0 gains measured worse -- was true of
+  pure pursuit against unsmoothed kinked paths on a plant with instant steering, all three of
+  which are gone; see the 2026-08-25 rework section.
+- `PARKING_SLAB_MIN_WIDTH_M` (1.6, is this run a filled ROW) vs `PARKING_STRIPE_MAX_WIDTH_M` (1.0,
+  is this run a DIVIDER). The gap between them is deliberate: a run in it is neither and is left
+  alone. `PARKING_SLAB_MIN_FILL` (0.55) is the one to be careful with -- it is what stops separate
+  rows that merely project onto the same offsets being read as one slab, and that failure takes
+  bays AWAY rather than adding them, because a claimed slab consumes its cells.
+- `PARKING_SLAB_NOMINAL_WIDTH_M` (2.75) picks how many bays a slab becomes and it is a GUESS by
+  construction -- the dividers are precisely what the annotation did not draw.
+  `PARKING_SLAB_COLUMN_DEPTH_FRACTION` (0.7) is a different question: which part of the slab is the
+  row at all, which is what trims an adjoining hatched zone of a different depth.
 - `PARKING_MAX_ROWS` (3) is how many row ORIENTATIONS are looked for, and it is the constant that
   makes bays appear anywhere other than the row you are facing. It is not a bay count —
   `PARKING_MAX_SLOTS` is. Two facing rows either side of an aisle plus a perpendicular row along
@@ -3049,12 +3893,13 @@ The AEB constants have the same "looks like one quantity, is two" trap as the dr
 
 Every module starts with `from __future__ import annotations`. Modules are single-responsibility
 and one-directional — `config` → `models` → {`geometry`, `semantics`, `raster`, `launcher`,
-`planner`, `controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit`} → `aeb` →
+`planner`, `controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit`,
+`capture`, `projection`} → `aeb` →
 {`worker`, `bridge_monitor`} →
 {`bev_widget`, `main_window`}; keep the pure/testable layers free
 of Qt and BeamNGpy imports (`geometry`, `semantics`, `raster`, `launcher`, `planner`,
-`controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit` and `aeb` currently
-import neither — `bridge_monitor` exists as a separate module precisely so `launcher` can stay
+`controller`, `navigation`, `parking`, `parking_drive`, `vehicle_fit`, `capture`, `projection`
+and `aeb` currently import neither — `bridge_monitor` exists as a separate module precisely so `launcher` can stay
 Qt-free; `navigation` takes its Lua runner as an injected callable for the same reason).
 `aeb` sits just below `worker` rather than beside `planner` because it depends on
 `planner.corridor_blocking_distances`; that is the only sibling edge in the pure layer.

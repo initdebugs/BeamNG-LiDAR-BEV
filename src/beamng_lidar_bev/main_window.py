@@ -8,6 +8,7 @@ from PyQt6.QtCore import QMetaObject, QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QResizeEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QVBoxLayout,
@@ -29,6 +31,9 @@ from .config import (
     AEB_REVERSE_MIN_SPEED_MPS,
     APP_NAME,
     BEAMNG_EXE,
+    CAPTURE_INTERVAL_S,
+    LABEL_BAY_CORNERS,
+    LABEL_MAX_ROW_BAYS,
     LIDAR_FRONT_HORIZONTAL_FOV_DEG,
     LIDAR_FRONT_MAX_DISTANCE_M,
     LIDAR_HORIZONTAL_FOV_DEG,
@@ -165,6 +170,11 @@ class MainWindow(QMainWindow):
     rear_aeb_requested = pyqtSignal(bool)
     parking_requested = pyqtSignal(bool)
     park_here_requested = pyqtSignal(bool)
+    recording_requested = pyqtSignal(bool)
+    labelling_requested = pyqtSignal(bool)
+    label_row_bays_requested = pyqtSignal(int)
+    labels_complete_requested = pyqtSignal(bool)
+    label_undo_requested = pyqtSignal()
     scene_clear_requested = pyqtSignal()
     streaming_changed = pyqtSignal(bool)
     sensor_mode_requested = pyqtSignal(str)
@@ -381,6 +391,120 @@ class MainWindow(QMainWindow):
         self.park_here_button.setEnabled(False)
         self.park_here_button.clicked.connect(self._request_park_here)
         sidebar_layout.addWidget(self.park_here_button)
+
+        sidebar_layout.addWidget(self._separator())
+        training_title = QLabel("TRAINING DATA")
+        training_title.setObjectName("sectionTitle")
+        sidebar_layout.addWidget(training_title)
+
+        self.record_button = QPushButton("Record Camera Data")
+        self.record_button.setObjectName("recordButton")
+        self.record_button.setIcon(
+            application_style.standardIcon(
+                QStyle.StandardPixmap.SP_DialogSaveButton
+            )
+        )
+        self.record_button.setCheckable(True)
+        self.record_button.setToolTip(
+            "Save camera frames and the car's pose to captures/, for training "
+            "a vision model to read bay paint. HYBRID only -- the LiDAR set "
+            f"has no cameras. One sample every {CAPTURE_INTERVAL_S:.1f} s, "
+            "written as JPEG on a background thread so it never delays the "
+            "driving tick. The annotation channel is deliberately NOT used: "
+            "it labels bay dividers as thin lines on one lot and as solid "
+            "slabs on the next, and the camera sees the same white lines on "
+            "both."
+        )
+        self.record_button.setEnabled(False)
+        self.record_button.clicked.connect(self._request_recording)
+        sidebar_layout.addWidget(self.record_button)
+
+        self.label_button = QPushButton("Label Bays")
+        self.label_button.setObjectName("recordButton")
+        self.label_button.setIcon(
+            application_style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        )
+        self.label_button.setCheckable(True)
+        self.label_button.setToolTip(
+            f"Click {LABEL_BAY_CORNERS} corners of a bay on the ground in the "
+            "3D WORLD view to save it as a training label. Works on bays the "
+            "detector never found, which is the whole point of labelling by "
+            "hand. Labels are saved beside the frames they describe, so "
+            "recording has to be running. While this is on, a left click "
+            "drops a corner instead of selecting a bay."
+        )
+        self.label_button.setEnabled(False)
+        self.label_button.clicked.connect(self._request_labelling)
+        sidebar_layout.addWidget(self.label_button)
+
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 0, 2)
+        row_name = QLabel("Bays in quad")
+        row_name.setObjectName("specName")
+        self.label_row_spin = QSpinBox()
+        self.label_row_spin.setObjectName("labelRowSpin")
+        self.label_row_spin.setRange(1, LABEL_MAX_ROW_BAYS)
+        self.label_row_spin.setValue(1)
+        self.label_row_spin.setToolTip(
+            "1 means the four corners are one bay. Higher means they are the "
+            "OUTER corners of a whole ROW, divided evenly into this many bays "
+            "-- 4 clicks and a number instead of 4 clicks per bay. "
+            "This is what labels a lot whose annotation covers whole bay "
+            "quads rather than the divider lines: the interior dividers are "
+            "not in the sensor data at all, so WORLD draws one solid slab and "
+            "there is nothing to click. The slab's outline IS visible, and "
+            "the count is readable from the simulator's own window. "
+            "Which way the quad gets divided is not asked for: whichever "
+            "orientation yields bays the detector would accept wins, so a "
+            "count that does not fit the row is refused rather than invented."
+        )
+        self.label_row_spin.setEnabled(False)
+        self.label_row_spin.valueChanged.connect(self.label_row_bays_requested)
+        row_layout.addWidget(row_name)
+        row_layout.addWidget(self.label_row_spin, 1)
+        sidebar_layout.addWidget(row_widget)
+
+        self.label_undo_button = QPushButton("Undo Corner")
+        self.label_undo_button.setObjectName("recordButton")
+        self.label_undo_button.setIcon(
+            application_style.standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
+        )
+        self.label_undo_button.setToolTip(
+            "Drop the corner in progress, or if there is none, the last whole "
+            "bay that was saved."
+        )
+        self.label_undo_button.setEnabled(False)
+        self.label_undo_button.clicked.connect(self.label_undo_requested.emit)
+        sidebar_layout.addWidget(self.label_undo_button)
+
+        self.labels_complete_box = QCheckBox("Every bay here is labelled")
+        self.labels_complete_box.setObjectName("labelsCompleteBox")
+        self.labels_complete_box.setToolTip(
+            "Tick this ONLY when every bay you drove past in this session has "
+            "been labelled. It is the flag that lets the training data "
+            "supervise its own negatives: on a complete session all the "
+            "tarmac is trusted background, so the model can be told that a "
+            "patch of tarmac is NOT a bay. Without it a third of every mask "
+            "has to be ignored -- and the ignored third is exactly where the "
+            "unlabelled bays are. "
+            "Ticking it when it is not true is WORSE than leaving it off: it "
+            "turns every bay you missed into a confident false negative."
+        )
+        self.labels_complete_box.setEnabled(False)
+        self.labels_complete_box.clicked.connect(
+            self.labels_complete_requested
+        )
+        sidebar_layout.addWidget(self.labels_complete_box)
+
+        self._add_spec_row(sidebar_layout, "Labelled", "not recording")
+        # Mirrors the worker's confirmed recording state. The BUTTON cannot
+        # stand in for it: it is set optimistically on click and corrected
+        # afterwards, so a refused start would read as recording.
+        self._recording = False
+        self.label_status = sidebar_layout.itemAt(
+            sidebar_layout.count() - 1
+        ).widget().findChild(QLabel, "specValue")
 
         sidebar_layout.addWidget(self._separator())
         sensor_title = QLabel("SENSOR ARRAY")
@@ -736,6 +860,17 @@ class MainWindow(QMainWindow):
         self.rear_aeb_requested.connect(self.worker.set_rear_aeb)
         self.parking_requested.connect(self.worker.set_parking_scan)
         self.park_here_requested.connect(self.worker.set_parking_drive)
+        self.recording_requested.connect(self.worker.set_recording)
+        self.labelling_requested.connect(self.worker.set_labelling)
+        self.label_row_bays_requested.connect(self.worker.set_label_row_bays)
+        self.labels_complete_requested.connect(
+            self.worker.set_labels_complete
+        )
+        self.label_undo_requested.connect(self.worker.undo_bay_label)
+        # The labeller's click, same division of labour as the bay pick: QML's
+        # raycast says where in the scene, and the worker -- which owns the
+        # pose -- says where in the world.
+        self.world_view.bridge.ground_picked.connect(self.worker.add_bay_label)
         # Bays are picked in the 3D view: QML's own raycast says where the
         # click landed, the bridge says which bay that is, and it reports the
         # bay's WORLD centre -- never an index, which would refer to a
@@ -759,6 +894,12 @@ class MainWindow(QMainWindow):
         self.worker.rear_aeb_changed.connect(self._on_rear_aeb_changed)
         self.worker.parking_changed.connect(self._on_parking_changed)
         self.worker.parking_drive_changed.connect(self._on_park_here_changed)
+        self.worker.recording_changed.connect(self._on_recording_changed)
+        self.worker.labelling_changed.connect(self._on_labelling_changed)
+        self.worker.label_progress.connect(self._on_label_progress)
+        self.worker.labels_complete_changed.connect(
+            self._on_labels_complete_changed
+        )
         self.worker.fatal_error.connect(self._show_error)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.start()
@@ -936,6 +1077,11 @@ class MainWindow(QMainWindow):
         self._set_rear_aeb_enabled(True)
         self._set_parking_enabled(True)
         self.park_here_button.setEnabled(True)
+        # Recording needs cameras, so it follows the confirmed mode the
+        # same way the CAMERAS view does rather than the phase alone.
+        self.record_button.setEnabled(
+            sensor_mode_has_cameras(self._active_sensor_mode)
+        )
         self.vehicle_label.setText(
             f"EGO {vehicle_id}  |  {geometry.length_m:.2f} x {geometry.width_m:.2f} m"
         )
@@ -983,6 +1129,10 @@ class MainWindow(QMainWindow):
         self._set_parking_checked(False)
         self.park_here_button.setEnabled(False)
         self._set_park_here_checked(False)
+        self.record_button.setEnabled(False)
+        self._set_recording_checked(False)
+        self.label_row_spin.setEnabled(False)
+        self._on_labelling_changed(False)
         self.vehicle_label.setText("No vehicle attached")
         self.bev.clear()
         self.world_view.clear()
@@ -1218,6 +1368,11 @@ class MainWindow(QMainWindow):
             self._set_parking_checked(False)
             self.park_here_button.setEnabled(False)
             self._set_park_here_checked(False)
+            self.record_button.setEnabled(False)
+            self._set_recording_checked(False)
+            self.label_row_spin.setEnabled(False)
+            self.labels_complete_box.setChecked(False)
+            self._on_labelling_changed(False)
 
     def _show_error(self, message: str) -> None:
         # A fault ENDS the wait: the launch that was pending is the most
@@ -1332,6 +1487,88 @@ class MainWindow(QMainWindow):
     def _on_park_here_changed(self, engaged: bool) -> None:
         """The worker owns the truth: it disengages on arrival faults."""
         self._set_park_here_checked(engaged)
+
+    def _request_recording(self, enabled: bool) -> None:
+        if enabled and self._phase != "STREAMING":
+            self._set_recording_checked(False)
+            return
+        self._set_recording_checked(enabled)
+        self.recording_requested.emit(enabled)
+
+    def _request_labelling(self, enabled: bool) -> None:
+        # Arming it selects WORLD for the same reason the parking scan does:
+        # the ground can only be clicked in the view that draws it, and a
+        # toggle that silently did nothing visible would read as broken.
+        if enabled and not self.world_view.is_ready:
+            self.label_button.setChecked(False)
+            self._append_log(
+                "Bays are labelled in the 3D WORLD view, which is "
+                "unavailable this session"
+            )
+            return
+        if enabled:
+            self._select_visualization(VIEW_WORLD)
+        self.labelling_requested.emit(enabled)
+
+    def _set_recording_checked(self, checked: bool) -> None:
+        if self.record_button.isChecked() != checked:
+            self.record_button.setChecked(checked)
+        self.record_button.setProperty(
+            "state", "engaged" if checked else "idle"
+        )
+        style = self.record_button.style()
+        if style is not None:
+            style.unpolish(self.record_button)
+            style.polish(self.record_button)
+
+    def _on_recording_changed(self, recording: bool) -> None:
+        """The worker owns the truth: it stops on teardown and on a full disk."""
+        self._recording = recording
+        self._set_recording_checked(recording)
+        # Labelling hangs off a live session, because a label is stored beside
+        # the frames it describes.
+        self.label_button.setEnabled(recording)
+        self.label_undo_button.setEnabled(recording)
+        self.label_row_spin.setEnabled(recording)
+        self.labels_complete_box.setEnabled(recording)
+        if not recording:
+            self._on_labelling_changed(False)
+            # Explicitly, rather than leaving it to the progress signal: the
+            # worker emits its final (0, 0) BEFORE it reports the stop, so a
+            # readout driven only by that signal would be left reading "0 bays"
+            # over a session that had actually saved dozens.
+            self._on_label_progress(0, 0)
+
+    def _on_labelling_changed(self, labelling: bool) -> None:
+        if self.label_button.isChecked() != labelling:
+            self.label_button.setChecked(labelling)
+        self.label_button.setProperty(
+            "state", "engaged" if labelling else "idle"
+        )
+        style = self.label_button.style()
+        if style is not None:
+            style.unpolish(self.label_button)
+            style.polish(self.label_button)
+        # The view has to know too: while labelling, the left button drops a
+        # corner instead of picking a bay.
+        self.world_view.set_labelling(labelling)
+
+    def _on_labels_complete_changed(self, complete: bool) -> None:
+        """The worker owns the truth: it clears the flag on every teardown."""
+        if self.labels_complete_box.isChecked() != complete:
+            self.labels_complete_box.setChecked(complete)
+
+    def _on_label_progress(self, bays: int, pending: int) -> None:
+        if self.label_status is None:
+            return
+        if not self._recording:
+            self.label_status.setText("not recording")
+            return
+        self.label_status.setText(
+            f"{bays} bays"
+            if not pending
+            else f"{bays} bays, {pending}/{LABEL_BAY_CORNERS}"
+        )
 
     def _on_parking_changed(self, scanning: bool) -> None:
         """The worker owns the truth here too: it drops the scan on teardown."""
@@ -1769,6 +2006,42 @@ class MainWindow(QMainWindow):
             QPushButton#aebButton[state="engaged"]:hover {
                 background: #ff9ea4;
             }
+            QCheckBox#labelsCompleteBox {
+                color: #aeb5bb;
+                padding: 4px 0;
+            }
+            QCheckBox#labelsCompleteBox:disabled {
+                color: #686f75;
+            }
+            QSpinBox#labelRowSpin {
+                color: #e2e6e9;
+                background: #282c30;
+                border: 1px solid #4a5056;
+                border-radius: 4px;
+                padding: 3px 6px;
+            }
+            QSpinBox#labelRowSpin:disabled {
+                color: #686f75;
+                background: #23272a;
+                border-color: #30353a;
+            }
+            QPushButton#recordButton {
+                color: #e2e6e9;
+                background: #282c30;
+                border: 1px solid #4a5056;
+            }
+            QPushButton#recordButton:hover {
+                border-color: #e8a33c;
+                color: #f0bd6b;
+            }
+            QPushButton#recordButton[state="engaged"] {
+                color: #1d1509;
+                background: #e8a33c;
+                border-color: #e8a33c;
+            }
+            QPushButton#recordButton[state="engaged"]:hover {
+                background: #f0bd6b;
+            }
             QPushButton#compactActionButton[role="aeb"]:hover {
                 border-color: #ff626c;
             }
@@ -1786,6 +2059,7 @@ class MainWindow(QMainWindow):
             QPushButton#stopButton:disabled,
             QPushButton#selfDriveButton:disabled,
             QPushButton#aebButton:disabled,
+            QPushButton#recordButton:disabled,
             QPushButton#compactActionButton:disabled {
                 color: #686f75;
                 background: #23272a;

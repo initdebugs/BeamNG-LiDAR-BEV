@@ -46,14 +46,16 @@ from .config import (
     HYBRID_GOAL_HEADING_DEG,
     HYBRID_GOAL_RADIUS_M,
     HYBRID_HEADING_BINS,
+    HYBRID_HEURISTIC_WEIGHT,
     HYBRID_MAX_EXPANSIONS,
     HYBRID_REVERSE_PENALTY,
+    HYBRID_SHOT_PATIENCE,
     HYBRID_STEER_PENALTY,
     HYBRID_STEP_M,
     HYBRID_UNKNOWN_PENALTY,
     MIN_TURN_RADIUS_M,
 )
-from .reeds_shepp import integrate, path_length, shortest_path
+from .reeds_shepp import Segment, all_paths, integrate, path_length, shortest_path
 
 FREE = 0
 BLOCKED = 1
@@ -100,6 +102,69 @@ class Occupancy:
         ).astype(np.int64)
         return set(map(tuple, cells))
 
+    def with_blocked(self, points: np.ndarray | None) -> "Occupancy":
+        """
+        A view of this occupancy with extra VIRTUAL obstacles added.
+
+        This is how paint becomes a constraint: a bay's side lines return no
+        LiDAR points, so nothing in the real map can ever forbid crossing
+        them -- the caller supplies the strips as synthetic blocked points
+        and the search treats them like any wall. The free set is shared,
+        not copied; both objects are read-only once built.
+        """
+        clone = Occupancy.__new__(Occupancy)
+        clone.cell_m = self.cell_m
+        clone._free = self._free
+        clone._blocked = self._blocked | self._index(points)
+        return clone
+
+    def without_start_overlap(
+        self, pose: Pose, half_width: float, front: float, rear: float
+    ) -> "Occupancy":
+        """
+        This occupancy with the blocked cells under the START footprint
+        exempted -- because the car standing there is PROOF they are
+        drivable.
+
+        Without this the search can be born dead: every child expansion
+        sweeps the start pose's own footprint, so one blocked cell inside it
+        -- a stale cell the body has covered since it was marked (nothing
+        can re-observe ground under the car), or a real kerb inside the
+        0.18 m clearance the footprint is inflated by -- returns None for
+        every move and the whole search exhausts in milliseconds. Measured
+        live: four engagements in a row refused UNREACHABLE within 120 ms
+        each, from a spot the car had just driven to. Probed denser than
+        `footprint_cost`'s own pattern so a cell between its probe discs
+        cannot survive to kill the second expansion instead of the first.
+        """
+        exempt: set[tuple[int, int]] = set()
+        span = front + rear
+        sin_h, cos_h = math.sin(pose.heading), math.cos(pose.heading)
+        stations = max(3, int(math.ceil(span / (self.cell_m * 0.5))))
+        laterals = np.linspace(-half_width, half_width, 5)
+        for index in range(stations + 1):
+            offset = -rear + span * index / stations
+            right = pose.right + sin_h * offset
+            forward = pose.forward + cos_h * offset
+            for lateral in laterals:
+                key = (
+                    int(math.floor((right + cos_h * lateral) / self.cell_m)),
+                    int(
+                        math.floor(
+                            (forward - sin_h * lateral) / self.cell_m
+                        )
+                    ),
+                )
+                if key in self._blocked:
+                    exempt.add(key)
+        if not exempt:
+            return self
+        clone = Occupancy.__new__(Occupancy)
+        clone.cell_m = self.cell_m
+        clone._free = self._free
+        clone._blocked = self._blocked - exempt
+        return clone
+
     def state(self, right: float, forward: float) -> int:
         key = (
             int(math.floor(right / self.cell_m)),
@@ -124,6 +189,7 @@ class Occupancy:
         count = max(2, int(math.ceil(span / max(half_width, 0.4))))
         sin_h, cos_h = math.sin(pose.heading), math.cos(pose.heading)
         unknown = 0
+        probes = 0
         for index in range(count + 1):
             offset = -rear + span * index / count
             right = pose.right + sin_h * offset
@@ -132,11 +198,21 @@ class Occupancy:
                 probe_r = right + cos_h * lateral
                 probe_f = forward - sin_h * lateral
                 state = self.state(probe_r, probe_f)
+                probes += 1
                 if state == BLOCKED:
                     return None
                 if state == UNKNOWN:
                     unknown += 1
-        return unknown * HYBRID_UNKNOWN_PENALTY
+        # The FRACTION of the body standing in unseen ground, not the count of
+        # cells. Charging per probe multiplied the penalty by however many
+        # stations the body happens to be sampled at -- fifteen on this car --
+        # so a pose entirely in unknown space cost 3.75 against 0.7 for a whole
+        # step of distance. That is not the mild preference this is documented
+        # to be: at 6.4x, the search will drive 3.8 m out of its way to avoid
+        # ONE step of unseen ground, and in a lot where most cells are unknown
+        # it plans grand tours. Measured live on a bay 3.5 m away: a four-leg
+        # manoeuvre, and on another attempt a single THIRTEEN-METRE reverse.
+        return (unknown / probes if probes else 0.0) * HYBRID_UNKNOWN_PENALTY
 
     def motion_cost(
         self,
@@ -217,9 +293,11 @@ def _key(pose: Pose, cell_m: float, gear: int) -> tuple[int, int, int, int]:
     )
 
 
-def _advance(pose: Pose, steering: int, gear: int, radius: float) -> Pose:
-    """One motion primitive: a short arc the car could actually steer."""
-    travelled = HYBRID_STEP_M * gear
+def _advance_by(
+    pose: Pose, steering: int, gear: int, radius: float, distance: float
+) -> Pose:
+    """A constant-steering move of the given arc length, closed form."""
+    travelled = distance * gear
     if steering == 0:
         return Pose(
             pose.right + math.sin(pose.heading) * travelled,
@@ -235,6 +313,11 @@ def _advance(pose: Pose, steering: int, gear: int, radius: float) -> Pose:
     )
 
 
+def _advance(pose: Pose, steering: int, gear: int, radius: float) -> Pose:
+    """One motion primitive: a short arc the car could actually steer."""
+    return _advance_by(pose, steering, gear, radius, HYBRID_STEP_M)
+
+
 def _heuristic(pose: Pose, goal: Pose, radius: float) -> float:
     """
     How far the car really has to travel, not how far the goal is.
@@ -248,8 +331,8 @@ def _heuristic(pose: Pose, goal: Pose, radius: float) -> float:
     relative = _relative(pose, goal)
     path = shortest_path(relative, radius)
     if path is None:
-        return math.hypot(relative[0], relative[1])
-    return path_length(path)
+        return HYBRID_HEURISTIC_WEIGHT * math.hypot(relative[0], relative[1])
+    return HYBRID_HEURISTIC_WEIGHT * path_length(path)
 
 
 def _relative(pose: Pose, goal: Pose) -> tuple[float, float, float]:
@@ -282,6 +365,13 @@ def plan(
     module: the manoeuvre families it replaces refused bays for being in the
     wrong place, where this refuses only for something being in the way.
     """
+    # The car's presence is evidence: blocked cells its start footprint
+    # overlaps are exempted for the whole search, or every child move sweeps
+    # them and the search dies before its first expansion. The corridor
+    # check guards the actual drive with real returns either way.
+    occupancy = occupancy.without_start_overlap(
+        start, half_width, front, rear
+    )
     start_cost = occupancy.footprint_cost(start, half_width, front, rear)
     if start_cost is None:
         # Standing in something already. Refusing would strand the car, and
@@ -309,30 +399,77 @@ def plan(
     goal_heading_tolerance = math.radians(HYBRID_GOAL_HEADING_DEG)
 
     expansions = 0
-    while open_set and expansions < HYBRID_MAX_EXPANSIONS:
-        _, _, popped_cost, node, pose, arrival_gear = heapq.heappop(open_set)
+    best_shot: tuple[float, np.ndarray] | None = None
+    shot_deadline = HYBRID_MAX_EXPANSIONS
+    while open_set and expansions < min(HYBRID_MAX_EXPANSIONS, shot_deadline):
+        priority, _, popped_cost, node, pose, arrival_gear = heapq.heappop(
+            open_set
+        )
         if popped_cost > cost_so_far.get(node, math.inf) + 1e-9:
             continue
+        # An admissible heuristic means `priority` under-estimates the cost of
+        # ANY completion through this node, so once the frontier's best cannot
+        # beat the best shot, the shot is the answer within this primitive set.
+        if best_shot is not None and priority >= best_shot[0] - 1e-9:
+            break
         expansions += 1
 
         # The analytic shortcut. Tried periodically rather than every node --
         # it is the expensive part, and near the goal it succeeds so often
         # that trying it constantly is wasted work far away.
-        if expansions % HYBRID_ANALYTIC_INTERVAL == 0 or _close(
+        #
+        # **Counted from the FIRST expansion, not the eighth.** Starting the
+        # count at 8 meant the start pose was never asked "can you simply
+        # drive there?", and the first primitive the search had committed came
+        # back inside the path: measured on a bay 18 m away down an open aisle,
+        # the plan opened with a pointless 0.70 m REVERSE -- exactly one
+        # HYBRID_STEP_M -- and the executor then treated that as a leg, hit
+        # its cusp almost at once, re-planned, and drew another one.
+        #
+        # **A shot is PRICED, never accepted on sight.** Taking the first
+        # collision-free shot let whichever node happened to be popped when
+        # the interval came round donate its whole prefix to the answer -- a
+        # topology lottery that returned a different manoeuvre from every
+        # slightly different pose. Each successful shot is costed like any
+        # other completion (travel, reverse, cusps, occupancy) and the search
+        # runs on, bounded by HYBRID_SHOT_PATIENCE, until nothing on the
+        # frontier can beat the best one. The candidate keeps its OWN
+        # reconstruction: `came_from[node]` may later be rewritten by a
+        # cheaper route to the same cell through a different continuous pose,
+        # and the stored tail was integrated from this one.
+        if (expansions - 1) % HYBRID_ANALYTIC_INTERVAL == 0 or _close(
             pose, goal, goal_heading_tolerance
         ):
             shot = _analytic(
-                pose, goal, occupancy, half_width, front, rear, radius
+                pose,
+                goal,
+                occupancy,
+                half_width,
+                front,
+                rear,
+                radius,
+                arrival_gear=arrival_gear,
+                cost_limit=(
+                    math.inf
+                    if best_shot is None
+                    else best_shot[0] - cost_so_far[node]
+                ),
             )
             if shot is not None:
                 tail, tail_cost = shot
-                return PlannedPath(
-                    poses=_reconstruct(came_from, node, tail),
-                    expansions=expansions,
-                    cost=cost_so_far[node]
+                total = (
+                    cost_so_far[node]
                     + _direction_cost(tail, arrival_gear)
-                    + tail_cost,
+                    + tail_cost
                 )
+                if best_shot is None or total < best_shot[0]:
+                    best_shot = (
+                        total,
+                        _reconstruct(came_from, node, tail, radius),
+                    )
+                    shot_deadline = min(
+                        shot_deadline, expansions + HYBRID_SHOT_PATIENCE
+                    )
 
         for steering in (-1, 0, 1):
             for gear in (1, -1):
@@ -352,13 +489,18 @@ def plan(
                 nxt_key = _key(nxt, occupancy.cell_m, gear)
                 if nxt_key in cost_so_far and cost_so_far[nxt_key] <= total:
                     continue
+                remaining = _heuristic(nxt, goal, radius)
+                if best_shot is not None and (
+                    total + remaining >= best_shot[0] - 1e-9
+                ):
+                    continue
                 cost_so_far[nxt_key] = total
                 came_from[nxt_key] = (nxt, node, steering, gear)
                 counter += 1
                 heapq.heappush(
                     open_set,
                     (
-                        total + _heuristic(nxt, goal, radius),
+                        total + remaining,
                         counter,
                         total,
                         nxt_key,
@@ -366,6 +508,10 @@ def plan(
                         gear,
                     ),
                 )
+    if best_shot is not None:
+        return PlannedPath(
+            poses=best_shot[1], expansions=expansions, cost=best_shot[0]
+        )
     return None
 
 
@@ -378,6 +524,20 @@ def _close(pose: Pose, goal: Pose, heading_tolerance: float) -> bool:
     return error < heading_tolerance * 3.0
 
 
+def _word_cost(path: list[Segment], arrival_gear: int) -> float:
+    """A Reeds-Shepp word priced exactly as the search prices its own steps."""
+    cost = 0.0
+    previous = 1 if arrival_gear >= 0 else -1
+    for segment in path:
+        cost += segment.length * (
+            HYBRID_REVERSE_PENALTY if segment.gear < 0 else 1.0
+        )
+        if segment.gear != previous:
+            cost += HYBRID_GEAR_PENALTY
+        previous = segment.gear
+    return cost
+
+
 def _analytic(
     pose: Pose,
     goal: Pose,
@@ -386,21 +546,48 @@ def _analytic(
     front: float,
     rear: float,
     radius: float,
+    arrival_gear: int = 1,
+    cost_limit: float = math.inf,
 ) -> tuple[np.ndarray, float] | None:
-    """A Reeds-Shepp shot at the goal, accepted only if it is clear."""
-    path = shortest_path(_relative(pose, goal), radius)
-    if path is None:
+    """
+    A Reeds-Shepp shot at the goal, cheapest clear word first.
+
+    Asking only `shortest_path` was the quiet source of shuffly plans: the
+    shortest WORD between two poses is very often a reverse-heavy one a few
+    metres shorter than a forward-only alternative that is far cheaper once
+    the reverse and cusp penalties apply -- and since the shot is the only
+    way the search ever terminates, every plan inherited that topology. The
+    whole word family is priced with the search's own penalties (the arrival
+    gear included, so a continuation of the current direction is correctly
+    free) and collision-checked in cost order; only a handful ever need
+    checking because the cheap words are the ones that clear.
+    """
+    words = all_paths(_relative(pose, goal), radius)
+    if not words:
         return None
-    poses = integrate(path, radius, start=pose.as_tuple(), step_m=0.25)
-    occupancy_cost = 0.0
-    for row in poses:
-        penalty = occupancy.footprint_cost(
-            Pose(row[0], row[1], row[2]), half_width, front, rear
-        )
-        if penalty is None:
-            return None
-        occupancy_cost += penalty * 0.25
-    return poses, occupancy_cost
+    words.sort(key=lambda path: _word_cost(path, arrival_gear))
+    for path in words[:6]:
+        # The word cost is a lower bound on the shot's priced total, so a
+        # word that cannot beat the best candidate found so far is skipped
+        # before the expensive integrate-and-collision pass -- and since the
+        # list is sorted, everything after it is too. This is what keeps the
+        # periodic shots nearly free once a good candidate exists.
+        if _word_cost(path, arrival_gear) >= cost_limit:
+            break
+        poses = integrate(path, radius, start=pose.as_tuple(), step_m=0.25)
+        occupancy_cost = 0.0
+        clear = True
+        for row in poses:
+            penalty = occupancy.footprint_cost(
+                Pose(row[0], row[1], row[2]), half_width, front, rear
+            )
+            if penalty is None:
+                clear = False
+                break
+            occupancy_cost += penalty * 0.25
+        if clear:
+            return poses, occupancy_cost
+    return None
 
 
 def _direction_cost(poses: np.ndarray, initial_gear: int) -> float:
@@ -424,16 +611,60 @@ def _direction_cost(poses: np.ndarray, initial_gear: int) -> float:
 
 
 def _reconstruct(
-    came_from: dict, node: tuple[int, int, int, int], tail: np.ndarray
+    came_from: dict,
+    node: tuple[int, int, int, int],
+    tail: np.ndarray,
+    radius: float,
 ) -> np.ndarray:
-    """Walk the parents back to the start and append the analytic shot."""
-    poses: list[tuple[float, float, float, float]] = []
+    """
+    Walk the parents back to the start and append the analytic shot.
+
+    Each primitive is re-integrated at a THIRD of its length rather than
+    reported as its endpoints. The endpoints alone are 0.7 m chords: the arc
+    between them is lost, its whole tangent change lands on one vertex, and
+    downstream that vertex reads as a one-sample 0.4 1/m spike -- beyond
+    anything the car can steer, and beyond anything the smoother should be
+    asked to hide. The sub-poses land exactly on the primitive's own arc, so
+    the endpoint chain is unchanged.
+    """
+    steps: list[tuple[Pose, int, int]] = []
     cursor: tuple[int, int, int, int] | None = node
+    start_pose: Pose | None = None
+    start_gear = 1
     while cursor is not None:
-        pose, parent, _, gear = came_from[cursor]
-        poses.append((pose.right, pose.forward, pose.heading, float(gear)))
+        pose, parent, steering, gear = came_from[cursor]
+        if parent is None:
+            start_pose = pose
+            start_gear = gear
+        else:
+            steps.append((pose, steering, gear))
         cursor = parent
-    poses.reverse()
+    steps.reverse()
+    assert start_pose is not None
+    poses: list[tuple[float, float, float, float]] = [
+        (
+            start_pose.right,
+            start_pose.forward,
+            start_pose.heading,
+            float(steps[0][2] if steps else start_gear),
+        )
+    ]
+    # Each primitive is integrated BACKWARD from its own stored child pose,
+    # never forward along the chain. `came_from` entries can be rewritten
+    # when a cheaper route reaches the same cell through a slightly
+    # different continuous pose, so an ancestor's stored pose need not be
+    # the one a descendant was generated from -- integrating forward
+    # propagates that mismatch down the rest of the path and disconnects
+    # the analytic tail (measured, a 0.14 m sideways jump at a cusp).
+    # Anchoring on the child keeps every link ending exactly where the
+    # search said it ends, which is also what the tail was integrated from.
+    for child, steering, gear in steps:
+        for fraction in (2.0 / 3.0, 1.0 / 3.0):
+            sub = _advance_by(
+                child, steering, gear, radius, -HYBRID_STEP_M * fraction
+            )
+            poses.append((sub.right, sub.forward, sub.heading, float(gear)))
+        poses.append((child.right, child.forward, child.heading, float(gear)))
     head = np.asarray(poses, dtype=np.float64)
     # `integrate` includes its start pose labelled with the first outgoing
     # gear. The reconstructed head already contains the same physical pose;

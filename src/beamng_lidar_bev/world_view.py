@@ -209,6 +209,14 @@ class SceneBridge(QObject):
     parking_slot_clicked = pyqtSignal(float, float)
     """The WORLD centre of the bay picked in the 3D view."""
     parking_selection_cleared = pyqtSignal()
+    ground_picked = pyqtSignal(float, float)
+    """A click on the drawn ground, in BEV metres (right, forward).
+
+    Reported in the BEV frame and NOT in world, because this object has no
+    pose: render space is ego-relative, and the worker owns the pose that
+    turns it into world XY. That is the same division the bay pick uses --
+    QML answers where in the scene, Python answers what that means.
+    """
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -317,6 +325,17 @@ class SceneBridge(QObject):
     @pyqtSlot()
     def parkingMissed(self) -> None:
         self.parking_selection_cleared.emit()
+
+    @pyqtSlot(float, float)
+    def groundPicked(self, render_x: float, render_z: float) -> None:
+        """The labeller's click, relabelled from render space into the BEV.
+
+        Render space is `(right, height, -forward)`, so dropping the height
+        and negating z lands in BEV -- a relabelling, not a projection, which
+        is why nothing here needs the camera or the ego pose. Exactly what
+        `parkingPicked` does with its own hit.
+        """
+        self.ground_picked.emit(render_x, -render_z)
 
     @property
     def has_parking_slots(self) -> bool:
@@ -504,6 +523,9 @@ class WorldView(QWidget):
         self._orbit_pitch_deg = 0.0
         self._orbit_zoom = 1.0
         self._drag_from: QPointF | None = None
+        # Redirects the left click from picking a bay to dropping a bay
+        # corner. GUI-side only: the worker owns whether labelling is on.
+        self._labelling = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -555,9 +577,13 @@ class WorldView(QWidget):
             event.button() == Qt.MouseButton.LeftButton
             and kind == QEvent.Type.MouseButtonPress
         ):
-            # Only when there is something to pick, so with the scan off the
-            # left button reaches QML exactly as it always did.
-            if self._pick_parking(event.position()):
+            # Labelling takes the left button when it is on; otherwise the
+            # bay pick gets it, and only when there is something to pick, so
+            # with both off the left button reaches QML as it always did.
+            if self._labelling:
+                if self._pick_ground(event.position()):
+                    return True
+            elif self._pick_parking(event.position()):
                 return True
         if event.button() == Qt.MouseButton.RightButton:
             if kind == QEvent.Type.MouseButtonDblClick:
@@ -595,6 +621,31 @@ class WorldView(QWidget):
             self._push_orbit()
             return True
         return False
+
+    def set_labelling(self, enabled: bool) -> None:
+        """While on, a left click drops a bay corner instead of picking a bay.
+
+        The two cannot both own the left button, and labelling wins: the whole
+        reason to label by hand is that the detector did not find the bay, so
+        there is usually nothing there to select anyway.
+        """
+        self._labelling = bool(enabled)
+
+    def _pick_ground(self, position: QPointF) -> bool:
+        """Ask QML's raycast for the ground point under the click."""
+        if not self._ready:
+            return False
+        root = self._quick.rootObject()
+        if root is None:
+            return False
+        QMetaObject.invokeMethod(
+            root,
+            "pickGroundPoint",
+            Qt.ConnectionType.DirectConnection,
+            Q_ARG("QVariant", position.x()),
+            Q_ARG("QVariant", position.y()),
+        )
+        return True
 
     def _pick_parking(self, position: QPointF) -> bool:
         """

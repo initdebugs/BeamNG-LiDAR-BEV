@@ -21,6 +21,7 @@ from beamng_lidar_bev.config import (
     PARKING_BAY_MAX_DEPTH_M,
     PARKING_BAY_MEMORY_M,
     PARKING_BAY_MIN_DEPTH_M,
+    PARKING_BAY_WIDTH_MAX_M,
     PARKING_BAY_WIDTH_MIN_M,
     PARKING_MARKING_CELL_M,
     PARKING_MARKING_MEMORY_M,
@@ -34,6 +35,7 @@ from beamng_lidar_bev.config import (
 )
 from beamng_lidar_bev.parking import (
     MarkingMemory,
+    ScanReport,
     dominant_axis,
     find_bays,
     match_selection,
@@ -720,3 +722,86 @@ def test_a_bay_left_behind_is_forgotten() -> None:
     )
 
     assert gone == ()
+
+
+# --- lots that annotate whole bay quads instead of the divider lines ----------
+
+
+def _filled_row(
+    count: int = 6,
+    width: float = 3.0,
+    depth: float = 5.3,
+    origin: tuple[float, float] = (0.0, 0.0),
+) -> np.ndarray:
+    """A bay row whose whole QUADS annotate, so no divider line is visible."""
+    step = PARKING_MARKING_CELL_M
+    xs = np.arange(0.0, count * width, step) + origin[0]
+    ys = np.arange(0.0, depth, step) + origin[1]
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    return np.column_stack((grid_x.ravel(), grid_y.ravel()))
+
+
+def test_a_row_annotated_as_solid_quads_still_yields_bays() -> None:
+    """
+    The case that used to yield NOTHING, with no counter saying why.
+
+    Two lots in the same session annotate differently: one gives its dividers
+    as thin lines, the other whole bay quads as one solid slab. A slab is not
+    a stripe, so `PARKING_STRIPE_MAX_WIDTH_M` rejected every run of it and the
+    lot produced no dividers, no bays, and zero of every rejection reason.
+    """
+    lot = _filled_row(count=6)
+    report = ScanReport()
+
+    bays = find_bays(lot, _EMPTY, np.asarray((9.0, -6.0)), report)
+
+    assert report.slabs_found == 1, "the slab must be counted, not silently dropped"
+    assert bays, "a filled bay row must still offer bays"
+    # The COUNT is a guess -- a filled quad carries no dividers to read it off,
+    # and 18 m of frontage divides plausibly several ways -- so the assertion
+    # is that every offered bay is a believable size, not that there are six.
+    for bay in bays:
+        assert PARKING_BAY_WIDTH_MIN_M <= bay.width_m <= PARKING_BAY_WIDTH_MAX_M
+        assert PARKING_BAY_MIN_DEPTH_M <= bay.depth_m <= PARKING_BAY_MAX_DEPTH_M
+
+
+def test_paint_beside_the_row_at_a_different_depth_is_trimmed_off() -> None:
+    """
+    A hatched keep-clear zone can share a slab with the row it adjoins.
+
+    Reported live: parking in the outermost bay of a row, with the annotation
+    running on past it over a chevron area that is not a bay at all. Nothing
+    in a solid quad distinguishes them, so what CAN be used is the shape --
+    only the contiguous stretch that is one bay deep is divided.
+    """
+    row = _filled_row(count=4, width=3.0, depth=5.3)
+    # A shallower painted area butted onto the end of the row.
+    hatch = _filled_row(count=2, width=3.0, depth=2.0, origin=(12.0, 0.0))
+    report = ScanReport()
+
+    bays = find_bays(
+        np.concatenate((row, hatch)), _EMPTY, np.asarray((6.0, -6.0)), report
+    )
+
+    assert bays
+    # No bay may sit out over the shallow paint: the row ends at 12 m.
+    for bay in bays:
+        assert bay.centre[0] < 12.0, "a bay was invented over the hatched area"
+
+
+def test_widely_spaced_dividers_are_not_read_as_a_filled_row() -> None:
+    """
+    A wide run is only a bay row when it is actually FILLED.
+
+    Separate rows, and dividers too far apart to bound a bay, project onto the
+    same wide band of offsets at some sweep angle -- and reading that as a slab
+    does not merely add wrong bays, it CONSUMES the cells every later sweep
+    needed. Measured before the fill test: three rows worth 4 + 4 + 3 bays
+    apart came back as 4 together.
+    """
+    sparse = _bay_row(count=4, spacing=9.0, depth=5.0)
+    report = ScanReport()
+
+    find_bays(sparse, _EMPTY, np.asarray((0.0, 0.0)), report)
+
+    assert report.slabs_found == 0

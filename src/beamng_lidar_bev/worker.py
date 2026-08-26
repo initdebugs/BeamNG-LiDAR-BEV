@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from beamngpy import BeamNGpy, Vehicle
     from beamngpy.sensors import Camera, Lidar
 
+from . import parking_drive as parking_drive_module
 from .aeb import (
     FORWARD,
     REVERSE,
@@ -30,6 +32,12 @@ from .aeb import (
     mirror_points,
     mirrored,
     stopping_distance,
+)
+from .capture import (
+    BayLabelStore,
+    CameraPose,
+    CaptureSession,
+    EgoPose,
 )
 from .config import (
     AEB_CONFIRM_S,
@@ -44,11 +52,17 @@ from .config import (
     BEAMNG_HOST,
     BEAMNG_PORT,
     CAMERA_NEAR_FAR_PLANES,
+    CAPTURE_DIR_NAME,
+    CAPTURE_INTERVAL_S,
+    CAPTURE_MIN_TRAVEL_M,
     CONTROL_INTERVAL_MS,
     DISPLAY_INTERVAL_MS,
     HYBRID_CAMERA_AUTO_EXPOSURE,
     HYBRID_CAMERA_MANUAL_EV,
     HYBRID_CAMERA_UPDATE_TIME_S,
+    LABEL_BAY_CORNERS,
+    LABEL_MAX_RANGE_M,
+    LABEL_MAX_ROW_BAYS,
     LIDAR_RANGE_M,
     LIDAR_ROAD_VISUAL_COLOUR,
     LIDAR_UPDATE_HZ,
@@ -152,6 +166,7 @@ from .parking_drive import (
     PARK_SHIFTING,
     ParkingDriver,
     ParkingDriveState,
+    leg_length,
 )
 from .parking_map import ParkingMap
 from .planner import (
@@ -230,6 +245,9 @@ _TELEMETRY_INTERVAL_S = 1.0
 # Cadence of the Memory check: line -- store sizes change slowly, and the line
 # exists to catch a runaway store or a map full of ghosts, not to trace it.
 _MEMORY_LOG_INTERVAL_S = 5.0
+# How often a running capture reports its totals. Throttled because the
+# alternative is a log line every CAPTURE_INTERVAL_S for the whole drive.
+_CAPTURE_LOG_INTERVAL_S = 30.0
 # How long Vision mode waits for a first genuinely new camera frame before
 # warning. The known silent failure it exists for: requested_update_time=0.0
 # leaves every streaming buffer zero-filled while the read loop spins happily
@@ -331,6 +349,11 @@ class BeamNgWorker(QObject):
     rear_aeb_changed = pyqtSignal(bool)
     parking_changed = pyqtSignal(bool)
     parking_drive_changed = pyqtSignal(bool)
+    recording_changed = pyqtSignal(bool)
+    labelling_changed = pyqtSignal(bool)
+    labels_complete_changed = pyqtSignal(bool)
+    label_progress = pyqtSignal(int, int)
+    """Whole bays labelled so far, and corners of the one in progress."""
     fatal_error = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -421,6 +444,19 @@ class BeamNgWorker(QObject):
         # stay put between the scans that rebuild them.
         self._parking_scan = False
         self._marking_memory = MarkingMemory()
+        # Training capture. The session owns a directory and a writer thread;
+        # None means not recording, which is also what every teardown path
+        # leaves behind. `_labelling` only ever runs with a session open --
+        # a label without the frames it belongs to has nothing to train.
+        self._last_pose_world: tuple[np.ndarray, ...] | None = None
+        self._capture: CaptureSession | None = None
+        self._labels: BayLabelStore | None = None
+        self._labelling = False
+        self._label_row_bays = 1
+        self._last_capture_at = 0.0
+        self._last_capture_pos: np.ndarray | None = None
+        self._cameras_fresh_since_capture = False
+        self._last_capture_log_at = 0.0
         self._parking_bays: tuple[ParkingBay, ...] = ()
         self._parking_selected: tuple[float, float] | None = None
         self._parking_job: ParkingJob | None = None
@@ -439,6 +475,14 @@ class BeamNgWorker(QObject):
         self._parking_map = ParkingMap()
         self._last_park_state: ParkingDriveState | None = None
         self._logged_park_phase = ""
+        self._logged_park_plan: tuple[tuple[bool, float], ...] = ()
+        # Measured yaw while parking, for the tracker's steering-map trim --
+        # the same wrap-aware filtered rate the controller and AEB keep for
+        # themselves, owned here because parking runs with both of those
+        # inactive.
+        self._park_last_heading: float | None = None
+        self._park_yaw_filtered: float | None = None
+        self._last_steer_log_at = 0.0
         self._last_shift_log_at = 0.0
         self._last_drive_block_ms = 0.0
         # Per system, NOT shared. Both step in the same tick, so one timestamp
@@ -819,6 +863,324 @@ class BeamNgWorker(QObject):
             self.attach_to_player()
 
     @pyqtSlot(bool)
+    def set_recording(self, enabled: bool) -> None:
+        """
+        Start or stop writing camera frames and poses to disk.
+
+        Worker-owned like every other toggle: the GUI requests, this confirms
+        via `recording_changed`. Gated on HYBRID because the LiDAR set has no
+        cameras to record -- a recording of nothing would be a button that
+        lights up and produces an empty directory.
+        """
+        if not enabled:
+            # The badge is passed in rather than looked up: the worker does not
+            # track one, and the teardown funnel must NOT emit a status here --
+            # `_cleanup_sensors` is about to emit READY, and a STREAMING badge
+            # in front of it would flicker the wrong state over a dead session.
+            self._stop_capture("recording stopped", badge="STREAMING")
+            return
+        if self._capture is not None:
+            return
+        if (
+            self._geometry is None
+            or not self._sensor_set_is_complete()
+            or not self._hybrid_cameras
+        ):
+            self.recording_changed.emit(False)
+            self.status_changed.emit(
+                "READY",
+                "Attach in HYBRID mode before recording -- recording saves "
+                "camera frames, and the LiDAR set has none",
+            )
+            return
+        try:
+            self._start_capture()
+        except OSError as exc:
+            LOGGER.warning("Could not start a capture session: %s", exc)
+            self.recording_changed.emit(False)
+            self.status_changed.emit(
+                "READY", f"Could not start recording: {exc}"
+            )
+            return
+        self.recording_changed.emit(True)
+
+    @pyqtSlot(bool)
+    def set_labelling(self, enabled: bool) -> None:
+        """
+        Turn WORLD clicks into bay corners instead of bay selections.
+
+        **Requires an open recording session**, and that is a design choice
+        rather than a limitation: a labelled bay is only meaningful beside the
+        frames that saw it, and pairing them in one directory sidesteps having
+        to invent a stable identity for the map. Two levels can use overlapping
+        world coordinates, and nothing in the bridge reports a level name this
+        code can rely on across BeamNG versions.
+        """
+        if not enabled:
+            if self._labelling:
+                self._labelling = False
+                if self._labels is not None and self._labels.cancel_pending():
+                    self._emit_label_progress()
+                LOGGER.info("Bay labelling off")
+            self.labelling_changed.emit(False)
+            return
+        if self._labels is None:
+            self.labelling_changed.emit(False)
+            self.status_changed.emit(
+                "READY",
+                "Start recording first -- labels are saved beside the frames "
+                "they describe",
+            )
+            return
+        self._labelling = True
+        LOGGER.info(
+            "Bay labelling on (%d bays so far)", self._labels.bay_count
+        )
+        self.labelling_changed.emit(True)
+        self._emit_label_progress()
+
+    @pyqtSlot(float, float)
+    def add_bay_label(self, right_m: float, forward_m: float) -> None:
+        """
+        One WORLD click, in BEV metres, becomes one world-anchored corner.
+
+        The conversion is here rather than in the view because the pose lives
+        here: the view knows where the click landed in the scene and nothing
+        about where the scene is. `LABEL_MAX_RANGE_M` refuses the far field --
+        the raycast will happily return a point 150 m out on a surface built
+        from a handful of returns, and a label there carries the accumulated
+        store's error rather than the paint's.
+        """
+        if not self._labelling or self._labels is None:
+            return
+        if self._last_pose_world is None:
+            return
+        distance = float(np.hypot(right_m, forward_m))
+        if distance > LABEL_MAX_RANGE_M:
+            self.status_changed.emit(
+                "STREAMING",
+                f"That point is {distance:.0f} m away -- label bays within "
+                f"{LABEL_MAX_RANGE_M:.0f} m, where the ground is densely "
+                "sampled",
+            )
+            return
+        pos, right_axis, forward_axis = self._last_pose_world
+        right_xy = np.asarray(right_axis, dtype=np.float64)[:2]
+        forward_xy = np.asarray(forward_axis, dtype=np.float64)[:2]
+        right_xy = right_xy / max(float(np.hypot(*right_xy)), 1e-9)
+        forward_xy = forward_xy / max(float(np.hypot(*forward_xy)), 1e-9)
+        world = pos[:2] + right_m * right_xy + forward_m * forward_xy
+        pending_before = self._labels.pending_count
+        result = self._labels.add_corner(
+            float(world[0]), float(world[1]), self._label_row_bays
+        )
+        self._emit_label_progress()
+        if result is None:
+            if pending_before + 1 >= LABEL_BAY_CORNERS:
+                # The quad is complete but the row count does not divide it
+                # into anything the detector would call a bay. The corners are
+                # KEPT -- the number was wrong, not the clicking.
+                self.status_changed.emit(
+                    "STREAMING", self._labels.split_refusal or "Quad refused"
+                )
+            return
+        # A re-click is reported rather than silently appended: the count on
+        # screen is the only thing a person labelling has to go on, and a
+        # duplicate that raises it says the opposite of what happened.
+        LOGGER.info(
+            "Label check: %d bay(s) from one quad at (%.1f, %.1f) -- %d "
+            "replaced an existing label, %d corner(s) snapped to a neighbour, "
+            "%d bays in this session",
+            len(result.bays),
+            *result.bay.centre,
+            len(result.replaced_indices),
+            result.snapped_corners,
+            self._labels.bay_count,
+        )
+        if result.replaced_indices:
+            self.status_changed.emit(
+                "STREAMING",
+                f"{len(result.replaced_indices)} of those were already "
+                f"labelled and were replaced -- {self._labels.bay_count} bays "
+                "in this session",
+            )
+
+    @pyqtSlot(bool)
+    def set_labels_complete(self, complete: bool) -> None:
+        """
+        Record that EVERY bay this session drove past has been labelled.
+
+        Worker-owned like the rest, and refused without a session for the same
+        reason labelling is: the claim is stored beside the frames it describes.
+        It is the one flag that changes what the training data MEANS -- a
+        complete session's tarmac is trusted background everywhere, so the
+        model can finally be told that a patch of tarmac is not a bay.
+        """
+        if self._labels is None:
+            self.labels_complete_changed.emit(False)
+            self.status_changed.emit(
+                "READY", "Start recording before marking a session complete"
+            )
+            return
+        self._labels.set_complete(complete)
+        LOGGER.info(
+            "Label check: session marked %s (%d bays)",
+            "COMPLETE -- every bay driven past is labelled"
+            if complete
+            else "partial",
+            self._labels.bay_count,
+        )
+        self.labels_complete_changed.emit(complete)
+
+    @pyqtSlot(int)
+    def set_label_row_bays(self, count: int) -> None:
+        """How many bays the next completed quad is divided into.
+
+        Worker-owned like the toggles, so the value the label is built with is
+        the value the worker confirmed rather than whatever the spin box read
+        when the click was dispatched.
+        """
+        self._label_row_bays = max(1, min(int(count), LABEL_MAX_ROW_BAYS))
+
+    @pyqtSlot()
+    def undo_bay_label(self) -> None:
+        """Drop the corner in progress, or failing that the last whole bay."""
+        if self._labels is None or not self._labels.undo():
+            return
+        self._emit_label_progress()
+
+    def _emit_label_progress(self) -> None:
+        if self._labels is None:
+            self.label_progress.emit(0, 0)
+            return
+        self.label_progress.emit(
+            self._labels.bay_count, self._labels.pending_count
+        )
+
+    def _start_capture(self) -> None:
+        """Open a session directory, one per run, named by wall-clock time."""
+        geometry = self._geometry
+        if geometry is None:
+            raise OSError("no vehicle geometry")
+        root = (
+            Path(__file__).resolve().parents[2]
+            / CAPTURE_DIR_NAME
+            / time.strftime("%Y-%m-%d_%H%M%S")
+        )
+        rig = derive_hybrid_camera_rig(geometry)
+        # Only the cameras that actually built. A dead camera in the manifest
+        # would promise frames the index never carries.
+        cameras = [
+            CameraPose(
+                name=mount.name,
+                position_vehicle=mount.position_vehicle,
+                direction_vehicle=mount.direction_vehicle,
+                horizontal_fov_deg=mount.horizontal_fov_deg,
+                vertical_fov_deg=mount.vertical_fov_deg,
+                resolution=mount.resolution,
+            )
+            for mount in rig.values()
+            if mount.name in self._hybrid_camera_names
+        ]
+        self._capture = CaptureSession(
+            root,
+            cameras,
+            vehicle={
+                "model": self._vehicle_model,
+                "ground_z_vehicle": geometry.ground_z_vehicle,
+                "left_m": geometry.left_m,
+                "right_m": geometry.right_m,
+                "front_m": geometry.front_m,
+                "rear_m": geometry.rear_m,
+                "height_m": geometry.height_m,
+                "sensor_origin_vehicle": list(geometry.sensor_origin_vehicle),
+            },
+        )
+        self._labels = BayLabelStore(root / "bays.json")
+        self._last_capture_at = 0.0
+        self._last_capture_pos = None
+        self._cameras_fresh_since_capture = False
+        self._last_capture_log_at = 0.0
+        LOGGER.info(
+            "Capture check: recording to %s | %d cameras | %.1f s between "
+            "samples | click %d corners per bay in WORLD to label",
+            root,
+            len(cameras),
+            CAPTURE_INTERVAL_S,
+            LABEL_BAY_CORNERS,
+        )
+
+    def _stop_capture(self, reason: str, badge: str | None = None) -> None:
+        """Close the session and report what it wrote. Idempotent."""
+        session, self._capture = self._capture, None
+        labels, self._labels = self._labels, None
+        if self._labelling:
+            self._labelling = False
+            self.labelling_changed.emit(False)
+        self._emit_label_progress()
+        self.labels_complete_changed.emit(False)
+        if session is None:
+            self.recording_changed.emit(False)
+            return
+        stats = session.close()
+        summary = stats.describe()
+        if labels is not None:
+            summary += f", {labels.bay_count} bays labelled"
+        LOGGER.info("Capture check: %s -- %s", reason, summary)
+        self.recording_changed.emit(False)
+        if badge is not None:
+            self.status_changed.emit(badge, f"Recording stopped: {summary}")
+
+    def _record_sample(
+        self, state: dict[str, Any], images: Sequence[CameraImage]
+    ) -> None:
+        """
+        The tick hook: cadence, freshness, and a put that never waits.
+
+        Freshness is required because a re-read of a held frame paired with a
+        NEW pose is a lie -- it says the car moved and the picture did not, and
+        a training set full of those teaches the unprojection to be wrong. At
+        `CAPTURE_INTERVAL_S` against `HYBRID_CAMERA_UPDATE_TIME_S` there is
+        always a fresh frame inside the window, so this only bites on a stalled
+        rig, which is exactly when it should.
+        """
+        session = self._capture
+        if session is None or not images:
+            return
+        now = time.monotonic()
+        if now - self._last_capture_at < CAPTURE_INTERVAL_S:
+            return
+        if not self._cameras_fresh_since_capture:
+            return
+        # Moved far enough to be a genuinely new viewpoint. Checked LAST, so a
+        # tick that fails it leaves `_last_capture_at` alone and the next tick
+        # re-tests rather than waiting out another interval.
+        position = np.asarray(vec3(state["pos"]), dtype=np.float64)[:2]
+        if self._last_capture_pos is not None:
+            if float(np.hypot(*(position - self._last_capture_pos))) < (
+                CAPTURE_MIN_TRAVEL_M
+            ):
+                return
+        self._last_capture_at = now
+        self._last_capture_pos = position
+        self._cameras_fresh_since_capture = False
+        session.offer(
+            EgoPose(
+                pos=tuple(float(v) for v in vec3(state["pos"])),
+                dir=tuple(float(v) for v in vec3(state["dir"])),
+                up=tuple(float(v) for v in vec3(state["up"])),
+                speed_mps=self._last_speed,
+            ),
+            [(image.name, image.rgba) for image in images],
+        )
+        if session.stopped_reason is not None:
+            self._stop_capture("out of disk space", badge="STREAMING")
+            return
+        if now - self._last_capture_log_at >= _CAPTURE_LOG_INTERVAL_S:
+            self._last_capture_log_at = now
+            LOGGER.info("Capture check: %s", session.stats.describe())
+
+    @pyqtSlot(bool)
     def set_self_driving(self, enabled: bool) -> None:
         if not enabled:
             self._disengage_self_driving("Self-driving disengaged")
@@ -996,16 +1358,27 @@ class BeamNgWorker(QObject):
                 "Self-driving off: parking takes the wheel", announce=False
             )
         self._parking_driver.reset()
-        self._parking_map.clear()
+        # The map is deliberately NOT cleared here. It accumulates from the
+        # moment the SCAN is armed, so the first search sees what the car has
+        # actually seen of the lot -- cleared at engage, it held one tick of
+        # returns in a sea of UNKNOWN, the search planned through space the
+        # corridor check then vetoed mid-drive, and the manoeuvre spent its
+        # life in block/resume cycles. Teleports still clear it (the pose
+        # jump guard), and so does the attach/teardown funnel.
         self._parking_job = ParkingJob(matched)
+        self._logged_park_plan = ()
         self._parking_driving = True
         self._logged_park_phase = ""
+        self._park_last_heading = None
+        self._park_yaw_filtered = None
         self.parking_drive_changed.emit(True)
         LOGGER.info(
-            "Park check: engaged with a latched world-space bay, creeping at "
-            "%.1f km/h (below the %.1f km/h AEB arms at, so the forward "
+            "Park check: engaged with a latched world-space bay, manoeuvring "
+            "at %.1f km/h (below the %.1f km/h AEB arms at, so the forward "
             "brake stays in STANDBY and the manoeuvre does its own corridor "
-            "check). A bay needing a shuffle is refused, not attempted.",
+            "check). The manoeuvre is planned once and committed; watch "
+            "Park plan: for its shape and Steer check: for the measured "
+            "steering map.",
             PARKING_DRIVE_SPEED_MPS * 3.6,
             AEB_MIN_SPEED_MPS * 3.6,
         )
@@ -1019,6 +1392,8 @@ class BeamNgWorker(QObject):
             self._parking_job = replace(self._parking_job, status="FAILED")
         self._parking_driver.reset()
         self._last_park_state = None
+        self._park_last_heading = None
+        self._park_yaw_filtered = None
         if self._vehicle is not None:
             try:
                 self._vehicle.control(
@@ -1367,7 +1742,16 @@ class BeamNgWorker(QObject):
             # because the scene needs it on every tick: the block that already
             # derives `forward_speed` only runs when self-driving or AEB is on,
             # and reversing under a human driver is precisely when neither is.
-            forward_axis = vehicle_axes(state)[1]
+            right_axis, forward_axis, _ = vehicle_axes(state)
+            # Kept for the bay labeller, which turns a WORLD click into world
+            # XY and has no state of its own to do it from. One tick stale by
+            # construction; a label is placed standing still, where that is
+            # sub-millimetre.
+            self._last_pose_world = (
+                np.asarray(vec3(state["pos"]), dtype=np.float64),
+                right_axis,
+                forward_axis,
+            )
             self._last_forward_speed = float(velocity @ forward_axis)
             # Body pitch, positive nose-up: a stop down a grade flatters the
             # plant and a stop up one slanders it, so every brake measurement
@@ -1459,6 +1843,11 @@ class BeamNgWorker(QObject):
                 or self._aeb_enabled
                 or self._rear_aeb_enabled
                 or self._parking_driving
+                # The scan alone is enough: the parking map accumulates from
+                # scan-arm so the eventual first search knows the lot, and
+                # that needs the obstacle band built. In practice both AEB
+                # systems arm at attach, so this rarely changes what runs.
+                or self._parking_scan
             ):
                 # Every driving step below is isolated from the poll-failure
                 # budget on purpose: a planner, AEB or controller bug must not
@@ -1586,7 +1975,7 @@ class BeamNgWorker(QObject):
                     aeb_obstacles = _EMPTY_BEV
                     measured = False
 
-                if self._parking_driving:
+                if self._parking_driving or self._parking_scan:
                     ego_pos = vec3(state["pos"])
                     if measured:
                         self._parking_map.update(
@@ -1596,9 +1985,21 @@ class BeamNgWorker(QObject):
                             obstacles,
                             bev[scene_groups == SCENE_ROAD],
                         )
-                    parking_occupancy = self._parking_map.occupancy_bev(
-                        ego_pos, right_axis, forward
-                    )
+                    if self._parking_driving:
+                        parking_occupancy = self._parking_map.occupancy_bev(
+                            ego_pos,
+                            right_axis,
+                            forward,
+                            # The ego footprint is trusted: a blocked cell
+                            # under the body is stale by definition and can
+                            # never be re-observed while the car covers it.
+                            body=(
+                                geometry.left_m,
+                                geometry.right_m,
+                                geometry.front_m,
+                                geometry.rear_m,
+                            ),
+                        )
 
                 if self._self_driving:
                     try:
@@ -1788,6 +2189,12 @@ class BeamNgWorker(QObject):
                     )
                 )
 
+            # Before `_actuate` only because it is bounded and tiny: the
+            # cadence check is two floats and the queue put never waits. The
+            # encode and the disk are on the writer thread.
+            if hybrid:
+                self._record_sample(state, camera_images)
+
             # Actuate only after the frame is out. Vehicle.control() is a
             # blocking ack, and the display must not wait on it.
             self._actuate(plan, aeb, rear_aeb)
@@ -1964,6 +2371,10 @@ class BeamNgWorker(QObject):
                 # disarms the silence warning that names the trap.
                 if held.any():
                     any_fresh = True
+                    # Sticky until a sample is taken: the capture cadence
+                    # is slower than the camera's, so a tick that happens to
+                    # be a re-read must not make the window look stale.
+                    self._cameras_fresh_since_capture = True
             images.append(CameraImage(name=name, rgba=held))
 
         self._watch_vision_liveness(
@@ -2399,6 +2810,47 @@ class BeamNgWorker(QObject):
             selected_world=self._parking_selected,
         )
 
+    def _log_park_plan(self, slot: ParkingSlot | None) -> None:
+        """
+        The shape of the manoeuvre, once per plan.
+
+        The phase line says what the car is doing; it cannot say whether the
+        PLAN was sensible, and those are the two things that need telling
+        apart when a park goes badly. Measured live, a bay 3.5 m away produced
+        a four-leg manoeuvre and, on another attempt, a single thirteen-metre
+        reverse -- neither visible in the log as anything but "leg 1 of 4".
+        """
+        legs = self._parking_driver.legs
+        if slot is None or legs is None:
+            self._logged_park_plan = ()
+            return
+        shape = tuple(
+            (bool(leg.reverse), round(leg_length(leg), 1)) for leg in legs
+        )
+        if shape == self._logged_park_plan:
+            return
+        self._logged_park_plan = shape
+        direct = float(
+            np.hypot(slot.centre_right_m, slot.centre_forward_m)
+        )
+        total = sum(length for _, length in shape)
+        LOGGER.info(
+            "Park plan: %d leg(s), %.1f m of driving for a bay %.1f m away "
+            "(%.1fx) -- %s | via %s",
+            len(shape),
+            total,
+            direct,
+            total / max(direct, 0.1),
+            ", ".join(
+                f"{'reverse' if reverse else 'forward'} {length:.1f} m"
+                for reverse, length in shape
+            ),
+            # Which planner produced this shape -- clean search round, bare
+            # round, the line-clipping fallback, a canned family or the
+            # nudge. The first question a 4.0x plan raises.
+            parking_drive_module.LAST_PLAN_NOTE or "unknown",
+        )
+
     def _drive_into_bay(
         self,
         state: dict[str, Any],
@@ -2429,6 +2881,21 @@ class BeamNgWorker(QObject):
         forward_speed = float(
             vec3(state.get("vel", (0.0, 0.0, 0.0))) @ forward
         )
+        # Wrap-aware filtered yaw, the controller's and AEB's own idiom,
+        # owned here because parking runs with both inactive. It feeds the
+        # tracker's steering-map trim: MIN_TURN_RADIUS_M is a guess, and yaw
+        # over signed speed is what the car MEASURABLY drives.
+        heading = float(np.arctan2(forward[1], forward[0]))
+        if self._park_last_heading is not None and dt > 1e-4:
+            yaw_rate = math.remainder(
+                heading - self._park_last_heading, math.tau
+            ) / dt
+            self._park_yaw_filtered = (
+                yaw_rate
+                if self._park_yaw_filtered is None
+                else 0.35 * yaw_rate + 0.65 * self._park_yaw_filtered
+            )
+        self._park_last_heading = heading
         reported_gear = self._reported_gear()
         command, park = self._parking_driver.step(
             selected,
@@ -2444,7 +2911,28 @@ class BeamNgWorker(QObject):
             # hands back rather than fighting a system that has decided the
             # car is about to hit something.
             rear_aeb_braking=bool(rear_aeb is not None and rear_aeb.engaged),
+            measured_yaw_rate=self._park_yaw_filtered,
         )
+        # Steer check: commanded vs measured curvature and the adapted trim.
+        # This line is the instrument that will eventually replace the
+        # MIN_TURN_RADIUS_M guess with a per-vehicle measurement.
+        if (
+            abs(forward_speed) > 0.35
+            and abs(park.curvature) > 0.03
+            and self._park_yaw_filtered is not None
+        ):
+            now_steer = time.monotonic()
+            if now_steer - self._last_steer_log_at > 2.5:
+                self._last_steer_log_at = now_steer
+                measured_curvature = self._park_yaw_filtered / forward_speed
+                LOGGER.info(
+                    "Steer check: commanded %+.3f 1/m, measured %+.3f 1/m "
+                    "(ratio %.2f), gain %.2f",
+                    park.curvature,
+                    measured_curvature,
+                    measured_curvature / park.curvature,
+                    self._parking_driver.steering_gain,
+                )
         self._last_park_state = park
         if self._parking_job is not None:
             status = {
@@ -2457,13 +2945,17 @@ class BeamNgWorker(QObject):
             self._logged_park_phase = park.phase
             LOGGER.info(
                 "Park check: %s -- %s (%.1f m to go) | gear commanded %+d, "
-                "box reports %r, speed %.2f m/s, legs %s",
+                "box reports %r, speed %.2f m/s, steering %+.2f, "
+                "cross-track %.2f m, target %.2f m/s, legs %s",
                 park.phase,
                 park.reason,
                 park.remaining_m,
                 command.gear,
                 reported_gear,
                 forward_speed,
+                command.steering,
+                park.cross_track_m,
+                park.target_speed_mps,
                 "none"
                 if self._parking_driver.legs is None
                 else " then ".join(
@@ -2487,6 +2979,7 @@ class BeamNgWorker(QObject):
                     reported_gear,
                     forward_speed,
                 )
+        self._log_park_plan(selected)
         if park.phase == PARK_ARRIVED:
             self._complete_parking_drive()
         elif park.phase not in (
@@ -3521,7 +4014,15 @@ class BeamNgWorker(QObject):
         # Electrics rides along only while driving: Sensors.poll batches every
         # named sensor into one request, so the gearbox reading is free, but
         # there is no reason to ask for it in the plain viewer.
-        if self._self_driving:
+        #
+        # PARKING counts as driving, and missing that made every live park run
+        # blind: engaging parking turns self-driving OFF, so this asked for
+        # `state` alone and `_reported_gear` returned None on every tick. The
+        # manoeuvre then had to wait out PARKING_SHIFT_DWELL_S at a standstill
+        # for each shift and creep on a probe throttle until motion confirmed
+        # the direction -- and every `Park check:` line in the log read
+        # `box reports None`, which is what made it look like a gearbox fault.
+        if self._self_driving or self._parking_driving:
             self._vehicle.poll_sensors("state", "electrics")
         else:
             self._vehicle.poll_sensors("state")
@@ -3896,6 +4397,10 @@ class BeamNgWorker(QObject):
         # The prefetch is dropped FIRST: everything below this line talks on
         # the same sockets the prefetch thread may still be using.
         self._drop_state_future()
+        # Before the sensors go: the session's last samples reference camera
+        # frames, and the log line naming what was written is worth having on
+        # a fault teardown as much as on a clean stop.
+        self._stop_capture("sensors stopped")
         self._disengage_aeb("Sensors stopped", announce=False)
         self._disengage_parking_drive("Sensors stopped")
         self._disengage_self_driving("Sensors stopped", announce=False)

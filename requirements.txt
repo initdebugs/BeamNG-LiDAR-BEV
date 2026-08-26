@@ -6,3 +6,6 @@ numpy>=1.26,<2.0
 # <6.8: PyQt6 6.11 could not be imported on this machine's Python 3.11.0
 # (DLL procedure error); 6.7.x loads fine. See CLAUDE.md "Commands".
 PyQt6>=6.6,<6.8
+# capture.py encodes recorded camera frames as JPEG on its writer thread.
+# Imported lazily there, so a missing Pillow costs recording rather than the app.
+Pillow>=10.0

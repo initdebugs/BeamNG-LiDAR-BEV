@@ -12,13 +12,36 @@ Rectangle {
     // on anything else -- or on nothing -- is a miss, which is how clicking
     // away from the bays deselects.
     function pickParkingBay(px, py) {
-        var result = world.pick(px, py)
-        if (result.objectHit === parkingModel) {
-            sceneBridge.parkingPicked(
-                result.scenePosition.x, result.scenePosition.z
-            )
-        } else {
-            sceneBridge.parkingMissed()
+        // pickAll, not pick: the ground is pickable now (for the labeller) and
+        // a single `pick` returns only the NEAREST hit, so a grazing ray that
+        // met the road first would report a miss over a bay the click was
+        // plainly on. Searching the list makes the two pickable surfaces
+        // independent of each other.
+        var hits = world.pickAll(px, py)
+        for (var i = 0; i < hits.length; ++i) {
+            if (hits[i].objectHit === parkingModel) {
+                sceneBridge.parkingPicked(
+                    hits[i].scenePosition.x, hits[i].scenePosition.z
+                )
+                return
+            }
+        }
+        sceneBridge.parkingMissed()
+    }
+
+    // The labeller's pick: any point on the drawn ground surface, which is
+    // what a bay corner is. Separate from pickParkingBay because they want
+    // different targets -- one asks "which bay is this", the other "where on
+    // the road is this" -- and the labeller must work where no bay was found.
+    function pickGroundPoint(px, py) {
+        var hits = world.pickAll(px, py)
+        for (var i = 0; i < hits.length; ++i) {
+            if (hits[i].objectHit === roadModel) {
+                sceneBridge.groundPicked(
+                    hits[i].scenePosition.x, hits[i].scenePosition.z
+                )
+                return
+            }
         }
     }
 
@@ -318,11 +341,20 @@ Rectangle {
         // loop per vertex per frame on the GUI thread -- the detail of the view
         // was limited by that loop rather than by what the sensors resolve.
         // These bind once and never rebind; new data arrives inside them.
+        // `pickable` is for the bay LABELLER, which needs an arbitrary point
+        // on the ground rather than a bay: a person clicks the four corners of
+        // a bay that has no outline yet, because the whole reason to label by
+        // hand is that the detector did not find it. Note `receivesShadows`
+        // has always been a no-op here -- this is a NoLighting material, which
+        // skips the lighting path entirely.
         Model {
+            id: roadModel
+            objectName: "roadSurface"
             geometry: sceneBridge.roadGeometry
             materials: [roadMaterial]
             castsShadows: false
             receivesShadows: true
+            pickable: true
         }
 
         Model {

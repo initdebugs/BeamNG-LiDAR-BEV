@@ -2250,6 +2250,63 @@ PARKING_OFFSET_BIN_M = 0.25
 # lost and with it a bay. Still less than half the narrowest bay width, so it
 # cannot merge two adjacent dividers into one run.
 PARKING_STRIPE_MAX_WIDTH_M = 1.0
+# An offset run WIDER than this is read as a filled bay row rather than
+# discarded, and that is the whole difference between finding a lot and
+# finding nothing on it.
+#
+# **Two lots in the same session annotate their bays differently.** One returns
+# its dividers as thin marking lines, which the stripe sweep above handles. The
+# other returns whole bay QUADS as solid slabs metres across -- a slab is not a
+# stripe, so the width cap rejected every run and the lot yielded no bays at
+# all. Measured on a synthetic six-bay row: divider lines gave 378 cells, 7
+# dividers, 6 bays; the same row annotated as whole bays gave 2,430 cells, 0
+# dividers and 0 bays, with every rejection counter reading zero, so the
+# `Parking check:` line could not even say which filter ate them.
+#
+# The camera sees the same thin white lines on both lots, so the inconsistency
+# lives entirely in the annotation layer -- which is what makes the paint model
+# the real answer and this the honest interim: a slab's own extent still
+# carries the row's depth and length, and a row of N bays is what a person
+# reads off it. Sized above the widest believable double divider line and well
+# under the narrowest bay, so nothing that IS a stripe lands here.
+PARKING_SLAB_MIN_WIDTH_M = 1.6
+# Bays a single slab may be divided into. A slab is one row, and the row's
+# length over the bay-width band is what bounds the count; this is the sanity
+# ceiling on a run that is really a taxiway.
+PARKING_SLAB_MAX_BAYS = 20
+# Fraction of its own bounding rectangle a wide run must actually FILL before
+# it is read as a bay row rather than left alone.
+#
+# Without it the slab path was ruinous, and in a way that took bays AWAY. At
+# the swept angle several separate rows -- or a handful of widely spaced
+# dividers -- project into one wide offset run, and a wide run was exactly the
+# trigger: measured, three rows that yielded 4 + 4 + 3 bays apart came back as
+# 4 together, because the first sweep read the lot as one slab, consumed every
+# cell and left nothing for the passes that would have found the other rows.
+# A separate case turned four dividers 9 m apart into two invented bays.
+#
+# A genuinely filled quad is nearly solid at PARKING_MARKING_CELL_M -- a
+# measured 18 x 5.3 m row held 2,430 cells of a possible 2,385 -- while merged
+# lines fill under a fifth of their bounding box. The two are not close.
+PARKING_SLAB_MIN_FILL = 0.55
+# Fraction of the row depth a single bay-wide column must span to count as
+# part of the row. This is what trims a hatched keep-clear zone, a chevron end
+# cap or an aisle marking that shares a slab with the bays it adjoins --
+# reported live, parking in the outermost bay of a row whose annotation ran on
+# past it over paint that is not a bay at all. A zone of a DIFFERENT depth is
+# separated here; one of the SAME depth is indistinguishable from a bay in a
+# solid quad and will still be offered.
+PARKING_SLAB_COLUMN_DEPTH_FRACTION = 0.7
+# Nominal bay width used to pick the division of a slab, in metres.
+#
+# **The count is not uniquely determined and pretending otherwise would be the
+# dishonest part.** A 17.5 m row divides into 6, 7 or 8 bays and all three land
+# inside PARKING_BAY_WIDTH_MIN/MAX_M; there is nothing in a filled quad to say
+# which, because the dividers are exactly what the annotation did not draw. So
+# the count is rounded from this nominal width and the result is a CANDIDATE --
+# something a person clicks to select, never something that steers on its own.
+# A bay found from real dividers always outranks one found this way.
+PARKING_SLAB_NOMINAL_WIDTH_M = 2.75
 # Cells in one offset bin before that bin counts as occupied at all, and this
 # is what makes a head line survivable rather than merely outvoted. Seen from
 # the dividers' own angle a line across their heads does not pile into one bin
@@ -2375,10 +2432,37 @@ PARKING_DRIVE_CREEP_MPS = 0.5
 # manoeuvre is under 15 m and there is nothing to be gained by hurrying the
 # last of it.
 PARKING_DRIVE_DECEL_MPS2 = 1.0
-# Pure-pursuit lookahead ceiling. It shortens as the car slows, because a
-# fixed lookahead cuts the corner into the bay -- which is exactly where the
-# tolerance is smallest.
-PARKING_DRIVE_LOOKAHEAD_M = 3.0
+# How fast the steering can actually wind, in CURVATURE per second, and it is
+# an assumption about the ACTUATOR, not a comfort choice. The tracker slews its
+# command at this rate and the offline plant achieves it at this rate, so the
+# two stay in phase; the live `Steer check:` line (measured vs commanded
+# curvature) is what says whether the real rack is slower. The old tracker
+# slewed at 0.9 with a plant that steered INSTANTLY, which is how gains tuned
+# offline destabilised on the real car.
+PARKING_STEER_RATE_PER_S = 0.7
+# Actuation lag budgeted into the stopping profile: the time between asking for
+# brake and the car actually decelerating (pedal slew + engine response). The
+# old sqrt profile assumed zero and only began braking inside the last metre,
+# so every leg ended still rolling at 0.7-1.2 m/s -- measured live, SHIFTING
+# entered at 1.19 m/s -- and each overshot cusp fed the replanner a new pose.
+PARKING_CONTROL_LAG_S = 0.55
+# How far ahead of the matched point the curvature feed-forward reads the
+# path, in seconds of travel. This is lag compensation, not lookahead: the
+# wheel takes PARKING_STEER_RATE_PER_S-limited time to wind, so the command
+# must lead the geometry by roughly the winding time or the car turns late at
+# every transition.
+PARKING_TRACK_PREVIEW_S = 0.5
+# Where the REAR AXLE sits behind the reference node, and it is the first
+# piece of an actual vehicle model in this codebase. The tracker measures its
+# errors at the axle, not at the node: the axle is the bicycle's no-slip
+# pivot, so its response to steering is minimum-phase in BOTH directions,
+# where the node -- a metre and a half ahead of it -- initially swings the
+# WRONG way in reverse. Controlling the node put the reverse tracker in a
+# saturated bang-bang limit cycle, full lock to full lock with 1.4 m swings,
+# measured against the offline plant the moment it gained honest kinematics.
+# An ESTIMATE (node near the front axle, wheelbase ~2.6 m, rear overhang
+# ~1 m); the live `Steer check:` line is the instrument for replacing it.
+PARKING_REAR_AXLE_OFFSET_M = 1.5
 # How far outside the mouth the car is brought onto the bay's own axis. This
 # is what makes the entry straight rather than a swerve across the lines, and
 # it is grown on retry when the sweep would be too tight.
@@ -2411,6 +2495,46 @@ PARKING_PATH_SAMPLES = 48
 # manoeuvre reported unreachable at run_in = -0.016 m, a few centimetres from
 # arriving, and stopped on the line. Inside this the arc simply starts now.
 PARKING_PATH_SLACK_M = 0.75
+# Arc-length step every planned path is resampled to before it is driven.
+#
+# **This is not a drawing resolution, it is the tracker's frame of reference.**
+# The constructions above sample each SEGMENT rather than the path: a square-on
+# bay comes back as two points for the run-in and then the tail at 0.25 m, so
+# the path could open with a single 6.3 m gap. `ParkingDriver` locates the car
+# by the nearest SAMPLE, and across a gap like that sample 0 stays nearest for
+# the first three metres of driving -- which silently redefined three separate
+# quantities at once: `cross_track` became the distance travelled rather than a
+# tracking error, `remaining` froze at the full path length so the no-progress
+# watchdog went blind, and pure pursuit measured its lookahead from the wrong
+# place. Measured on a bay 14 m DEAD AHEAD, driven perfectly straight: the car
+# covered 1.5 m, cross-track hit PARKING_DRIVE_MAX_CROSS_TRACK_M, and the
+# controller announced a 1.5 m tracking error and re-planned -- three times on
+# a straight line. Uniform spacing is what makes the nearest sample mean
+# "where the car is".
+PARKING_PATH_STEP_M = 0.25
+# Planning radius as a multiple of the car's actual minimum. The canned
+# constructions solve at EXACTLY MIN_TURN_RADIUS_M -- measured, a 90-degree bay
+# holds full lock for 9.4 m -- which leaves the tracker no authority to tighten
+# and nothing to correct with except running wide. A path the car can only just
+# drive is not a path it can FOLLOW.
+PARKING_PLAN_RADIUS_MARGIN = 1.15
+# How far from square a bay may be and still be reversed into by preference.
+#
+# Reversing in is the geometrically kind entry and that is arithmetic, not
+# taste: backing in, the rear axle is the pivot, so the body is aligned with
+# the bay while it is still outside the mouth. Nose-first the front swings
+# wide, and one arc through 90 degrees displaces the car a whole radius -- in
+# a normal aisle it cannot be done without crossing the neighbouring bay.
+# Measured before this, at a 5 m offset a corner reached 0.74 m past the side
+# line with 0.58 m of margin available. A bay in LINE with the aisle is a
+# different problem and still goes in nose first.
+PARKING_REVERSE_FIRST_DEG = 40.0
+# How far a corner may stray past the target bay's side line, once the body is
+# inside the bay's depth, before a candidate manoeuvre is rejected. Paint is
+# not an obstacle -- there is no return to collide with -- so without an
+# explicit test nothing anywhere prefers staying between the lines, and the
+# final pose being square says nothing about the path that reached it.
+PARKING_BAY_KEEPOUT_M = 0.15
 # Distance inside which the creep floor is released so the profile can reach
 # zero. Above it a floor keeps the car rolling against a gentle grade instead
 # of stalling short of the bay; below it that same floor is what would carry
@@ -2421,13 +2545,129 @@ PARKING_DRIVE_CREEP_HOLD_M = 1.0
 # still wound on -- centred in the bay but 7.2 degrees off square. Slowing
 # while there is turn left gives the tracker time to straighten.
 PARKING_TURN_SLOW_DEG = 8.0
-# Where the car stops before backing into a bay, in the bay's own frame:
-# how far out to the side, and how far past the mouth. These are the poses a
-# driver actually uses -- alongside and a little past the space, squared to
-# the aisle -- and they are searched rather than fixed because which one
-# works depends on how much aisle there is and where the car starts.
-PARKING_SETUP_ACROSS_M = (2.6, 3.4, 4.2, 5.0, 5.8)
-PARKING_SETUP_OUT_M = (0.5, 1.5, 2.5, 3.5, 4.5)
+# How close to the end of a leg the turn cap above applies.
+#
+# **Without a range it crawls the WHOLE manoeuvre**, and that is most of "it is
+# very slow". The heading it measures is the error against the leg's FINAL
+# pose, so entering a square-on bay there is about 90 degrees to lose from the
+# moment the manoeuvre starts -- the cap is therefore satisfied continuously
+# and the car creeps at 0.8 m/s from the aisle to the bay. Squaring up is the
+# last few metres' job; before that the heading is meant to be changing.
+PARKING_TURN_SLOW_RANGE_M = 4.0
+# The error-state tracker: curvature = FF * path curvature + k_y * lateral
+# error + k_theta * heading error, all in the travel frame, mirrored once for
+# reverse. This replaced pure pursuit, whose lookahead point runs off the path
+# end exactly where parking needs precision, cuts every committed bend, and is
+# the weakest of the common trackers for reverse work.
+#
+# **Why full feed-forward is safe NOW and was measured worse before**: the old
+# paths carried curvature STEPS at every arc/straight join (a raw Reeds-Shepp
+# path demands an instantaneous wheel jump there), so a 1.0 feed-forward slam
+# against an instant-steering offline plant read as under-damping. The paths
+# are smoothed per leg now (`parking_smooth`) and the plant carries the real
+# actuator slew, so the feed-forward is simply the truth about the path.
+# The feedback pair sets a damping ratio k_theta / (2 * sqrt(k_y)) of about
+# 1.2 -- deliberately overdamped, because the plant's controlled point is the
+# reference NODE, ahead of the rear axle, and in reverse that point reacts
+# non-minimum-phase to steering.
+PARKING_TRACK_FEEDFORWARD_GAIN = 1.0
+PARKING_TRACK_HEADING_GAIN = 1.4
+# Lateral error commands a bounded APPROACH ANGLE toward the path --
+# atan(gain * error), capped at APPROACH_MAX -- and the heading loop then
+# tracks tangent-plus-approach. The structure matters more than the numbers:
+# a plain k_y * e_y term saturates the whole command at large error, and
+# inside saturation there is NO damping at all -- the output is pinned
+# whatever the heading does -- so the honest plant ping-ponged lock to lock
+# in metre swings down a whole reverse leg. With the approach angle bounded
+# and the heading term keeping full authority, damping survives saturation:
+# the car turns to the capped approach angle, holds it until the path is
+# near, and blends off. The linear region reproduces the old lateral gain
+# exactly: HEADING_GAIN * APPROACH_GAIN = 0.35.
+PARKING_TRACK_APPROACH_GAIN = 0.25
+PARKING_TRACK_APPROACH_MAX_DEG = 17.0
+# Speed cap while the path ahead bends hard. The tracker's lag-induced
+# deviation is the winding time times the speed, so the tight half of a
+# reverse swing driven at full manoeuvring speed is where the body strays --
+# measured, 0.32 m past a bay side line at 1.4 m/s where 1.0 m/s stays
+# inside. Distinct from PARKING_TURN_SLOW_*, which is about arriving square
+# at the END of a leg; this is about the middle of one.
+PARKING_TURN_SPEED_MPS = 1.0
+PARKING_TURN_SPEED_CURVATURE = 0.10
+# The target speed itself is SLEWED, asymmetrically: rising at a gentle ramp
+# and falling fast. Four caps take turns owning the target (cruise, the
+# curvature cap, the end-of-leg turn cap, the creep floor), and handing their
+# raw argmin to laggy pedals surged the live car 0.3-1.3 m/s down a whole
+# reverse leg. The down rate stays high because braking demands -- a cusp,
+# a blockage's standoff -- must never wait on a comfort filter.
+PARKING_TARGET_RAMP_UP_MPS2 = 0.7
+PARKING_TARGET_RAMP_DOWN_MPS2 = 3.0
+# Heading misalignment at the START of a leg above which the leg is locally
+# re-derived from the actual pose (the same repair the cross-track trigger
+# uses). A cusp is reached by TRACKING, so it inherits whatever heading error
+# the previous leg ended with; past this the canned solver absorbs the error
+# into a fresh construction instead of the tracker fighting it at full lock.
+PARKING_LEG_REPAIR_DEG = 12.0
+# The steering-map trim, mirroring `controller._adapt_gain` for the parking
+# regime: the curvature the car measurably drives against the command trims a
+# clamped gain, slowly, only above walking pace at meaningful curvature and
+# only when the car turns the way it was asked. MIN_TURN_RADIUS_M is a GUESS
+# ("roughly a small car's full-lock radius") and the steering map is assumed
+# linear; this is what absorbs both errors on the real car, per vehicle,
+# without a registry. The worker's `Steer check:` line reports the ratio so
+# the guess can eventually be replaced by a measurement.
+PARKING_STEER_GAIN_MIN = 0.6
+PARKING_STEER_GAIN_MAX = 1.6
+PARKING_STEER_GAIN_ADAPT_RATE = 0.12
+PARKING_STEER_GAIN_MIN_SPEED_MPS = 0.35
+PARKING_STEER_GAIN_MIN_CURVATURE = 0.03
+# (PARKING_SETUP_ACROSS_M / PARKING_SETUP_OUT_M lived here: the hand-built
+# position-then-reverse family's search ranges, dead since the search replaced
+# that family and deleted with the parking rework.)
+# Straight run into the bay appended to every SEARCHED manoeuvre.
+#
+# The canned construction ends with a deliberate straight -- CLAUDE.md records
+# that the tightest feasible radius is preferred precisely because it leaves a
+# longer one, and that the widest left the car 7.2 degrees off as it crossed
+# the stop plane. A Reeds-Shepp analytic shot has no such property: it is the
+# shortest path to the pose and it can arrive still turning, so the car
+# reached its stop pose 12.3 degrees skewed against a 12.0 degree success
+# limit. Searching to a pose set back by this much and running straight in
+# from there gives the tracker the same chance to square up.
+#
+# Swept over the eight offline geometries: 3.0 m leaves 6.4 degrees of skew,
+# 4.5 leaves 5.3, and 6.0 is much WORSE at 11.5 with nearly twice the gear
+# changes -- past a point the set-back goal sits so far from the bay that
+# reaching IT becomes the hard problem. The search's own goal tolerance is not
+# the lever it looks like: tightening HYBRID_GOAL_HEADING_DEG from 8 to 4
+# degrees changed nothing at any run-in, because the analytic shot lands on
+# the goal exactly and the tolerance never binds.
+PARKING_SEARCH_RUN_IN_M = 4.5
+# Per-leg path smoothing (`parking_smooth.smooth_path`). Raw legs are pieces
+# of constant curvature with a STEP at every join -- and worse, the search's
+# primitives are sampled at their 0.7 m ENDPOINTS, so every steering change
+# is a concentrated tangent kink that reads as a one-sample 0.4 1/m spike, a
+# wheel jump no car can steer. Every production parking pipeline smooths per
+# gear segment with the cusps held fixed, and this is that stage: a windowed
+# moving average along arc length, which spreads each kink over WINDOW_M of
+# path. A Laplacian descent was tried first and MEASURED WORSE: it clusters
+# vertices at the very corners it rounds (the classic shrinkage artifact),
+# and clustered samples read as higher discrete curvature than the kink --
+# 0.405 raw became 0.52 "smoothed". MAX_DEVIATION_M bounds how far any sample
+# may drift from the path the collision and bay-keepout checks approved, and
+# a smoothed leg is re-validated against both rather than trusting the bound.
+PARKING_SMOOTH_WINDOW_M = 1.5
+PARKING_SMOOTH_MAX_DEVIATION_M = 0.20
+# The last-metre correction law. A failed final-pose check used to hand a
+# 0.5 m error to the SEARCH, whose 0.7 m primitives and 0.5 m cells cannot
+# express a small correction -- measured live, 9.2 m of two-leg shuffle for a
+# 0.5 m error, twice. Inside these bounds the correction is an analytic
+# pull-out-and-re-enter pair instead; beyond them the full replan still runs.
+PARKING_NUDGE_MAX_M = 1.3
+PARKING_NUDGE_HEADING_DEG = 25.0
+# How far the nudge pulls out before re-entering: enough travel for the
+# re-entry to fix PARKING_NUDGE_MAX_M of error, scaled by the error itself.
+PARKING_NUDGE_OUT_MIN_M = 1.8
+PARKING_NUDGE_OUT_MAX_M = 3.5
 
 # At or below this the car counts as stopped for a gear change. Tighter than
 # STALL_SPEED_MPS because shifting a moving box is exactly what this exists to
@@ -2447,6 +2687,11 @@ PARKING_LEG_SQUARE_DEG = 12.0
 # Re-plans allowed before handing back. A plan that keeps producing a sequence
 # the car cannot drive would otherwise cycle for ever.
 PARKING_MAX_REPLANS = 4
+# Re-plans a MANOEUVRE may spend on its own cusps, counted separately from the
+# budget above. A cusp is not a failure: a multi-leg plan re-plans at every
+# direction change by design, so sharing one budget meant a three-leg park
+# spent two of its four before anything had gone wrong.
+PARKING_MAX_CUSP_REPLANS = 6
 # How far the car may travel before a bay the scan has stopped finding is
 # forgotten. Detection is a chain of filters over an accumulating cloud, so a
 # bay near several thresholds at once drops out and returns a moment later --
@@ -2484,7 +2729,25 @@ HYBRID_REVERSE_PENALTY = 1.6
 # full stop, a gear change and a wait for the box to confirm. This is what
 # keeps the answer to a manoeuvre a driver would recognise rather than a
 # five-point shuffle that happens to measure shortest.
-HYBRID_GEAR_PENALTY = 3.0
+#
+# **3.0 was far too cheap and the measurement is unambiguous.** At 0.7 m per
+# step it priced a cusp at about three metres of driving, so the search took
+# any shuffle that saved three metres -- which is exactly backwards for
+# parking, where a stop-and-shift costs seconds of dwell, a gear handshake and
+# a re-plan. Swept over the eight offline bay geometries:
+#
+# | penalty | shifts, total | worst case | wall time |
+# |---|---|---|---|
+# | 3 | 26 | 12 | 257 s |
+# | 8 | 8 | 2 | 195 s |
+# | **15** | **8** | **2** | **183 s** |
+# | 25 | 6 | 1 | 268 s |
+# | 40 | 6 | 1 | 276 s |
+#
+# All eight park at every value, so this buys smoothness rather than success.
+# Past 15 it starts driving a long way round to dodge a cusp that was worth
+# taking, which is why the time climbs again.
+HYBRID_GEAR_PENALTY = 15.0
 HYBRID_STEER_PENALTY = 0.15
 # Cost per body sample standing in never-observed ground. Traversable at a
 # price rather than forbidden: forbidding it strands the car in a lot it has
@@ -2497,6 +2760,23 @@ HYBRID_GOAL_HEADING_DEG = 8.0
 # part of an expansion and far from the goal it almost never clears, so it is
 # tried periodically -- and always once the search is near.
 HYBRID_ANALYTIC_INTERVAL = 8
+# Expansions the search keeps running after its FIRST successful shot, looking
+# for a cheaper one. A shot used to be accepted the moment it was
+# collision-free, so whichever node happened to be popped when the interval
+# came round donated its whole prefix to the answer -- a topology lottery that
+# returned a different manoeuvre from every slightly different pose, which is
+# most of what the live shuffling was. The search now prices every shot and
+# stops early only when the frontier's best f-value cannot beat the best shot.
+HYBRID_SHOT_PATIENCE = 300
+# The heuristic is the raw Reeds-Shepp LENGTH, and every real cost is larger
+# -- travel through unknown ground pays a surcharge, reverse pays 1.6x, a
+# cusp pays 15 -- so unweighted it under-guides the search toward
+# near-Dijkstra behaviour: measured, 7,473 expansions (1.2 s on the worker
+# thread) for a square-on bay 16 m away. Inflating it trades a sliver of
+# path optimality for most of that time; Autoware ships the same dial as
+# `distance_heuristic_weight`. The shot PRICING is untouched, so what gets
+# returned is still the cheapest completion found.
+HYBRID_HEURISTIC_WEIGHT = 1.25
 # Hard bound on the search. A parking manoeuvre that needs more than this is
 # one to hand back rather than to keep grinding at, and it runs off the
 # control tick so the ceiling is about answering promptly, not about safety.
@@ -2516,6 +2796,25 @@ PARKING_OVERSHOOT_M = 0.4
 # never will does not strand the manoeuvre.
 PARKING_SHIFT_DWELL_S = 1.2
 
+# An obstruction on the path is a SPEED LIMIT first and a stop second: the
+# car brakes to a stop this far short of it, on the normal profile, instead of
+# slamming the pedal the moment anything appears anywhere on the remaining
+# path -- measured live, a full stop for an obstruction 12.9 m down the leg,
+# then resume, then again at 10.7 and 5.0: that cycle IS the reported
+# "repeatedly braking then accelerating".
+PARKING_BLOCK_STANDOFF_M = 0.45
+# How long a blockage must persist, with the car stopped at the standoff,
+# before ONE replan around it is attempted (the accumulated occupancy has the
+# blockage by then, so the search can route round a parked car). The old
+# semantics only ever WAITED for the obstruction to clear -- written for a
+# crossing pedestrian, and a parked car never clears.
+PARKING_BLOCKED_REPLAN_S = 2.0
+# Cross-track at the start of a leg above which the leg's path is re-derived
+# from the actual pose -- a LOCAL repair that keeps the committed sequence,
+# where the old code re-searched the whole manoeuvre at every cusp and the
+# coarse search re-chose the topology every time: measured live, seven
+# different manoeuvres for one bay in two minutes.
+PARKING_LEG_REPAIR_M = 0.55
 # Blockage and terminal-state hysteresis. These make WAITING and success real
 # states rather than one-frame labels that can alternate with motion.
 PARKING_BLOCKED_CLEAR_DWELL_S = 0.5
@@ -2527,3 +2826,91 @@ PARKING_SUCCESS_SPEED_MPS = 0.05
 PARKING_SUCCESS_POSITION_M = 0.55
 PARKING_SUCCESS_HEADING_DEG = 12.0
 PARKING_SUCCESS_BOUNDARY_TOLERANCE_M = 0.30
+
+
+# ---------------------------------------------------------------------------
+# Training capture: recording camera frames, and labelling bays by hand
+# ---------------------------------------------------------------------------
+# This exists because the annotation channel CANNOT be the training signal.
+# Measured on two lots in the same session: one annotates its bay dividers as
+# thin lines (usable), the other annotates whole bay quads as solid slabs
+# (useless -- a slab is not a stripe, so the sweep in `parking` finds nothing).
+# The CAMERA sees the same thing on both: thin white lines on grey tarmac. So
+# the labels have to come from somewhere that does not vary per lot, and the
+# only such source is a person clicking on the ground.
+#
+# It lives IN THE APP rather than in tools/ for one hard reason: the BeamNG
+# bridge takes exactly one client, so a separate capture script cannot run
+# while the app is driving -- every probe under tools/ says "STOP in the app"
+# for that reason. Recording has to happen where the connection already is.
+
+# Where a session writes. Sibling of logs/, resolved the same way
+# (`Path(__file__).parents[2]`), so it depends on the src/<pkg>/ layout in
+# exactly the way __main__._configure_logging already does.
+CAPTURE_DIR_NAME = "captures"
+# Seconds between saved samples. NOT the camera rate: at
+# HYBRID_CAMERA_UPDATE_TIME_S (0.10) with two cameras a 1280x960 RGBA frame is
+# 4.9 MB, so recording every frame is 98 MB/s of raw pixels. Half a second is
+# ~2.5 m of travel at a lot's crawl, which is far enough apart that successive
+# samples are not near-duplicates -- and near-duplicates are exactly what
+# inflates a training set without adding information to it.
+CAPTURE_INTERVAL_S = 0.5
+# ...and how far the car must have MOVED since the last one. A standstill
+# re-samples the same rays from the same place, so a parked car adds nothing --
+# and parking up to label bays is the normal workflow, which at the cadence
+# above is ~120 identical samples a minute per camera. The pose that was
+# stopped at is still captured once, because the sample that arrived there
+# passed this test; what is skipped is the second and every one after it.
+# 0.25 m binds below ~1.8 km/h, so a crawl through a lot still records densely.
+CAPTURE_MIN_TRAVEL_M = 0.25
+# JPEG, not PNG. Lossy is what a real camera delivers anyway, and PNG at this
+# resolution costs ~8x the bytes and several times the encode. 92 keeps the
+# paint edges clean; below ~85 the thin far-field lines start to ring.
+CAPTURE_JPEG_QUALITY = 92
+# The writer queue's depth, in samples. Bounded on purpose: a full queue DROPS
+# the sample and counts it rather than blocking, because this runs on the
+# 40 ms worker tick and a disk stall must never delay `_actuate`. Deep enough
+# to ride out a stall of several seconds at CAPTURE_INTERVAL_S.
+CAPTURE_QUEUE_DEPTH = 32
+# A recording session is stopped if the drive it writes to fills. Reported,
+# never silent: a training set that quietly stopped growing is worse than one
+# that failed loudly.
+CAPTURE_MIN_FREE_MB = 512
+
+# How many corners make one labelled bay. Four, and deliberately not two: a
+# bay is a quad and its EDGES are the paint. Two clicks would describe one
+# divider and leave the width to be assumed, which is the same mistake
+# `vehicle_fit` documents -- an assumed dimension reported as a measured one.
+LABEL_BAY_CORNERS = 4
+# A click further than this from the car is refused. The WORLD raycast will
+# happily return a point 150 m away on a surface built from a handful of
+# returns, and a label placed there carries the accumulated store's error
+# rather than the paint's. Inside this, the ground is dense.
+LABEL_MAX_RANGE_M = 30.0
+# A completed bay whose centre lands this close to one already labelled is the
+# SAME bay clicked again, and it replaces it rather than being added. Measured
+# on the first real session: 3 of 12 labels were re-clicks from a second pass,
+# 0.10-0.16 m apart, so the set read as 12 bays over 9 places. Well under a bay
+# width, so two genuine neighbours are never merged. Replace rather than refuse,
+# because the usual reason to re-click a bay is that the first attempt was bad.
+LABEL_DUPLICATE_M = 1.5
+# A click this close to a corner already labelled SNAPS to it exactly.
+# Neighbouring bays in a row share a divider -- bay 1's right line is bay 2's
+# left line -- so every interior divider gets clicked twice, and twice at
+# slightly different places. Snapping makes the shared edge exactly shared and
+# lets the second bay be clicked roughly. Comfortably under the closest real
+# corner spacing (a bay width, 2.1 m at PARKING_BAY_WIDTH_MIN_M), so two
+# genuinely distinct corners are never welded together.
+LABEL_SNAP_M = 0.5
+# How many bays one clicked quad may be divided into. A row of bays is laid out
+# on a regular pitch, so clicking its four OUTER corners and saying how many are
+# in it describes the whole row -- 4 clicks and a number instead of 4N clicks.
+#
+# It is not a convenience: on a lot whose annotation covers whole bay quads
+# rather than the divider lines (measured, one of the first two lots tried) the
+# interior dividers are not in the LiDAR data AT ALL, so WORLD draws one solid
+# white slab and there is nothing to click. The slab's OUTLINE is visible, the
+# bay count is readable from the simulator's own window, and between them the
+# row is fully determined. Which axis gets divided is not asked for -- it is
+# whichever produces bays inside the detector's own size bounds.
+LABEL_MAX_ROW_BAYS = 20

@@ -30,3 +30,19 @@ tools/oracle_data/*.npz
 
 # tools/hybrid_rig_probe.py's side-by-side output; re-run the probe for it.
 tools/hybrid_rig_probe.png
+
+# Training captures: hundreds of MB of camera frames per drive, and
+# reproducible by recording again. The labels inside them are NOT reproducible,
+# so copy a session out of here before deleting one.
+captures/
+
+# Overlay renders from tools/label_overlay.py; re-run the tool for them.
+tools/label_overlay/
+
+# Training masks built from captures/ by tools/build_dataset.py; rebuild them.
+dataset/
+
+# The training virtualenv: 3 GB of PyTorch, rebuilt by the command in
+# tools/train_paint.py. Deliberately separate from .venv39 so the app never
+# carries it.
+.venv-train/

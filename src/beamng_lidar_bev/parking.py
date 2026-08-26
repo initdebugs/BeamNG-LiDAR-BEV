@@ -63,6 +63,11 @@ from .config import (
     PARKING_OFFSET_BIN_M,
     PARKING_SCAN_RADIUS_M,
     PARKING_SELECT_MATCH_M,
+    PARKING_SLAB_COLUMN_DEPTH_FRACTION,
+    PARKING_SLAB_MAX_BAYS,
+    PARKING_SLAB_MIN_FILL,
+    PARKING_SLAB_MIN_WIDTH_M,
+    PARKING_SLAB_NOMINAL_WIDTH_M,
     PARKING_STRIPE_ANGLE_TOL_DEG,
     PARKING_STRIPE_GAP_M,
     PARKING_STRIPE_MAX_WIDTH_M,
@@ -374,10 +379,27 @@ def _stripes(
     # Only the WIDTH cap here; the cell-count floor moved to the per-segment
     # test below, because an offset run may hold several dividers and it is
     # each one that has to carry its own evidence.
-    keep = (ends - starts + 1) <= width_bins
+    run_bins = ends - starts + 1
+    keep = run_bins <= width_bins
+    # A run TOO WIDE to be a divider is not automatically rubbish. Some lots
+    # annotate whole bay quads rather than the lines between them, and there
+    # the entire row arrives as one solid run -- so discarding everything wide
+    # meant those lots produced no dividers, no bays, and no counter saying
+    # why. See PARKING_SLAB_MIN_WIDTH_M.
+    slab = run_bins * PARKING_OFFSET_BIN_M >= PARKING_SLAB_MIN_WIDTH_M
+    slab_stripes, slab_member, slab_count = _slab_stripes(
+        points,
+        along,
+        across,
+        index,
+        starts[slab],
+        ends[slab],
+        along_axis,
+        across_axis,
+    )
     starts, ends = starts[keep], ends[keep]
     if not len(starts):
-        return [], np.zeros(len(points), dtype=bool)
+        return slab_stripes, slab_member, slab_count
 
     # bin -> stripe, so every point finds its stripe in one gather. The loop
     # runs once per STRIPE (tens), never per point -- `merge_cell_runs`' rule.
@@ -428,7 +450,166 @@ def _stripes(
                 )
             )
             member[picked] = True
-    return stripes, member
+    return stripes + slab_stripes, member | slab_member, slab_count
+
+
+def _slab_stripes(
+    points: np.ndarray,
+    along: np.ndarray,
+    across: np.ndarray,
+    index: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    along_axis: np.ndarray,
+    across_axis: np.ndarray,
+) -> tuple[list[_Stripe], np.ndarray, int]:
+    """
+    Synthetic dividers across a filled bay ROW, for lots that annotate quads.
+
+    A row of bays and one solid slab are the same painted region as far as
+    this sensor is concerned, so the row own extents are all there is to go
+    on: one of them is a bay DEPTH and the other is the row length, and which
+    is which is settled by PARKING_BAY_MIN/MAX_DEPTH_M rather than by assuming
+    the longer side. Dividing the length by a nominal bay width gives a count.
+
+    **The count is a considered guess and cannot be anything else** -- the
+    dividers are exactly what the annotation did not draw, and a 17.5 m row
+    divides into 6, 7 or 8 bays all of which are plausible widths. Emitting
+    synthetic stripes rather than finished bays is what keeps that honest:
+    they pass through the same pairing, width, depth and occupancy filters
+    every real divider does, and what comes out is a CANDIDATE to be clicked.
+
+    **Not everything annotated is a bay.** Hatched keep-clear zones, chevron
+    end caps and aisle markings can share a slab with the row they adjoin, and
+    a solid quad carries nothing to tell them apart. The per-column depth test
+    in `_row_dividers` trims a zone of a DIFFERENT depth from the row; one of
+    the same depth is indistinguishable here and will be offered. That is the
+    cost of reading a row off a shape, and it is why these are candidates
+    rather than destinations.
+    """
+    stripes: list[_Stripe] = []
+    member = np.zeros(len(points), dtype=bool)
+    slabs = 0
+    for lo_bin, hi_bin in zip(starts, ends):
+        picked = np.flatnonzero((index >= lo_bin) & (index <= hi_bin))
+        if len(picked) < PARKING_MIN_MARKING_CELLS:
+            continue
+        run_across, run_along = across[picked], along[picked]
+        span_across = float(run_across.max() - run_across.min())
+        span_along = float(run_along.max() - run_along.min())
+        # Is this actually a FILLED region, or several things that merely
+        # project onto the same wide band of offsets? See
+        # PARKING_SLAB_MIN_FILL -- getting this wrong does not merely add
+        # wrong bays, it CONSUMES the cells of every row a later sweep would
+        # have found.
+        area = span_across * span_along
+        if area <= 0.0 or len(picked) < PARKING_SLAB_MIN_FILL * area / (
+            PARKING_MARKING_CELL_M**2
+        ):
+            continue
+        slabs += 1
+        # Which extent is the bay depth. Both are tried; assuming the longer
+        # side is the row is the trap CLAUDE.md already records for the hand
+        # labeller, where two 2.4 m bays measure 4.8 m across against a 5.5 m
+        # depth, so the longer side is the DEPTH and slicing it invents bays
+        # no lot has.
+        wide_enough = 2.0 * PARKING_BAY_WIDTH_MIN_M
+        if _is_bay_depth(span_across) and span_along >= wide_enough:
+            row, perp, depth = run_along, run_across, span_across
+            row_axis, cut_axis = along_axis, across_axis
+            fixed = float(run_across.mean())
+        elif _is_bay_depth(span_along) and span_across >= wide_enough:
+            row, perp, depth = run_across, run_along, span_along
+            row_axis, cut_axis = across_axis, along_axis
+            fixed = float(run_along.mean())
+        else:
+            continue
+        found = _row_dividers(row, perp, depth, fixed, row_axis, cut_axis)
+        if not found:
+            continue
+        # Claimed only once it has actually yielded dividers. A slab that
+        # produced nothing must be left in the cloud for the next sweep, the
+        # same way an offset run bounding no bay is.
+        member[picked] = True
+        stripes.extend(found)
+    return stripes, member, slabs
+
+
+def _is_bay_depth(extent: float) -> bool:
+    return PARKING_BAY_MIN_DEPTH_M <= extent <= PARKING_BAY_MAX_DEPTH_M
+
+
+def _row_dividers(
+    row: np.ndarray,
+    perp: np.ndarray,
+    depth: float,
+    fixed: float,
+    row_axis: np.ndarray,
+    cut_axis: np.ndarray,
+) -> list[_Stripe]:
+    """Evenly spaced dividers over the stretch of a row that is one bay deep."""
+    low, high = float(row.min()), float(row.max())
+    length = high - low
+    count = max(
+        1,
+        min(
+            int(round(length / PARKING_SLAB_NOMINAL_WIDTH_M)),
+            PARKING_SLAB_MAX_BAYS,
+        ),
+    )
+    width = length / count
+    if not PARKING_BAY_WIDTH_MIN_M <= width <= PARKING_BAY_WIDTH_MAX_M:
+        return []
+    # Columns that are not the row own depth are something else painted
+    # alongside it -- a hatched zone, a chevron cap, an aisle marking. Only a
+    # contiguous stretch of full-depth columns is divided, so a differently
+    # shaped neighbour is trimmed rather than turned into bays.
+    edges = low + np.arange(count + 1) * width
+    column = np.clip(
+        np.searchsorted(edges, row, side="right") - 1, 0, count - 1
+    )
+    # Full DEPTH, not merely populated. Checking only that a column holds
+    # cells lets a shallow hatched area at the end of a row through: it is
+    # painted, so its columns are populated, and it became bays.
+    wanted = depth * PARKING_SLAB_COLUMN_DEPTH_FRACTION
+    deep = np.zeros(count, dtype=bool)
+    for slot in range(count):
+        inside = perp[column == slot]
+        deep[slot] = (
+            len(inside) >= PARKING_MIN_BIN_CELLS
+            and float(inside.max() - inside.min()) >= wanted
+        )
+    span = _longest_run(deep)
+    if span is None:
+        return []
+    first, last = span
+    return [
+        _Stripe(
+            centre=(
+                float(row_axis[0] * edges[cut] + cut_axis[0] * fixed),
+                float(row_axis[1] * edges[cut] + cut_axis[1] * fixed),
+            ),
+            direction=(float(cut_axis[0]), float(cut_axis[1])),
+            half_length_m=depth * 0.5,
+            cells=PARKING_MIN_STRIPE_CELLS,
+        )
+        for cut in range(first, last + 2)
+    ]
+
+
+def _longest_run(flags: np.ndarray) -> tuple[int, int] | None:
+    """The longest contiguous True span as (first, last), or None."""
+    best = current = None
+    for position, flag in enumerate(flags):
+        if not flag:
+            current = None
+            continue
+        current = (
+            (position, position) if current is None else (current[0], position)
+        )
+        if best is None or current[1] - current[0] > best[1] - best[0]:
+            best = current
+    return best
 
 
 def _occupancy(
@@ -474,6 +655,16 @@ class ScanReport:
     """Dividers that found no partner at all -- a row's outer edges, mostly."""
     bays_found: int = 0
     bays_capped: int = 0
+    slabs_found: int = 0
+    """
+    Painted runs too wide to be dividers -- whole bay QUADS rather than the
+    lines between them.
+
+    Counted because a lot annotated that way used to report plenty of marking
+    cells, zero dividers and zero of every rejection reason, so the log could
+    not distinguish "the paint never annotated" from "the paint annotated as
+    something this scan discards". Those are opposite problems.
+    """
 
     def summary(self) -> str:
         return (
@@ -483,6 +674,11 @@ class ScanReport:
             f"bays; rejected {self.rejected_width} on width, "
             f"{self.rejected_depth} on depth, {self.unpaired_stripes} "
             f"unpaired, {self.bays_capped} over the cap"
+            + (
+                f"; {self.slabs_found} filled slab(s)"
+                if self.slabs_found
+                else ""
+            )
         )
 
 
@@ -542,7 +738,8 @@ def find_bays(
         if len(remaining) < PARKING_MIN_MARKING_CELLS:
             break
         angle = dominant_axis(remaining)
-        stripes, claimed = _stripes(remaining, angle)
+        stripes, claimed, slabs = _stripes(remaining, angle)
+        tally.slabs_found += slabs
         if not len(stripes):
             break
         tally.rows_swept += 1

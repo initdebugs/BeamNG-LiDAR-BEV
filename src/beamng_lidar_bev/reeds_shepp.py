@@ -184,16 +184,18 @@ _WORDS = (
 )
 
 
-def shortest_path(
+def all_paths(
     goal: tuple[float, float, float], radius: float
-) -> list[Segment] | None:
+) -> list[list[Segment]]:
     """
-    The shortest Reeds-Shepp path from the origin (heading 0) to `goal`.
+    Every valid Reeds-Shepp word to `goal`, in METRES, unordered.
 
-    `goal` is `(x, y, heading)` in the START's frame, in metres and radians,
-    with heading measured the way the rest of this codebase measures it: from
-    +forward toward +right, so a direction is `(sin h, cos h)`. The returned
-    segment lengths are in METRES, already scaled by `radius`.
+    `shortest_path` picks by LENGTH, and that is the wrong criterion for a
+    planner that prices reverse travel and direction changes: the shortest
+    word between two poses is very often a reverse-heavy one, a few metres
+    shorter than a forward-only word that is far cheaper once penalties
+    apply. Exposing the whole family lets the caller pick by ITS cost --
+    which is how the analytic shot stops proposing shuffles.
     """
     if radius <= 0.0:
         raise ValueError("Turning radius must be positive")
@@ -204,7 +206,7 @@ def shortest_path(
     y = -float(goal[0]) / radius
     phi = -float(goal[2])
 
-    best: tuple[float, list[Segment]] | None = None
+    found: list[list[Segment]] = []
     for backwards in (False, True):
         for flipped in (False, True):
             for reflected in (False, True):
@@ -224,19 +226,34 @@ def shortest_path(
                     )
                     if not path:
                         continue
-                    total = path_length(path)
-                    if best is None or total < best[0]:
-                        best = (total, path)
-    if best is None:
+                    found.append(
+                        [
+                            Segment(
+                                steering=segment.steering,
+                                gear=segment.gear,
+                                length=segment.length * radius,
+                            )
+                            for segment in path
+                        ]
+                    )
+    return found
+
+
+def shortest_path(
+    goal: tuple[float, float, float], radius: float
+) -> list[Segment] | None:
+    """
+    The shortest Reeds-Shepp path from the origin (heading 0) to `goal`.
+
+    `goal` is `(x, y, heading)` in the START's frame, in metres and radians,
+    with heading measured the way the rest of this codebase measures it: from
+    +forward toward +right, so a direction is `(sin h, cos h)`. The returned
+    segment lengths are in METRES, already scaled by `radius`.
+    """
+    candidates = all_paths(goal, radius)
+    if not candidates:
         return None
-    return [
-        Segment(
-            steering=segment.steering,
-            gear=segment.gear,
-            length=segment.length * radius,
-        )
-        for segment in best[1]
-    ]
+    return min(candidates, key=path_length)
 
 
 def integrate(
